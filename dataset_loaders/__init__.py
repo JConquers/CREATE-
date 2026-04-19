@@ -1,5 +1,5 @@
 from .base_dataset import BaseDataset
 from .beauty_dataset import BeautyDataset
-from .yelp_dataset import YelpDataset
+from .books_dataset import BooksDataset
 
-__all__ = ['BaseDataset', 'BeautyDataset', 'YelpDataset']
+__all__ = ['BaseDataset', 'BeautyDataset', 'BooksDataset']

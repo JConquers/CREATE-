@@ -3,7 +3,7 @@ CREATE++ Training Script with command-line argument parsing.
 
 Usage:
     python train.py --dataset beauty --sequential sasrec --graph lightgcn
-    python train.py --dataset yelp --sequential bert4rec --graph ultragcn
+    python train.py --dataset books --sequential bert4rec --graph ultragcn
 """
 
 import argparse
@@ -14,13 +14,13 @@ import numpy as np
 from pathlib import Path
 
 from models import CreatePlusPlus
-from dataset_loaders import BeautyDataset, YelpDataset
+from dataset_loaders import BeautyDataset, BooksDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CREATE++ model")
     parser.add_argument('--dataset', type=str, default='beauty',
-                       choices=['beauty', 'yelp'],
+                       choices=['beauty', 'books'],
                        help='Dataset to use')
     parser.add_argument('--data_root', type=str, default='data',
                        help='Root directory for data')
@@ -81,8 +81,8 @@ def load_dataset(name, data_root):
     """Load dataset by name."""
     if name == 'beauty':
         dataset = BeautyDataset(root=f"{data_root}/Beauty_and_Personal_Care")
-    elif name == 'yelp':
-        dataset = YelpDataset(root=f"{data_root}/Yelp")
+    elif name == 'books':
+        dataset = BooksDataset(root=f"{data_root}/Books")
     else:
         raise ValueError(f"Unknown dataset: {name}")
 
