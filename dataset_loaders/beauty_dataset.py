@@ -43,10 +43,10 @@ class BeautyDataset:
         df = df.sort_values(['user_id', 'timestamp'])
 
         user2idx = {u: i for i, u in enumerate(df['user_id'].unique())}
-        item2idx = {i: idx for idx, i in enumerate(df['item_id'].unique())}
+        item2idx = {i: idx for idx, i in enumerate(df['parent_asin'].unique())}
 
         df['user_idx'] = df['user_id'].map(user2idx)
-        df['item_idx'] = df['item_id'].map(item2idx)
+        df['item_idx'] = df['parent_asin'].map(item2idx)
 
         n_users = len(user2idx)
         n_items = len(item2idx)
