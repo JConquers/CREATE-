@@ -40,13 +40,18 @@ class BeautyDataset:
         print("Processing dataset...")
 
         df = pd.read_csv(self.raw_file, compression='gzip')
+        print(f"Columns: {df.columns.tolist()}")
+        print(f"Sample rows:\n{df.head()}")
         df = df.sort_values(['user_id', 'timestamp'])
 
-        user2idx = {u: i for i, u in enumerate(df['user_id'].unique())}
-        item2idx = {i: idx for idx, i in enumerate(df['parent_asin'].unique())}
+        user_col = 'user_id'
+        item_col = 'parent_asin' if 'parent_asin' in df.columns else 'asin'
 
-        df['user_idx'] = df['user_id'].map(user2idx)
-        df['item_idx'] = df['parent_asin'].map(item2idx)
+        user2idx = {u: i for i, u in enumerate(df[user_col].unique())}
+        item2idx = {i: idx for idx, i in enumerate(df[item_col].unique())}
+
+        df['user_idx'] = df[user_col].map(user2idx)
+        df['item_idx'] = df[item_col].map(item2idx)
 
         n_users = len(user2idx)
         n_items = len(item2idx)
