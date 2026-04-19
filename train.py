@@ -14,7 +14,7 @@ import numpy as np
 from pathlib import Path
 
 from models import CreatePlusPlus
-from datasets import BeautyDataset, YelpDataset
+from dataset_loaders import BeautyDataset, YelpDataset
 
 
 def parse_args():
