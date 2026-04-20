@@ -242,8 +242,8 @@ def load_dataset(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    data = dataset.process(rating_threshold=args.rating_threshold)
-    stats = dataset.get_stats()
+    data = dataset.load(rating_threshold=args.rating_threshold)
+    stats = dataset.get_stats(rating_threshold=args.rating_threshold)
 
     print(f"\nDataset: {args.dataset}")
     print(f"  Users: {stats['n_users']}")
