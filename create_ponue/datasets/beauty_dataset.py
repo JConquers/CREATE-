@@ -155,9 +155,9 @@ class BeautyDataset:
         threshold_file = self.processed_dir / f"beauty_data_thresh{rating_threshold}.pt"
         return torch.load(threshold_file, weights_only=False)
 
-    def get_stats(self):
+    def get_stats(self, rating_threshold=4):
         """Return dataset statistics."""
-        data = self.process()
+        data = self.process(rating_threshold=rating_threshold)
         return {
             "n_users": data["n_users"],
             "n_items": data["n_items"],
