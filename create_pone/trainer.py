@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -29,17 +30,62 @@ def set_random_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def resolve_device(device_name: str) -> torch.device:
+def is_kaggle_runtime() -> bool:
+    return (
+        os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
+        or os.environ.get("KAGGLE_URL_BASE") is not None
+        or Path("/kaggle").exists()
+    )
+
+
+def resolve_device(device_name: str, allow_kaggle_cpu: bool) -> torch.device:
+    cuda_available = torch.cuda.is_available()
+
     if device_name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if cuda_available:
+            return torch.device("cuda")
+
+        if is_kaggle_runtime() and not allow_kaggle_cpu:
+            raise RuntimeError(
+                "Kaggle CUDA is not available. Enable GPU accelerator in notebook settings "
+                "and restart the kernel, or pass --allow-kaggle-cpu to continue on CPU."
+            )
+
+        return torch.device("cpu")
+
+    if device_name.startswith("cuda") and not cuda_available:
+        raise RuntimeError(
+            "CUDA device requested but torch.cuda.is_available() is False. "
+            "Enable Kaggle GPU accelerator and restart the kernel."
+        )
+
     return torch.device(device_name)
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     moved = {}
+    non_blocking = device.type == "cuda"
     for key, value in batch.items():
-        moved[key] = value.to(device) if torch.is_tensor(value) else value
+        moved[key] = value.to(device, non_blocking=non_blocking) if torch.is_tensor(value) else value
     return moved
+
+
+def resolve_effective_batch_size(
+    requested_batch_size: int,
+    max_seq_len: int,
+    num_items: int,
+    device: torch.device,
+    max_logit_elements: int,
+) -> int:
+    if device.type != "cuda" or max_logit_elements <= 0:
+        return requested_batch_size
+
+    per_batch_elements = requested_batch_size * max_seq_len * max(1, num_items)
+    if per_batch_elements <= max_logit_elements:
+        return requested_batch_size
+
+    safe_batch = max(1, max_logit_elements // (max_seq_len * max(1, num_items)))
+    return min(requested_batch_size, safe_batch)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -78,6 +124,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--pos-threshold", type=float, default=4.0)
     parser.add_argument("--neg-threshold", type=float, default=3.0)
+    parser.add_argument(
+        "--allow-kaggle-cpu",
+        action="store_true",
+        help="Allow CPU fallback on Kaggle when CUDA is unavailable.",
+    )
+    parser.add_argument(
+        "--max-logit-elements",
+        type=int,
+        default=350_000_000,
+        help="CUDA safety cap for batch*seq_len*num_items; batch is reduced automatically.",
+    )
 
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -87,15 +144,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     set_random_seed(args.seed)
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, allow_kaggle_cpu=args.allow_kaggle_cpu)
 
     print(f"Using device: {device}")
+    if device.type == "cuda":
+        cuda_index = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(cuda_index)
+        print(
+            f"CUDA device {cuda_index}: {props.name} | "
+            f"VRAM={props.total_memory / (1024 ** 3):.1f} GB"
+        )
+        if torch.backends.cudnn.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     bundle = load_dataset_bundle(
         dataset_name=args.dataset,
         data_dir=args.data_dir,
         max_sequence_length=args.max_seq_len,
     )
+
+    effective_batch_size = resolve_effective_batch_size(
+        requested_batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len,
+        num_items=bundle.num_items,
+        device=device,
+        max_logit_elements=args.max_logit_elements,
+    )
+    if effective_batch_size < args.batch_size:
+        print(
+            f"Reducing batch size from {args.batch_size} to {effective_batch_size} "
+            "for CUDA memory safety on full-softmax logits."
+        )
 
     train_dataset = UserSequenceDataset(bundle.user_sequences)
     if len(train_dataset) == 0:
@@ -107,7 +188,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collator,
@@ -168,6 +249,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"items={bundle.num_items}",
         f"train_interactions={len(bundle.train_df)}",
         f"train_sequences={len(train_dataset)}",
+        f"batch_size={effective_batch_size}",
     )
 
     for epoch in range(args.epochs):
