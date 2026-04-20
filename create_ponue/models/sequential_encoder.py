@@ -137,16 +137,27 @@ class AlignmentModule(nn.Module):
 
     Aligns sequential encoder representations with graph encoder representations
     while maintaining orthogonality to disinterest embeddings.
+
+    Implements Eq. 15 from CREATE++ paper:
+    L_align = sum_i (1 - C_hz_ii)^2 + lambda * sum_{i!=j} (C_hz_ij)^2 + mu * sum_{i,j} (C_hv_ij)^2
+
+    Where:
+    - C_hz: cross-correlation between seq_emb and graph interest (pos) embeddings
+    - C_hv: cross-correlation between seq_emb and graph disinterest (neg) embeddings
+    - First term: invariance (alignment)
+    - Second term: redundancy reduction (push off-diagonal to 0)
+    - Third term: orthogonality (push seq away from disinterest)
     """
 
-    def __init__(self, embedding_dim: int, lambda_param: float = 0.1):
+    def __init__(self, embedding_dim: int, lambda_param: float = 0.1, mu_param: float = 0.1):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.lambda_param = lambda_param
+        self.lambda_param = lambda_param  # Weight for off-diagonal (redundancy reduction)
+        self.mu_param = mu_param  # Weight for orthogonality to disinterest
 
     def forward(self, seq_emb, graph_pos_emb, graph_neg_emb=None):
         """
-        Compute alignment loss.
+        Compute alignment and orthogonality losses according to CREATE++ Eq. 15.
 
         Args:
             seq_emb: Sequential encoder embeddings (B, D)
@@ -154,33 +165,36 @@ class AlignmentModule(nn.Module):
             graph_neg_emb: Graph encoder disinterest embeddings (B, D) - optional
 
         Returns:
-            alignment_loss: Scalar tensor
-            orthogonality_loss: Scalar tensor (if graph_neg_emb provided)
+            barlow_twins_loss: Alignment + redundancy reduction (Eq. 15 first two terms)
+            orthogonality_loss: Orthogonality to disinterest (Eq. 15 third term)
         """
-        # Normalize embeddings
+        # Normalize embeddings (batch normalization without affine parameters)
         seq_emb_norm = nn.functional.normalize(seq_emb, dim=1, p=2)
         graph_pos_emb_norm = nn.functional.normalize(graph_pos_emb, dim=1, p=2)
 
-        # Cross-correlation matrix
+        # Cross-correlation matrix C_hz between seq and graph interest embeddings
         batch_size = seq_emb.size(0)
-        cross_corr = (seq_emb_norm.T @ graph_pos_emb_norm) / batch_size  # (D, D)
+        cross_corr_hz = (seq_emb_norm.T @ graph_pos_emb_norm) / batch_size  # (D, D)
 
-        # Alignment loss: push diagonal toward 1
-        on_diag = torch.diagonal(cross_corr).add(-1).pow(2).sum() / self.embedding_dim
+        # Term 1: Invariance - push diagonal toward 1 (alignment)
+        on_diag_hz = torch.diagonal(cross_corr_hz).add(-1).pow(2).sum()
 
-        # Redundancy reduction: push off-diagonal toward 0
-        off_diag = self._off_diagonal(cross_corr).pow(2).sum() / self.embedding_dim
+        # Term 2: Redundancy reduction - push off-diagonal toward 0
+        off_diag_hz = self._off_diagonal(cross_corr_hz).pow(2).sum()
 
-        alignment_loss = on_diag + self.lambda_param * off_diag
+        # Barlow Twins loss (alignment + redundancy reduction)
+        barlow_twins_loss = on_diag_hz + self.lambda_param * off_diag_hz
 
-        # Orthogonality constraint (push sequential away from disinterest)
+        # Term 3: Orthogonality - push seq away from disinterest embeddings
         orthogonality_loss = torch.tensor(0.0, device=seq_emb.device)
         if graph_neg_emb is not None:
             graph_neg_emb_norm = nn.functional.normalize(graph_neg_emb, dim=1, p=2)
-            cross_corr_neg = (seq_emb_norm.T @ graph_neg_emb_norm) / batch_size
-            orthogonality_loss = torch.diagonal(cross_corr_neg).pow(2).sum() / self.embedding_dim
+            # Cross-correlation C_hv between seq and graph disinterest embeddings
+            cross_corr_hv = (seq_emb_norm.T @ graph_neg_emb_norm) / batch_size
+            # Push ALL elements toward 0 (orthogonality)
+            orthogonality_loss = cross_corr_hv.pow(2).sum()
 
-        return alignment_loss, orthogonality_loss
+        return barlow_twins_loss, orthogonality_loss
 
     def _off_diagonal(self, x):
         """Return flattened off-diagonal elements of square matrix."""

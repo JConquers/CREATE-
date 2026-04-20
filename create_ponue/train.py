@@ -201,7 +201,19 @@ def parse_args():
         "--ortho_weight",
         type=float,
         default=0.1,
-        help="Weight for orthogonality loss (default: 0.1)",
+        help="Weight for orthogonality loss / mu parameter in Barlow Twins (default: 0.1)",
+    )
+    parser.add_argument(
+        "--bt_lambda",
+        type=float,
+        default=0.1,
+        help="Lambda parameter for Barlow Twins off-diagonal regularization (default: 0.1)",
+    )
+    parser.add_argument(
+        "--contrastive_weight",
+        type=float,
+        default=0.1,
+        help="Weight for contrastive loss in global objective (default: 0.1)",
     )
 
     # Other arguments
@@ -270,6 +282,7 @@ def create_model(stats, args):
         global_weight=args.global_weight,
         align_weight=args.align_weight,
         ortho_weight=args.ortho_weight,
+        bt_lambda=args.bt_lambda,  # Barlow Twins lambda for off-diagonal regularization
         reg_weight=args.weight_decay,
     )
 
@@ -280,11 +293,21 @@ def train_epoch(model, dataloader, optimizer, device, epoch, args, edge_index_di
     """Train for one epoch.
 
     Args:
-        warmup_mode: If True, only train graph encoder with global loss (no alignment/ortho)
+        warmup_mode: If True, only train graph encoder with dual-feedback loss (no local/align/ortho)
     """
     model.train()
     total_loss = 0.0
-    loss_dict = {"local": 0.0, "global": 0.0, "align": 0.0, "ortho": 0.0}
+    loss_dict = {
+        "local": 0.0,
+        "global": 0.0,
+        "dual_feedback": 0.0,
+        "pos_bpr": 0.0,
+        "neg_bpr": 0.0,
+        "contrastive": 0.0,
+        "barlow_twins": 0.0,
+        "orthogonality": 0.0,
+        "align": 0.0,
+    }
     num_batches = 0
 
     for batch in dataloader:
@@ -333,9 +356,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, args, edge_index_di
         # Add regularization
         reg_loss = model.graph_encoder.get_embedding_regularization()
 
-        # In warmup mode: only use global loss + reg (graph encoder training only)
+        # In warmup mode: only train with dual-feedback loss (graph encoder only)
+        # No local, alignment, orthogonality, or contrastive losses during warmup
         if warmup_mode:
-            total_loss_batch = losses["global_loss"] + reg_loss
+            total_loss_batch = losses["dual_feedback_loss"] + reg_loss
         else:
             total_loss_batch = total_loss_batch + reg_loss
 
@@ -351,6 +375,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, args, edge_index_di
         # Track losses
         total_loss += total_loss_batch.item()
         for key, value in losses.items():
+            # Convert key names: e.g., "barlow_twins_loss" -> "barlow_twins"
             loss_name = key.replace("_loss", "")
             if loss_name in loss_dict:
                 loss_dict[loss_name] += value.item()
@@ -485,11 +510,11 @@ def main():
 
             print(
                 f"Epoch {epoch:3d} | "
-                f"Loss: {train_loss:.4f} | "
-                f"Local: {train_losses['local']:.4f} | "
-                f"Global: {train_losses['global']:.4f} | "
-                f"Align: {train_losses['align']:.4f} | "
-                f"Ortho: {train_losses['ortho']:.4f} | "
+                f"Total Loss: {train_loss:.4f} | "
+                f"L_local: {train_losses['local']:.4f} | "
+                f"L_global: {train_losses['global']:.4f} (L_DF: {train_losses['dual_feedback']:.4f} = L_pos_bpr: {train_losses['pos_bpr']:.4f} + L_neg_bpr: {train_losses['neg_bpr']:.4f}) | "
+                f"L_contrastive: {train_losses['contrastive']:.4f} | "
+                f"L_align: {train_losses['align']:.4f} (L_barlow_twins: {train_losses['barlow_twins']:.4f} + L_ortho: {train_losses['orthogonality']:.4f}) | "
                 f"NDCG@10: {eval_metrics['ndcg@10']:.4f} | "
                 f"Recall@10: {eval_metrics['recall@10']:.4f}"
             )
