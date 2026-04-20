@@ -5,5 +5,8 @@ __pycache__/
 *.pyo
 *.pyd
 CREATE
-Pone-GNN
+Pone-GNN/
 .claude
+
+# Extracted text files from PDFs
+*.extracted.txt
