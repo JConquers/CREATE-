@@ -62,6 +62,49 @@ class AmazonBeautyDataset(BaseDataset):
         with gzip.open(self.raw_file, 'rt') as f:
             df = pd.read_csv(f)
 
+        # Amazon 2023 dataset column names: user_id, item_id, rating, timestamp
+        # Check and rename columns if needed
+        print(f"Original columns: {df.columns.tolist()}")
+
+        # Handle different column name formats
+        column_mapping = {}
+        if 'user_id' not in df.columns:
+            if 'User_ID' in df.columns:
+                column_mapping['User_ID'] = 'user_id'
+            elif 'userId' in df.columns:
+                column_mapping['userId'] = 'user_id'
+            elif 'reviewerID' in df.columns:
+                column_mapping['reviewerID'] = 'user_id'
+
+        if 'item_id' not in df.columns:
+            if 'Item_ID' in df.columns:
+                column_mapping['Item_ID'] = 'item_id'
+            elif 'asin' in df.columns:
+                column_mapping['asin'] = 'item_id'
+            elif 'product_id' in df.columns:
+                column_mapping['product_id'] = 'item_id'
+
+        if 'rating' not in df.columns:
+            if 'Rating' in df.columns:
+                column_mapping['Rating'] = 'rating'
+            elif 'stars' in df.columns:
+                column_mapping['stars'] = 'rating'
+
+        if 'timestamp' not in df.columns:
+            if 'Timestamp' in df.columns:
+                column_mapping['Timestamp'] = 'timestamp'
+            elif 'unix_review_time' in df.columns:
+                column_mapping['unix_review_time'] = 'timestamp'
+            else:
+                # Create synthetic timestamp if not available
+                print("No timestamp column found, creating synthetic timestamps...")
+                df['timestamp'] = range(len(df))
+
+        if column_mapping:
+            df = df.rename(columns=column_mapping)
+            print(f"Renamed columns: {column_mapping}")
+
+        # Select and order columns
         df = df[['user_id', 'item_id', 'rating', 'timestamp']].copy()
         df = df.sort_values(['user_id', 'timestamp'])
 

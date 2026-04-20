@@ -62,7 +62,60 @@ class AmazonBooksDataset(BaseDataset):
         with gzip.open(self.raw_file, 'rt') as f:
             df = pd.read_csv(f)
 
-        df = df[['user_id', 'item_id', 'rating', 'timestamp']].copy()
+        # Amazon Reviews 2023 dataset column names: user_id, parent_asin (or asin), rating, timestamp
+        # Check and rename columns if needed
+        print(f"Original columns: {df.columns.tolist()}")
+        print(f"Sample rows:\n{df.head()}")
+
+        # Handle different column name formats
+        column_mapping = {}
+        if 'user_id' not in df.columns:
+            if 'User_ID' in df.columns:
+                column_mapping['User_ID'] = 'user_id'
+            elif 'userId' in df.columns:
+                column_mapping['userId'] = 'user_id'
+            elif 'reviewerID' in df.columns:
+                column_mapping['reviewerID'] = 'user_id'
+
+        # Amazon 2023 uses parent_asin or asin for item identifier
+        if 'item_id' not in df.columns:
+            if 'parent_asin' in df.columns:
+                column_mapping['parent_asin'] = 'item_id'
+            elif 'asin' in df.columns:
+                column_mapping['asin'] = 'item_id'
+            elif 'Item_ID' in df.columns:
+                column_mapping['Item_ID'] = 'item_id'
+            elif 'product_id' in df.columns:
+                column_mapping['product_id'] = 'item_id'
+
+        if 'rating' not in df.columns:
+            if 'Rating' in df.columns:
+                column_mapping['Rating'] = 'rating'
+            elif 'stars' in df.columns:
+                column_mapping['stars'] = 'rating'
+
+        if 'timestamp' not in df.columns:
+            if 'Timestamp' in df.columns:
+                column_mapping['Timestamp'] = 'timestamp'
+            elif 'unix_review_time' in df.columns:
+                column_mapping['unix_review_time'] = 'timestamp'
+            else:
+                # Create synthetic timestamp if not available
+                print("No timestamp column found, creating synthetic timestamps...")
+                df['timestamp'] = range(len(df))
+
+        if column_mapping:
+            df = df.rename(columns=column_mapping)
+            print(f"Renamed columns: {column_mapping}")
+
+        # Verify required columns exist before selecting
+        required_cols = ['user_id', 'item_id', 'rating', 'timestamp']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise KeyError(f"{missing_cols} not in index. Available columns: {df.columns.tolist()}")
+
+        # Select and order columns
+        df = df[required_cols].copy()
         df = df.sort_values(['user_id', 'timestamp'])
 
         train_rows, val_rows, test_rows = [], [], []
