@@ -3,6 +3,7 @@ Training loop for CREATE-Pone.
 Implements two-phase training: warm-up + joint optimization.
 """
 
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -26,31 +27,36 @@ class CREATEPoneTrainer:
         device="cuda",
         warmup_epochs=10,
         grad_clip=1.0,
+        save_dir="checkpoints",
+        save_interval=10,
     ):
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.warmup_epochs = warmup_epochs
         self.grad_clip = grad_clip
+        self.save_dir = save_dir
+        self.save_interval = save_interval
+        os.makedirs(save_dir, exist_ok=True)
 
-    def train_epoch(self, dataloader, epoch):
+    def train_epoch(self, dataloader, epoch, warmup_mode=False):
         """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         loss_dict = {"local": 0.0, "global": 0.0, "align": 0.0, "ortho": 0.0}
         num_batches = 0
 
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch}"):
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch}", leave=False):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            loss = self._train_batch(batch, epoch)
+            loss = self._train_batch(batch, epoch, warmup_mode=warmup_mode)
             total_loss += loss
             num_batches += 1
 
-        return total_loss / num_batches, {k: v / num_batches for k, v in loss_dict.items()}
+        return total_loss / max(num_batches, 1), {k: v / max(num_batches, 1) for k, v in loss_dict.items()}
 
-    def _train_batch(self, batch, epoch):
+    def _train_batch(self, batch, epoch, warmup_mode=False):
         """Train on a single batch."""
         self.optimizer.zero_grad()
 
@@ -73,13 +79,18 @@ class CREATEPoneTrainer:
             user_neg_emb=user_neg_emb,
             item_pos_emb=item_pos_emb,
             item_neg_emb=item_neg_emb,
-            pos_pairs=batch["pos_pairs"],
-            neg_pairs=batch["neg_pairs"],
+            pos_pairs=batch.get("pos_pairs", torch.stack([batch["user_indices"], batch["item_sequence"][:, -1]], dim=1)),
+            neg_pairs=batch.get("neg_pairs", torch.stack([batch["user_indices"], torch.randint(0, self.model.num_items, (len(batch["user_indices"]),), device=self.device)], dim=1)),
         )
 
         # Add regularization
         reg_loss = self.model.graph_encoder.get_embedding_regularization()
-        total_loss = total_loss + reg_loss
+
+        # In warmup mode: only use dual-feedback loss
+        if warmup_mode:
+            total_loss = losses["dual_feedback_loss"] + reg_loss
+        else:
+            total_loss = total_loss + reg_loss
 
         # Backward pass
         total_loss.backward()
@@ -90,23 +101,7 @@ class CREATEPoneTrainer:
 
         self.optimizer.step()
 
-        # Track losses
-        self._update_loss_dict(losses)
-
         return total_loss.item()
-
-    def _update_loss_dict(self, losses):
-        """Update loss tracking dictionary."""
-        for key, value in losses.items():
-            loss_name = key.replace("_loss", "")
-            if loss_name in self.loss_dict:
-                self.loss_dict[loss_name] += value.item()
-
-    @property
-    def loss_dict(self):
-        if not hasattr(self, "_loss_dict"):
-            self._loss_dict = {"local": 0.0, "global": 0.0, "align": 0.0, "ortho": 0.0}
-        return self._loss_dict
 
     def evaluate(self, dataloader, k=10):
         """Evaluate model on test data."""
@@ -178,6 +173,93 @@ class CREATEPoneTrainer:
             metrics[key] /= max(num_samples, 1)
 
         return metrics
+
+    def save_checkpoint(self, epoch, metrics, losses, filename=None):
+        """Save a training checkpoint."""
+        if filename is None:
+            filename = f"checkpoint_epoch_{epoch:04d}.pt"
+
+        checkpoint_path = os.path.join(self.save_dir, filename)
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "metrics": metrics,
+            "losses": losses,
+        }, checkpoint_path)
+        print(f"Checkpoint saved: {checkpoint_path}")
+        return checkpoint_path
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load a training checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print(f"Checkpoint loaded from {checkpoint_path} (epoch {checkpoint['epoch']})")
+        return checkpoint
+
+    def train(self, dataloader, val_dataloader, epochs, edge_index_dict, args):
+        """
+        Full training loop with warmup and joint training phases.
+
+        Args:
+            dataloader: Training data loader
+            val_dataloader: Validation data loader
+            epochs: Total number of epochs
+            edge_index_dict: Dictionary with 'pos' and 'neg' edge indices
+            args: Training arguments
+        """
+        print(f"\nStarting training on {self.device}...")
+        print(f"Warmup epochs: {self.warmup_epochs} (graph encoder only)")
+        print(f"Joint training epochs: {epochs - self.warmup_epochs}")
+        print(f"Total epochs: {epochs}")
+
+        best_ndcg = 0.0
+        patience = 10
+        patience_counter = 0
+
+        for epoch in tqdm(range(1, epochs + 1), desc="Training Progress"):
+            # Determine if in warmup phase
+            warmup_mode = epoch <= self.warmup_epochs
+
+            # Train
+            train_loss, train_losses = self.train_epoch(dataloader, epoch, warmup_mode=warmup_mode)
+
+            # Evaluate
+            if epoch % args.log_interval == 0 or epoch == 1:
+                eval_metrics = self.compute_metrics(*self.evaluate(val_dataloader))
+
+                print(
+                    f"Epoch {epoch:3d} | "
+                    f"Total Loss: {train_loss:.4f} | "
+                    f"NDCG@10: {eval_metrics['ndcg@10']:.4f} | "
+                    f"Recall@10: {eval_metrics['recall@10']:.4f}"
+                )
+
+                # Save checkpoint for every logged epoch
+                self.save_checkpoint(epoch, eval_metrics, train_losses)
+
+                # Save best model
+                if eval_metrics["ndcg@10"] > best_ndcg:
+                    best_ndcg = eval_metrics["ndcg@10"]
+                    torch.save({
+                        "epoch": epoch,
+                        "model_state_dict": self.model.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "metrics": eval_metrics,
+                    }, os.path.join(self.save_dir, "best_model.pt"))
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                # Early stopping
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+        print(f"\nTraining complete!")
+        print(f"Best NDCG@10: {best_ndcg:.4f}")
+        print(f"Best model saved to {self.save_dir}/best_model.pt")
 
 
 class BatchGenerator:

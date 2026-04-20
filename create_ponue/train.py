@@ -403,7 +403,7 @@ def evaluate(model, dataloader, device, edge_index_dict, k=10):
         ndcg_scores = []
         recall_scores = []
 
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="Evaluating"):
             batch = {
                 k: v.to(device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -495,6 +495,10 @@ def main():
     patience = 10
     patience_counter = 0
 
+    # Create checkpoint directory
+    checkpoint_dir = os.path.join(args.save_dir, f"create_pone_{args.dataset}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     for epoch in range(1, args.epochs + 1):
         # Determine if in warmup phase
         warmup_mode = epoch <= args.warmup_epochs
@@ -518,6 +522,21 @@ def main():
                 f"NDCG@10: {eval_metrics['ndcg@10']:.4f} | "
                 f"Recall@10: {eval_metrics['recall@10']:.4f}"
             )
+
+            # Save checkpoint for every logged epoch
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch:04d}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "metrics": eval_metrics,
+                    "train_losses": train_losses,
+                    "args": vars(args),
+                },
+                checkpoint_path,
+            )
+            print(f"  -> Checkpoint saved: {checkpoint_path}")
 
             # Save best model
             if eval_metrics["ndcg@10"] > best_ndcg:
