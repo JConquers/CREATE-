@@ -238,8 +238,10 @@ def train_ponegnn(model, train_df, dataset, device, pretrain_epochs: int = 50,
 
     model.train()
     best_loss = float('inf')
+    best_state = None
 
-    for epoch in range(1, pretrain_epochs + 1):
+    pbar = tqdm(range(1, pretrain_epochs + 1), desc="Pre-training PoneGNN")
+    for epoch in pbar:
         # Generate negatives
         negatives = sampler.generate_negatives(epoch)
 
@@ -288,18 +290,23 @@ def train_ponegnn(model, train_df, dataset, device, pretrain_epochs: int = 50,
         avg_loss = total_loss / max(n_batches, 1)
         scheduler.step()
 
+        # Update progress bar
+        pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'best': f'{best_loss:.4f}'})
+
         if epoch % eval_every == 0:
-            print(f"Epoch {epoch:3d}/{pretrain_epochs} | Loss: {avg_loss:.4f}")
+            pbar.write(f"Epoch {epoch:3d}/{pretrain_epochs} | Loss: {avg_loss:.4f}")
 
         if avg_loss < best_loss:
             best_loss = avg_loss
+            best_state = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_loss,
+            }
             if save_path:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_loss,
-                }, save_path)
+                torch.save(best_state, save_path)
+                pbar.write(f"  -> Checkpoint saved (best loss: {best_loss:.4f})")
 
     print(f"\nPre-training complete. Best loss: {best_loss:.4f}")
     return data_p, data_n
@@ -325,13 +332,20 @@ def train_joint(model, train_loader, val_loader, dataset, args, device,
     model.train()
     best_hr = 0
     best_ndcg = 0
+    best_model_state = None
+    checkpoint_path = None
 
-    for epoch in range(1, args.num_epochs + 1):
+    # Determine checkpoint path from save_path if available
+    if hasattr(args, 'save_dir') and args.save_dir:
+        checkpoint_path = os.path.join(args.save_dir, 'joint_training_best.pt')
+
+    pbar = tqdm(range(1, args.num_epochs + 1), desc="Joint Training")
+    for epoch in pbar:
         total_loss = 0
         n_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}", disable=True)
-        for batch in pbar:
+        batch_pbar = tqdm(train_loader, desc=f"  Batch", leave=False)
+        for batch in batch_pbar:
             item_sequences = batch['padded_sequence_ids'].to(device)
             mask = batch['mask'].to(device)
             labels = batch['labels.ids'].to(device)
@@ -364,6 +378,7 @@ def train_joint(model, train_loader, val_loader, dataset, args, device,
 
             total_loss += loss.item()
             n_batches += 1
+            batch_pbar.set_postfix({'batch_loss': f'{loss.item():.4f}'})
 
         avg_loss = total_loss / max(n_batches, 1)
         scheduler.step()
@@ -372,17 +387,36 @@ def train_joint(model, train_loader, val_loader, dataset, args, device,
         if epoch % args.eval_every == 0:
             metrics = evaluate(model, val_loader, device, top_k=args.top_k)
 
+            improved = False
             if metrics['hit_rate'] > best_hr:
                 best_hr = metrics['hit_rate']
+                improved = True
             if metrics['ndcg'] > best_ndcg:
                 best_ndcg = metrics['ndcg']
+                improved = True
 
-            print(
+            pbar.write(
                 f"Epoch {epoch:3d}/{args.num_epochs} | "
                 f"Loss: {avg_loss:.4f} | "
                 f"HR@{args.top_k}: {metrics['hit_rate']:.4f} | "
-                f"NDCG@{args.top_k}: {metrics['ndcg']:.4f}"
+                f"NDCG@{args.top_k}: {metrics['ndcg']:.4f} | "
+                f"Best: HR={best_hr:.4f}, NDCG={best_ndcg:.4f}"
             )
+
+            # Save best model checkpoint
+            if improved and checkpoint_path:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_hr': best_hr,
+                    'best_ndcg': best_ndcg,
+                    'loss': avg_loss,
+                }, checkpoint_path)
+                pbar.write(f"  -> Best model saved!")
+
+        # Update main progress bar postfix
+        pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'best_hr': f'{best_hr:.4f}'})
 
     print(f"\nJoint training complete.")
     print(f"Best HR@{args.top_k}: {best_hr:.4f}")
@@ -543,6 +577,7 @@ def train_create_plus_plus(
             self.alpha = alpha
             self.top_k = top_k
             self.eval_every = eval_every
+            self.save_dir = run_dir if save_checkpoint else None
 
     joint_args = JointArgs()
 
@@ -555,6 +590,8 @@ def train_create_plus_plus(
     # Save final model
     if save_checkpoint:
         final_path = os.path.join(run_dir, 'create_plus_plus_final.pt')
+        checkpoint = torch.load(os.path.join(run_dir, 'joint_training_best.pt')) if os.path.exists(os.path.join(run_dir, 'joint_training_best.pt')) else None
+
         torch.save({
             'model_state_dict': create_model.state_dict(),
             'graph_encoder_state_dict': graph_model.state_dict(),
@@ -571,7 +608,13 @@ def train_create_plus_plus(
                 'num_epochs': num_epochs,
                 'batch_size': batch_size,
                 'lr': lr,
-            }
+                'reg': reg,
+                'dropout': dropout,
+                'contrastive_weight': contrastive_weight,
+                'alpha': alpha,
+                'seed': seed,
+            },
+            'best_joint_checkpoint': checkpoint,
         }, final_path)
         print(f"\nFinal model saved to: {final_path}")
 
