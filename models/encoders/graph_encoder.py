@@ -281,11 +281,12 @@ class PoneGNN(GraphEncoder):
             user_emb[row] * norm.unsqueeze(1)
         )
 
-        # Apply self-embedding strengthening (first term in Eq. 1)
-        self_emb_factor = (1 + self.epsilon_p) / (torch.bincount(row, minlength=self.n_users).float().clamp(min=1)[row].shape[0] + 1)
+        # Apply self-embedding strengthening and normalize (Eq. 1 in PoneGNN paper)
+        deg = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
+        self_emb_factor = (1 + self.epsilon_p) / (deg + 1)
 
-        new_user_emb = user_emb + item_to_user
-        new_item_emb = item_emb + user_to_item
+        new_user_emb = self_emb_factor.unsqueeze(1) * user_emb + item_to_user
+        new_item_emb = self_emb_factor.unsqueeze(1) * item_emb + user_to_item
 
         return new_user_emb, new_item_emb
 
@@ -320,17 +321,25 @@ class PoneGNN(GraphEncoder):
             user_emb[row] * norm.unsqueeze(1)
         )
 
-        # Apply self-embedding strengthening
-        new_user_emb = user_emb + item_to_user
-        new_item_emb = item_emb + user_to_item
+        # Apply self-embedding strengthening and normalize (Eq. 3 in PoneGNN paper)
+        deg = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
+        self_emb_factor = (1 + self.epsilon_n) / (deg + 1)
+
+        new_user_emb = self_emb_factor.unsqueeze(1) * user_emb + item_to_user
+        new_item_emb = self_emb_factor.unsqueeze(1) * item_emb + user_to_item
 
         return new_user_emb, new_item_emb
 
     def compute_contrastive_loss(self, user_emb_pos, item_emb_pos, user_emb_neg, item_emb_neg):
         """
         Compute contrastive learning loss (Eq. 7 and 13 in PoneGNN paper).
-        Maximizes similarity between positive embeddings while minimizing
-        similarity between disinterest embeddings.
+
+        Positive pairs: user_emb_pos ↔ item_emb_pos (user's interest with items they liked)
+        Negative pairs: user_emb_pos ↔ item_emb_neg (user's interest with items they disliked)
+
+        Items themselves don't have user-anchored pairs without interaction data,
+        so we use user-centric contrastive learning: pull user_emb_pos closer to
+        item_emb_pos, push it away from item_emb_neg.
         """
         # Normalize embeddings
         user_emb_pos = F.normalize(user_emb_pos, p=2, dim=1)
@@ -338,24 +347,18 @@ class PoneGNN(GraphEncoder):
         user_emb_neg = F.normalize(user_emb_neg, p=2, dim=1)
         item_emb_neg = F.normalize(item_emb_neg, p=2, dim=1)
 
-        # Compute similarity for positive pairs
-        pos_sim_user = torch.sum(user_emb_pos * user_emb_pos, dim=1)  # Should be close to 1
-        pos_sim_item = torch.sum(item_emb_pos * item_emb_pos, dim=1)
+        # Positive: user interest embedding should be close to items they liked
+        pos_sim_user = torch.sum(user_emb_pos * item_emb_pos, dim=1)
 
-        # Compute similarity for negative pairs (should be pushed apart)
-        neg_sim_user = torch.sum(user_emb_neg * user_emb_neg, dim=1)
-        neg_sim_item = torch.sum(item_emb_neg * item_emb_neg, dim=1)
+        # Negative: user interest embedding should be far from items they disliked
+        neg_sim_user = torch.sum(user_emb_pos * item_emb_neg, dim=1)
 
-        # Contrastive loss: bring positive pairs closer, push negative pairs apart
-        # Using InfoNCE-style loss
-        pos_loss = -torch.log(torch.exp(pos_sim_user / self.temperature) /
-                              (torch.exp(pos_sim_user / self.temperature) +
-                               torch.exp(neg_sim_user / self.temperature) + 1e-8)).mean()
-        pos_loss += -torch.log(torch.exp(pos_sim_item / self.temperature) /
-                               (torch.exp(pos_sim_item / self.temperature) +
-                                torch.exp(neg_sim_item / self.temperature) + 1e-8)).mean()
+        # InfoNCE-style: maximize pos similarity, minimize neg similarity
+        user_loss = -torch.log(torch.exp(pos_sim_user / self.temperature) /
+                               (torch.exp(pos_sim_user / self.temperature) +
+                                torch.exp(neg_sim_user / self.temperature) + 1e-8)).mean()
 
-        return self.lambda_cl * pos_loss
+        return self.lambda_cl * user_loss
 
     def compute_reg_loss(self):
         """Compute L2 regularization loss on initial embeddings."""

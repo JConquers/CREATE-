@@ -278,7 +278,7 @@ def train(args):
             w_info=args.w_info,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
-            gnn_layers=args.gnn_layers,
+            n_layers_gnn=args.gnn_layers,
         ).to(device)
         print(f"Model: CREATE++ with {args.sequential} + {args.graph}")
 
@@ -314,6 +314,7 @@ def train(args):
         total_align = 0.0
         total_ortho = 0.0
         total_contrast = 0.0
+        total_reg = 0.0
 
         perm = torch.randperm(len(seqs))
         for i in range(0, len(seqs), args.batch_size):
@@ -328,7 +329,7 @@ def train(args):
                 )
             else:
                 loss, loss_dict = model.compute_loss(
-                    batch_seqs, edge_index, edge_weight, epoch=epoch
+                    batch_seqs, edge_index, edge_weight
                 )
 
             loss.backward()
@@ -340,6 +341,7 @@ def train(args):
             total_align += loss_dict.get('alignment_loss', 0.0) + loss_dict.get('info_loss', 0.0)
             total_ortho += loss_dict.get('ortho_loss', 0.0)
             total_contrast += loss_dict.get('contrastive_loss', 0.0)
+            total_reg += loss_dict.get('reg_loss', 0.0)
 
         n_batches = len(seqs) // args.batch_size + 1
         avg_loss = total_loss / n_batches
@@ -348,11 +350,12 @@ def train(args):
         avg_align = total_align / n_batches
         avg_ortho = total_ortho / n_batches
         avg_contrast = total_contrast / n_batches
+        avg_reg = total_reg / n_batches
 
         if (epoch + 1) % args.log_every == 0:
             log_msg = (f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
                       f"Local: {avg_local:.4f} | Global: {avg_global:.4f} | "
-                      f"Align: {avg_align:.4f}")
+                      f"Align: {avg_align:.4f} | Reg: {avg_reg:.6f}")
             if args.graph == 'ponegnn':
                 log_msg += f" | Ortho: {avg_ortho:.4f} | Contrast: {avg_contrast:.4f}"
             print(log_msg)

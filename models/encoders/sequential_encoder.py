@@ -74,8 +74,7 @@ class SASRec(SequentialEncoder):
             embeddings = self.norm_layers[i](embeddings + attn_out)
 
             ffn_out = self.ffn_layers[i](embeddings)
-            embeddings = self.norm_layers[i + self.n_layers](embeddings + ffn_out) if i < self.n_layers else \
-                         self.norm_layers[i](embeddings + ffn_out)
+            embeddings = self.norm_layers[i](embeddings + ffn_out)
 
         return embeddings
 

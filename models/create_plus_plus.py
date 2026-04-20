@@ -156,9 +156,9 @@ class CreatePlusPlus(nn.Module):
             raise ValueError(f"Unknown sequential model: {sequential_model}")
 
         if graph_model.lower() == 'lightgcn':
-            self.graph_encoder = LightGCN(n_users, n_items, embedding_dim, **kwargs)
+            self.graph_encoder = LightGCN(n_users, n_items, embedding_dim, n_layers=kwargs.pop('n_layers_gnn', 4))
         elif graph_model.lower() == 'ultragcn':
-            self.graph_encoder = UltraGCN(n_users, n_items, embedding_dim, **kwargs)
+            self.graph_encoder = UltraGCN(n_users, n_items, embedding_dim, n_layers=kwargs.pop('n_layers_gnn', 4))
         elif graph_model.lower() == 'ponegnn':
             self.graph_encoder = PoneGNN(n_users, n_items, embedding_dim, **kwargs)
         else:
@@ -176,6 +176,60 @@ class CreatePlusPlus(nn.Module):
         self.w_global = w_global
         self.w_barlow = w_barlow
         self.w_info = w_info
+
+    def forward(self, seq, edge_index, edge_weight=None):
+        """Full forward pass computing fused embeddings."""
+        seq_emb = self.sequential_encoder(seq)
+        user_emb, item_emb = self.graph_encoder(edge_index, edge_weight)
+        last_item_emb = seq_emb[:, -1, :]
+        fused_emb = self.fusion(last_item_emb, item_emb)
+        return fused_emb, item_emb
+
+    def compute_loss(self, seq, edge_index, edge_weight=None, negatives=None):
+        """Compute total loss for CREATE++ model.
+
+        L = w_local * L_local + w_global * L_global + w_barlow * L_barlow + w_info * L_info
+        """
+        seq_emb = self.sequential_encoder(seq)
+        user_emb, item_emb = self.graph_encoder(edge_index, edge_weight)
+
+        last_item_emb = seq_emb[:, -1, :]
+        fused_emb = self.fusion(last_item_emb, item_emb)
+
+        # Local loss: next-item prediction from sequential encoder
+        local_loss = F.cross_entropy(
+            torch.mm(last_item_emb, item_emb[: self.n_items].t()),
+            seq[:, -1],
+        )
+
+        # Global loss: next-item prediction from fused embedding
+        global_loss = F.cross_entropy(
+            torch.mm(fused_emb, item_emb[: self.n_items].t()),
+            seq[:, -1],
+        )
+
+        # Alignment loss: Barlow Twins between local and global item embeddings
+        alignment_loss = self.barlow_loss(last_item_emb, item_emb)
+
+        info_loss = (
+            self.info_nce_loss(last_item_emb, item_emb, negatives)
+            if self.w_info > 0
+            else torch.tensor(0.0, device=last_item_emb.device)
+        )
+
+        total_loss = (
+            self.w_local * local_loss
+            + self.w_global * global_loss
+            + self.w_barlow * alignment_loss
+            + self.w_info * info_loss
+        )
+
+        return total_loss, {
+            "local_loss": local_loss.item(),
+            "global_loss": global_loss.item(),
+            "alignment_loss": alignment_loss.item(),
+            "info_loss": info_loss.item(),
+        }
 
 
 class CreatePone(nn.Module):
@@ -301,7 +355,7 @@ class CreatePone(nn.Module):
             # Standard Barlow Twins alignment between local and global (interest)
             alignment_loss = self.barlow_loss(last_item_emb, item_emb_pos)
 
-        if self.w_ortho > 0:
+        if self.w_ortho > 0 and negative_edge_index is not None:
             # Orthogonality constraint: push sequential rep away from disinterest
             # This is the "push" term in Eq. 15 (third term with mu coefficient)
             h_u_norm = F.normalize(last_item_emb, p=2, dim=1)
@@ -313,7 +367,7 @@ class CreatePone(nn.Module):
         info_loss = (
             self.info_nce_loss(last_item_emb, item_emb_pos, negatives)
             if self.w_info > 0
-            else torch.tensor(0.0)
+            else torch.tensor(0.0, device=last_item_emb.device)
         )
 
         # PoneGNN contrastive loss between positive and negative embeddings
@@ -322,8 +376,11 @@ class CreatePone(nn.Module):
                 user_emb_pos, item_emb_pos, user_emb_neg, item_emb_neg
             )
             if self.w_contrast > 0
-            else torch.tensor(0.0)
+            else torch.tensor(0.0, device=last_item_emb.device)
         )
+
+        # PoneGNN L2 regularization on embeddings
+        reg_loss = self.graph_encoder.compute_reg_loss()
 
         # Total loss (Eq. 16)
         total_loss = (
@@ -333,6 +390,7 @@ class CreatePone(nn.Module):
             + self.w_info * info_loss
             + self.w_ortho * ortho_loss
             + self.w_contrast * contrastive_loss
+            + reg_loss
         )
 
         return total_loss, {
@@ -342,6 +400,7 @@ class CreatePone(nn.Module):
             "ortho_loss": ortho_loss.item(),
             "info_loss": info_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "reg_loss": reg_loss.item(),
         }
 
     def recommend(self, seq, edge_index, edge_weight=None, negative_edge_index=None, k=10):
