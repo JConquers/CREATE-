@@ -1,5 +1,6 @@
 """Amazon Beauty dataset loader with automatic download and preprocessing."""
 
+import hashlib
 import gzip
 import pickle
 from pathlib import Path
@@ -21,6 +22,50 @@ class AmazonBeautyDataset(BaseDataset):
     """
 
     URL = "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Beauty_and_Personal_Care.csv.gz"
+
+    @staticmethod
+    def _resolve_column(columns: list[str], candidates: list[str], field_name: str) -> str:
+        for name in candidates:
+            if name in columns:
+                return name
+        raise KeyError(
+            f"Could not find required {field_name} column. "
+            f"Tried {candidates}. Available columns: {columns}"
+        )
+
+    def _normalize_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        columns = list(df.columns)
+        user_col = self._resolve_column(columns, ["user_id", "reviewerID", "reviewer_id"], "user")
+        item_col = self._resolve_column(columns, ["item_id", "parent_asin", "asin"], "item")
+        rating_col = self._resolve_column(columns, ["rating", "overall"], "rating")
+        time_col = self._resolve_column(columns, ["timestamp", "unixReviewTime", "time"], "timestamp")
+
+        normalized = df[[user_col, item_col, rating_col, time_col]].rename(
+            columns={
+                user_col: "user_id",
+                item_col: "item_id",
+                rating_col: "rating",
+                time_col: "timestamp",
+            }
+        ).copy()
+
+        normalized["rating"] = pd.to_numeric(normalized["rating"], errors="coerce")
+        normalized["timestamp"] = pd.to_numeric(normalized["timestamp"], errors="coerce")
+
+        missing_ts = normalized["timestamp"].isna()
+        if missing_ts.any():
+            parsed_ts = pd.to_datetime(df.loc[missing_ts, time_col], errors="coerce", utc=True)
+            normalized.loc[missing_ts, "timestamp"] = parsed_ts.map(
+                lambda x: x.timestamp() if pd.notna(x) else pd.NA
+            )
+            normalized["timestamp"] = pd.to_numeric(normalized["timestamp"], errors="coerce")
+
+        normalized = normalized.dropna(subset=["user_id", "item_id", "rating", "timestamp"])
+        if normalized.empty:
+            raise ValueError("No valid interactions after column normalization.")
+
+        normalized["timestamp"] = normalized["timestamp"].astype("int64")
+        return normalized
 
     def __init__(self, data_dir: str, max_sequence_length: int = 50):
         super().__init__(data_dir, max_sequence_length)
@@ -49,110 +94,117 @@ class AmazonBeautyDataset(BaseDataset):
         urllib.request.urlretrieve(self.URL, self.raw_file, reporthook)
         print(f"\nDownload complete: {self.raw_file}")
 
+    def _compute_hash(self, filepath: Path) -> str:
+        """Compute MD5 hash of a file."""
+        hash_md5 = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
     def _preprocess(self):
         """Preprocess the raw dataset with leave-last-out splitting."""
+        # Check if processed file exists
         if self.processed_file.exists():
             print(f"Loading preprocessed data from {self.processed_file}")
-            self._load_processed_data()
+            with open(self.processed_file, 'rb') as f:
+                data = pickle.load(f)
+                self.train_df = data['train_df']
+                self.val_df = data['val_df']
+                self.test_df = data['test_df']
+                self.num_users = data['num_users']
+                self.num_items = data['num_items']
+                self.user2items = data['user2items']
+                self.item2users = data['item2users']
+                self.user_sequences = data.get('user_sequences', {})
             return
 
+        # Download if needed
         self._download()
+
         print("Preprocessing dataset...")
 
+        # Read the CSV
         with gzip.open(self.raw_file, 'rt') as f:
             df = pd.read_csv(f)
 
-        # Amazon 2023 dataset column names: user_id, item_id, rating, timestamp
-        # Check and rename columns if needed
-        print(f"Original columns: {df.columns.tolist()}")
+        # Normalize schema differences across Amazon dumps.
+        df = self._normalize_raw_columns(df)
 
-        # Handle different column name formats
-        column_mapping = {}
-        if 'user_id' not in df.columns:
-            if 'User_ID' in df.columns:
-                column_mapping['User_ID'] = 'user_id'
-            elif 'userId' in df.columns:
-                column_mapping['userId'] = 'user_id'
-            elif 'reviewerID' in df.columns:
-                column_mapping['reviewerID'] = 'user_id'
-
-        if 'item_id' not in df.columns:
-            if 'Item_ID' in df.columns:
-                column_mapping['Item_ID'] = 'item_id'
-            elif 'asin' in df.columns:
-                column_mapping['asin'] = 'item_id'
-            elif 'product_id' in df.columns:
-                column_mapping['product_id'] = 'item_id'
-
-        if 'rating' not in df.columns:
-            if 'Rating' in df.columns:
-                column_mapping['Rating'] = 'rating'
-            elif 'stars' in df.columns:
-                column_mapping['stars'] = 'rating'
-
-        if 'timestamp' not in df.columns:
-            if 'Timestamp' in df.columns:
-                column_mapping['Timestamp'] = 'timestamp'
-            elif 'unix_review_time' in df.columns:
-                column_mapping['unix_review_time'] = 'timestamp'
-            else:
-                # Create synthetic timestamp if not available
-                print("No timestamp column found, creating synthetic timestamps...")
-                df['timestamp'] = range(len(df))
-
-        if column_mapping:
-            df = df.rename(columns=column_mapping)
-            print(f"Renamed columns: {column_mapping}")
-
-        # Select and order columns
-        df = df[['user_id', 'item_id', 'rating', 'timestamp']].copy()
+        # Sort by user and timestamp to ensure chronological order
         df = df.sort_values(['user_id', 'timestamp'])
 
-        train_rows, val_rows, test_rows = [], [], []
+        # Leave-last-out splitting
+        train_rows = []
+        val_rows = []
+        test_rows = []
 
         for user_id, user_data in df.groupby('user_id'):
             user_interactions = user_data.values.tolist()
             n = len(user_interactions)
 
             if n >= 3:
+                # Train: all except last 2
                 train_rows.extend(user_interactions[:-2])
+                # Val: second to last
                 val_rows.append(user_interactions[-2])
+                # Test: last
                 test_rows.append(user_interactions[-1])
             elif n == 2:
+                # Train: first
                 train_rows.append(user_interactions[0])
+                # Val: second (no test)
                 val_rows.append(user_interactions[1])
             else:
+                # Only 1 interaction - put in train
                 train_rows.extend(user_interactions)
 
         self.train_df = pd.DataFrame(train_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
         self.val_df = pd.DataFrame(val_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
         self.test_df = pd.DataFrame(test_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
 
+        # Create contiguous IDs
         all_users = set()
         all_items = set()
-        for data_df in [self.train_df, self.val_df, self.test_df]:
-            all_users.update(data_df['user_id'].unique())
-            all_items.update(data_df['item_id'].unique())
+        for df in [self.train_df, self.val_df, self.test_df]:
+            all_users.update(df['user_id'].unique())
+            all_items.update(df['item_id'].unique())
 
         user_map = {old: new for new, old in enumerate(sorted(all_users))}
         item_map = {old: new for new, old in enumerate(sorted(all_items))}
 
-        for data_df in [self.train_df, self.val_df, self.test_df]:
-            data_df['user_id'] = data_df['user_id'].map(user_map).astype(int)
-            data_df['item_id'] = data_df['item_id'].map(item_map).astype(int)
+        for df in [self.train_df, self.val_df, self.test_df]:
+            df['user_id'] = df['user_id'].map(user_map).astype(int)
+            df['item_id'] = df['item_id'].map(item_map).astype(int)
 
         self.num_users = len(all_users)
         self.num_items = len(all_items)
 
+        # Build mappings
         self.build_user_item_index()
+
+        # Build user sequences for sequential models
         self.user_sequences = {}
         for user_id, group in self.train_df.groupby('user_id'):
             items = group.sort_values('timestamp')['item_id'].tolist()
             self.user_sequences[user_id] = items[-self.max_sequence_length:]
 
-        self._save_processed_data()
+        # Save processed data
+        print(f"Saving preprocessed data to {self.processed_file}")
+        data = {
+            'train_df': self.train_df,
+            'val_df': self.val_df,
+            'test_df': self.test_df,
+            'num_users': self.num_users,
+            'num_items': self.num_items,
+            'user2items': dict(self.user2items),
+            'item2users': dict(self.item2users),
+            'user_sequences': self.user_sequences,
+        }
+        with open(self.processed_file, 'wb') as f:
+            pickle.dump(data, f)
 
-        print("Preprocessing complete!")
+        print(f"Preprocessing complete!")
         print(f"  Users: {self.num_users:,}")
         print(f"  Items: {self.num_items:,}")
         print(f"  Train interactions: {len(self.train_df):,}")
@@ -163,3 +215,12 @@ class AmazonBeautyDataset(BaseDataset):
         """Load or preprocess and load the dataset."""
         self._preprocess()
         return self.train_df, self.val_df, self.test_df
+
+    def get_user_sequences(self) -> dict:
+        """Return user-item sequences for sequential models."""
+        if not hasattr(self, 'user_sequences'):
+            self.user_sequences = {}
+            for user_id, group in self.train_df.groupby('user_id'):
+                items = group.sort_values('timestamp')['item_id'].tolist()
+                self.user_sequences[user_id] = items[-self.max_sequence_length:]
+        return self.user_sequences
