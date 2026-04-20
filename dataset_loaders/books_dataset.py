@@ -22,6 +22,50 @@ class AmazonBooksDataset(BaseDataset):
 
     URL = "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Books.csv.gz"
 
+    @staticmethod
+    def _resolve_column(columns: list[str], candidates: list[str], field_name: str) -> str:
+        for name in candidates:
+            if name in columns:
+                return name
+        raise KeyError(
+            f"Could not find required {field_name} column. "
+            f"Tried {candidates}. Available columns: {columns}"
+        )
+
+    def _normalize_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        columns = list(df.columns)
+        user_col = self._resolve_column(columns, ["user_id", "reviewerID", "reviewer_id"], "user")
+        item_col = self._resolve_column(columns, ["item_id", "parent_asin", "asin"], "item")
+        rating_col = self._resolve_column(columns, ["rating", "overall"], "rating")
+        time_col = self._resolve_column(columns, ["timestamp", "unixReviewTime", "time"], "timestamp")
+
+        normalized = df[[user_col, item_col, rating_col, time_col]].rename(
+            columns={
+                user_col: "user_id",
+                item_col: "item_id",
+                rating_col: "rating",
+                time_col: "timestamp",
+            }
+        ).copy()
+
+        normalized["rating"] = pd.to_numeric(normalized["rating"], errors="coerce")
+        normalized["timestamp"] = pd.to_numeric(normalized["timestamp"], errors="coerce")
+
+        missing_ts = normalized["timestamp"].isna()
+        if missing_ts.any():
+            parsed_ts = pd.to_datetime(df.loc[missing_ts, time_col], errors="coerce", utc=True)
+            normalized.loc[missing_ts, "timestamp"] = parsed_ts.map(
+                lambda x: x.timestamp() if pd.notna(x) else pd.NA
+            )
+            normalized["timestamp"] = pd.to_numeric(normalized["timestamp"], errors="coerce")
+
+        normalized = normalized.dropna(subset=["user_id", "item_id", "rating", "timestamp"])
+        if normalized.empty:
+            raise ValueError("No valid interactions after column normalization.")
+
+        normalized["timestamp"] = normalized["timestamp"].astype("int64")
+        return normalized
+
     def __init__(self, data_dir: str, max_sequence_length: int = 50):
         super().__init__(data_dir, max_sequence_length)
         self.dataset_name = 'amazon_books'
@@ -118,9 +162,8 @@ class AmazonBooksDataset(BaseDataset):
         with gzip.open(self.raw_file, 'rt') as f:
             df = pd.read_csv(f)
 
-        # Expected columns: user_id, item_id, parent_asin, rating, timestamp
-        # Keep only needed columns
-        df = df[['user_id', 'item_id', 'rating', 'timestamp']].copy()
+        # Normalize schema differences across Amazon dumps.
+        df = self._normalize_raw_columns(df)
 
         # Sort by user and timestamp to ensure chronological order
         df = df.sort_values(['user_id', 'timestamp'])
