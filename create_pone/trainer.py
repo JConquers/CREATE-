@@ -138,6 +138,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save an epoch checkpoint every N epochs. Use <=0 to disable periodic saves.",
+    )
 
     return parser
 
@@ -243,6 +249,18 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
 
     history = []
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"create_pone_{args.dataset}_{stamp}"
+
+    checkpoint_dir = output_dir / f"{run_prefix}_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    best_checkpoint_path = output_dir / f"{run_prefix}_best.pt"
+    best_total = float("inf")
+
     print(
         "Loaded dataset:",
         f"users={bundle.num_users}",
@@ -309,16 +327,49 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             f"align={epoch_metrics['align']:.4f}"
         )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        if epoch_metrics["total"] < best_total:
+            best_total = epoch_metrics["total"]
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "best_total": best_total,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "args": vars(args),
+                    "num_users": bundle.num_users,
+                    "num_items": bundle.num_items,
+                    "pad_id": bundle.num_items,
+                },
+                best_checkpoint_path,
+            )
+            print(f"Saved best checkpoint to: {best_checkpoint_path}")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_path = output_dir / f"create_pone_{args.dataset}_{stamp}.pt"
-    history_path = output_dir / f"create_pone_{args.dataset}_{stamp}_history.json"
+        if args.checkpoint_every > 0 and ((epoch + 1) % args.checkpoint_every == 0):
+            epoch_checkpoint_path = checkpoint_dir / f"{run_prefix}_epoch_{epoch + 1:03d}.pt"
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "args": vars(args),
+                    "num_users": bundle.num_users,
+                    "num_items": bundle.num_items,
+                    "pad_id": bundle.num_items,
+                },
+                epoch_checkpoint_path,
+            )
+            print(f"Saved epoch checkpoint to: {epoch_checkpoint_path}")
+
+    checkpoint_path = output_dir / f"{run_prefix}.pt"
+    history_path = output_dir / f"{run_prefix}_history.json"
 
     torch.save(
         {
+            "epoch": args.epochs,
+            "best_total": best_total,
+            "best_checkpoint_path": str(best_checkpoint_path),
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
             "num_users": bundle.num_users,
             "num_items": bundle.num_items,
