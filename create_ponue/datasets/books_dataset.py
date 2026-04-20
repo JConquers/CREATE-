@@ -162,6 +162,10 @@ class BooksDataset:
         }
 
     def load(self, rating_threshold=4):
-        """Main entry point to load and process the dataset."""
+        """Main entry point to load and process the dataset.
+
+        Args:
+            rating_threshold: Ratings >= threshold are positive, else negative
+        """
         self.download()
         return self.process(rating_threshold=rating_threshold)

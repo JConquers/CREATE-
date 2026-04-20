@@ -166,7 +166,7 @@ class BeautyDataset:
             "n_negative": data["neg_edge_index"].shape[1],
         }
 
-    def load(self):
+    def load(self, rating_threshold=4):
         """Main entry point to load and process the dataset."""
         self.download()
-        return self.process()
+        return self.process(rating_threshold=rating_threshold)
