@@ -1,18 +1,24 @@
 """Base dataset class for sequential recommendation datasets."""
 
-from abc import ABC, abstractmethod
+import pickle
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
 
-class BaseDataset(ABC):
-    """Abstract base class for dataset loaders."""
+class BaseDataset:
+    """Base class for dataset loaders.
+
+    Provides common functionality:
+    - Train/val/test DataFrames with contiguous user/item IDs
+    - User-item interaction mappings
+    - Pickled cache for fast reloading
+    - Graph edge construction for signed graph learning
+    """
 
     def __init__(self, data_dir: str, max_sequence_length: int = 50):
         self.data_dir = Path(data_dir)
@@ -24,11 +30,7 @@ class BaseDataset(ABC):
         self.num_items = 0
         self.user2items = defaultdict(list)
         self.item2users = defaultdict(list)
-
-    @abstractmethod
-    def load_data(self):
-        """Load and preprocess the dataset."""
-        pass
+        self.user_sequences = {}
 
     def build_user_item_index(self):
         """Build user-to-items and item-to-users mappings."""
@@ -45,81 +47,40 @@ class BaseDataset(ABC):
             'num_items': self.num_items,
             'num_interactions': len(self.train_df),
             'sparsity': 1 - len(self.train_df) / (self.num_users * self.num_items),
-            'avg_sequence_length': np.mean([len(seq) for seq in self.user2items.values()])
+            'avg_interactions_per_user': len(self.train_df) / self.num_users,
         }
 
-
-class SequenceDataset(Dataset):
-    """PyTorch Dataset for sequential recommendations."""
-
-    def __init__(self, user_sequences: dict, mode: str = 'train'):
-        """
-        Args:
-            user_sequences: Dict mapping user_id to list of item_ids
-            mode: One of 'train', 'validation', 'test'
-        """
-        self.mode = mode
-        self._index = []
-        for user_id, item_seq in sorted(user_sequences.items(), key=lambda x: x[0]):
-            self._index.append({
-                'user.ids': user_id,
-                'item.ids': item_seq,
-            })
-
-    def __len__(self):
-        return len(self._index)
-
-    def __getitem__(self, index):
-        return self._index[index]
-
-
-class SASRecCollator:
-    """Collator for SASRec model batches."""
-
-    def __init__(self, pad_id: int = 0, mode: str = 'train'):
-        self.pad_id = pad_id
-        self.mode = mode
-
-    def __call__(self, batch):
-        processed = {
-            'user.ids': [],
-            'item.ids': [],
-            'item.length': [],
-            'labels.ids': [],
+    def _save_processed_data(self, extra_data: dict = None):
+        """Save processed data to pickle file."""
+        data = {
+            'train_df': self.train_df,
+            'val_df': self.val_df,
+            'test_df': self.test_df,
+            'num_users': self.num_users,
+            'num_items': self.num_items,
+            'user2items': dict(self.user2items),
+            'item2users': dict(self.item2users),
+            'user_sequences': self.user_sequences,
         }
+        if extra_data:
+            data.update(extra_data)
 
-        for sample in batch:
-            processed['user.ids'].append(sample['user.ids'])
-            if self.mode == 'train':
-                context_seq = sample['item.ids']
-                label_seq = sample['item.ids'][1:]
-            else:
-                context_seq = sample['item.ids'][:-1]
-                label_seq = [sample['item.ids'][-1]]
+        self.processed_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.processed_file, 'wb') as f:
+            pickle.dump(data, f)
 
-            processed['item.ids'].extend(context_seq)
-            processed['item.length'].append(len(context_seq))
-            processed['labels.ids'].extend(label_seq)
-
-        for key in processed:
-            processed[key] = torch.tensor(processed[key], dtype=torch.long)
-
-        # Pad sequences
-        max_len = max(processed['item.length'])
-        batch_size = len(processed['item.length'])
-        padded_seq = torch.full((batch_size, max_len), self.pad_id, dtype=torch.long)
-        mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
-
-        for i, length in enumerate(processed['item.length']):
-            padded_seq[i, :length] = processed['item.ids'][
-                sum(processed['item.length'][:i]):sum(processed['item.length'][:i+1])
-            ]
-            mask[i, :length] = True
-
-        processed['padded_sequence_ids'] = padded_seq
-        processed['mask'] = mask
-
-        return processed
+    def _load_processed_data(self):
+        """Load processed data from pickle file."""
+        with open(self.processed_file, 'rb') as f:
+            data = pickle.load(f)
+            self.train_df = data['train_df']
+            self.val_df = data['val_df']
+            self.test_df = data['test_df']
+            self.num_users = data['num_users']
+            self.num_items = data['num_items']
+            self.user2items = data['user2items']
+            self.item2users = data['item2users']
+            self.user_sequences = data.get('user_sequences', {})
 
 
 def build_graph_edges(train_df: pd.DataFrame, num_users: int, num_items: int,

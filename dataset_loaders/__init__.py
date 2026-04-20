@@ -1,16 +1,17 @@
 """Dataset loaders package for sequential recommendation models."""
 
-from .base_dataset import BaseDataset, SequenceDataset, SASRecCollator, build_graph_edges
-from .beauty_dataset import AmazonBeautyDataset
+from .base_dataset import BaseDataset, build_graph_edges
+from .collators import SequenceDataset, SASRecCollator
 from .books_dataset import AmazonBooksDataset
+from .beauty_dataset import AmazonBeautyDataset
 
 __all__ = [
     'BaseDataset',
     'SequenceDataset',
     'SASRecCollator',
     'build_graph_edges',
-    'AmazonBeautyDataset',
     'AmazonBooksDataset',
+    'AmazonBeautyDataset',
 ]
 
 

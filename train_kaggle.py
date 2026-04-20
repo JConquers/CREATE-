@@ -28,8 +28,7 @@ from tqdm import tqdm
 
 # Import local modules
 from dataset_loaders import get_dataset, SequenceDataset, SASRecCollator, build_graph_edges
-from models.fusion import CREATEPlusPlusModel
-from models.encoders import PoneGNNEncoder, SASRecEncoder
+from models import CREATEPlusPlusModel, PoneGNNEncoder, SASRecEncoder
 
 
 def setup_seed(seed: int = 42):

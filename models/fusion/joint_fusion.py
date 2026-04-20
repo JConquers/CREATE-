@@ -6,6 +6,7 @@ with four loss components:
 2. Dual-Feedback Loss - Separate BPR for positive/negative rated items
 3. Barlow Twins Alignment Loss - Redundancy reduction between encoders
 4. Orthogonal Loss - Decorrelate positive/negative graph embeddings
+Plus: Contrastive Loss from Pone-GNN for cross-space alignment
 """
 
 import torch
@@ -14,7 +15,14 @@ import torch.nn.functional as F
 
 
 class JointFusionModule(nn.Module):
-    """Fusion module for combining sequential and graph embeddings."""
+    """Fusion module for combining sequential and graph embeddings.
+
+    Supports multiple fusion strategies:
+    - concat: Concatenate and project
+    - sum: Element-wise sum
+    - gate: Learned gating mechanism
+    - mlp: MLP fusion
+    """
 
     def __init__(
         self,
@@ -50,7 +58,15 @@ class JointFusionModule(nn.Module):
             raise ValueError(f"Unknown fusion type: {fusion_type}")
 
     def forward(self, sequential_emb: torch.Tensor, graph_emb: torch.Tensor) -> torch.Tensor:
-        """Fuse sequential and graph embeddings."""
+        """Fuse sequential and graph embeddings.
+
+        Args:
+            sequential_emb: Embeddings from SASRec encoder (batch, dim)
+            graph_emb: Embeddings from PoneGNN encoder (batch, dim)
+
+        Returns:
+            Fused embeddings (batch, dim)
+        """
         if self.fusion_type == 'concat':
             combined = torch.cat([sequential_emb, graph_emb], dim=-1)
             fused = self.output_proj(combined)
@@ -72,11 +88,32 @@ class JointFusionModule(nn.Module):
 class CREATEPlusPlusModel(nn.Module):
     """CREATE++ Pone variant model with joint SASRec + PoneGNN training.
 
-    Implements the four loss components from CREATE++ paper:
-    1. Sequential Loss (SASRec cross-entropy)
-    2. Dual-Feedback Loss (positive/negative BPR)
-    3. Barlow Twins Alignment Loss (redundancy reduction)
-    4. Orthogonal Loss (embedding decorrelation)
+    Implements all five loss components:
+    1. Sequential Loss (SASRec cross-entropy) - learns temporal patterns
+    2. Dual-Feedback Loss (positive/negative BPR) - learns from ratings
+    3. Barlow Twins Alignment Loss (redundancy reduction) - aligns encoders
+    4. Orthogonal Loss (embedding decorrelation) - decorrelates pos/neg
+    5. Contrastive Loss (InfoNCE-style) - cross-space alignment
+
+    Args:
+        num_users: Number of users
+        num_items: Number of items
+        embedding_dim: Embedding dimension
+        sasrec_heads: Number of attention heads in SASRec
+        sasrec_layers: Number of transformer layers in SASRec
+        ponegnn_layers: Number of graph convolution layers in PoneGNN
+        max_sequence_length: Maximum sequence length
+        fusion_type: Fusion strategy ('concat', 'sum', 'gate', 'mlp')
+        fusion_hidden_dim: Hidden dimension for MLP fusion
+        dim_feedforward: Feedforward dimension in SASRec transformer
+        dropout: Dropout rate
+        reg: L2 regularization
+        barlow_weight: Weight for Barlow Twins loss
+        orthogonal_weight: Weight for orthogonal loss
+        dual_feedback_weight: Weight for dual-feedback loss
+        contrastive_weight: Weight for contrastive loss
+        temperature: Temperature for contrastive loss
+        contrastive_interval: Apply contrastive loss every N epochs
     """
 
     def __init__(
@@ -89,11 +126,16 @@ class CREATEPlusPlusModel(nn.Module):
         ponegnn_layers: int = 2,
         max_sequence_length: int = 50,
         fusion_type: str = 'concat',
+        fusion_hidden_dim: int = 128,
+        dim_feedforward: int = 256,
         dropout: float = 0.1,
         reg: float = 1e-4,
         barlow_weight: float = 0.01,
         orthogonal_weight: float = 0.01,
         dual_feedback_weight: float = 1.0,
+        contrastive_weight: float = 0.1,
+        temperature: float = 1.0,
+        contrastive_interval: int = 10,
     ):
         super().__init__()
         self.num_users = num_users
@@ -109,25 +151,31 @@ class CREATEPlusPlusModel(nn.Module):
             embedding_dim=embedding_dim,
             num_heads=sasrec_heads,
             num_layers=sasrec_layers,
-            dim_feedforward=embedding_dim * 4,
+            dim_feedforward=dim_feedforward,
             dropout=dropout,
             max_sequence_length=max_sequence_length,
         )
 
-        # Graph encoder (PoneGNN)
+        # Graph encoder (PoneGNN) - with contrastive learning support
         self.graph_encoder = PoneGNNEncoder(
             num_users=num_users,
             num_items=num_items,
             embedding_dim=embedding_dim,
             num_layers=ponegnn_layers,
             reg=reg,
+            temperature=temperature,
+            contrastive_weight=contrastive_weight,
         )
 
         # Fusion module
         self.fusion_module = JointFusionModule(
             embedding_dim=embedding_dim,
             fusion_type=fusion_type,
+            hidden_dim=fusion_hidden_dim,
         )
+
+        # Contrastive loss interval
+        self.contrastive_interval = contrastive_interval
 
         # Output projection
         self.output_projection = nn.Linear(embedding_dim, num_items + 1)
@@ -136,10 +184,12 @@ class CREATEPlusPlusModel(nn.Module):
         self.barlow_weight = barlow_weight
         self.orthogonal_weight = orthogonal_weight
         self.dual_feedback_weight = dual_feedback_weight
+        self.contrastive_weight = contrastive_weight
 
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize output projection weights."""
         nn.init.xavier_normal_(self.output_projection.weight)
 
     def forward(
@@ -150,7 +200,26 @@ class CREATEPlusPlusModel(nn.Module):
         neg_edge_index: torch.Tensor = None,
         training_graph: bool = False,
     ) -> dict:
-        """Forward pass for CREATE++ model."""
+        """
+        Forward pass for CREATE++ model.
+
+        Args:
+            item_sequences: Item sequences (batch_size, seq_len)
+            mask: Boolean mask for valid positions (batch_size, seq_len)
+            pos_edge_index: Positive edge indices (2, num_pos_edges)
+            neg_edge_index: Negative edge indices (2, num_neg_edges)
+            training_graph: Whether to use graph encoder
+
+        Returns:
+            Dictionary containing:
+            - sequential_scores: Scores from sequential encoder
+            - sequential_emb: Sequential embeddings
+            - user_pos_emb: User positive graph embeddings (if graph enabled)
+            - user_neg_emb: User negative graph embeddings (if graph enabled)
+            - item_pos_emb: Item positive graph embeddings (if graph enabled)
+            - fused_emb: Fused embeddings
+            - fused_scores: Scores from fused embeddings
+        """
         # Get sequential embeddings
         seq_output = self.sequential_encoder(item_sequences, mask)
         sequential_emb = seq_output['user_embedding']
@@ -197,30 +266,34 @@ class CREATEPlusPlusModel(nn.Module):
         Computes cross-correlation matrix between sequential and graph
         embeddings and penalizes deviation from identity.
 
+        The loss has two terms:
+        - On-diagonal: Forces correlation of corresponding features to 1 (alignment)
+        - Off-diagonal: Forces correlation of different features to 0 (redundancy reduction)
+
         Args:
-            z_seq: Sequential embeddings (batch, dim)
-            z_graph: Graph embeddings (batch, dim)
+            z_seq: Sequential embeddings from SASRec (batch_size, embedding_dim)
+            z_graph: Graph embeddings from PoneGNN (batch_size, embedding_dim)
 
         Returns:
-            Barlow Twins loss
+            Barlow Twins loss scalar
         """
         batch_size = z_seq.size(0)
 
-        # Normalize along feature dimension
+        # Normalize along feature dimension (zero mean, unit variance)
         z_seq_norm = (z_seq - z_seq.mean(dim=0)) / (z_seq.std(dim=0) + 1e-8)
         z_graph_norm = (z_graph - z_graph.mean(dim=0)) / (z_graph.std(dim=0) + 1e-8)
 
-        # Cross-correlation matrix
+        # Cross-correlation matrix: C_ij = correlation between seq feature i and graph feature j
         correlation = torch.mm(z_seq_norm.t(), z_graph_norm) / batch_size
 
-        # Loss: diagonal to 1, off-diagonal to 0
+        # Loss: diagonal to 1 (alignment), off-diagonal to 0 (redundancy reduction)
         diagonal = torch.diag(correlation)
         off_diagonal = correlation - torch.diag_embed(diagonal)
 
-        # On-diagonal: (1 - corr_ii)^2
+        # On-diagonal: (1 - corr_ii)^2 - want features to be similar across views
         on_diag_loss = ((1 - diagonal) ** 2).sum()
 
-        # Off-diagonal: sum(corr_ij^2) for i != j
+        # Off-diagonal: sum(corr_ij^2) for i != j - want to reduce redundancy
         off_diag_loss = (off_diagonal ** 2).sum()
 
         return on_diag_loss + self.barlow_weight * off_diag_loss
@@ -230,23 +303,24 @@ class CREATEPlusPlusModel(nn.Module):
         Orthogonal loss to decorrelate positive and negative embeddings.
 
         Encourages positive and negative embeddings to be orthogonal
-        (uncorrelated) to learn distinct representations.
+        (uncorrelated), enabling them to learn distinct representations
+        for positive vs negative feedback patterns.
 
         Args:
-            pos_emb: Positive embeddings (batch, dim)
-            neg_emb: Negative embeddings (batch, dim)
+            pos_emb: Positive embeddings from PoneGNN (batch_size, embedding_dim)
+            neg_emb: Negative embeddings from PoneGNN (batch_size, embedding_dim)
 
         Returns:
-            Orthogonal regularization loss
+            Orthogonal regularization loss scalar
         """
-        # Normalize
+        # L2 normalize
         pos_norm = F.normalize(pos_emb, dim=1)
         neg_norm = F.normalize(neg_emb, dim=1)
 
         # Cosine similarity - should be close to 0 (orthogonal)
         similarity = (pos_norm * neg_norm).sum(dim=1)
 
-        # Penalize non-orthogonality
+        # Penalize non-orthogonality: minimize squared cosine similarity
         return (similarity ** 2).mean()
 
     def dual_feedback_loss(
@@ -264,18 +338,21 @@ class CREATEPlusPlusModel(nn.Module):
         Positive feedback (rating > 3.5): Learn to rank positive items higher
         Negative feedback (rating < 3.5): Learn to rank negative items lower
 
+        This implements the key insight from Pone-GNN: negative feedback should
+        actively push away unwanted items, not just rank them lower.
+
         Args:
-            users: User indices
-            pos_items: Positive item indices
-            neg_items: Negative sample indices
-            pos_emb: Positive embeddings from PoneGNN
-            neg_emb: Negative embeddings from PoneGNN
+            users: User indices (batch_size,)
+            pos_items: Positive item indices (batch_size,)
+            neg_items: Negative sample indices (batch_size,)
+            pos_emb: Positive embeddings from PoneGNN (num_users + num_items, dim)
+            neg_emb: Negative embeddings from PoneGNN (num_users + num_items, dim)
             ratings: Optional ratings for weighting
 
         Returns:
             Tuple of (positive_bpr_loss, negative_bpr_loss)
         """
-        # Get embeddings
+        # Get embeddings for users and items
         u_pos = pos_emb[users]
         u_neg = neg_emb[users]
         i_pos = pos_emb[self.num_users + pos_items]
@@ -284,12 +361,13 @@ class CREATEPlusPlusModel(nn.Module):
         n_neg = neg_emb[self.num_users + neg_items]
 
         # Positive BPR: maximize u_pos · i_pos - u_pos · n_pos
+        # Learn to rank positively-rated items higher than negative samples
         pos_scores = (u_pos * i_pos).sum(dim=1)
         neg_scores = (u_pos * n_pos).sum(dim=1)
         pos_bpr = -F.logsigmoid(pos_scores - neg_scores).mean()
 
         # Negative BPR: maximize u_neg · n_neg - u_neg · i_neg
-        # (push away from negative items)
+        # Learn to push away negatively-rated items
         neg_scores_neg = (u_neg * n_neg).sum(dim=1)
         pos_scores_neg = (u_neg * i_neg).sum(dim=1)
         neg_bpr = -F.logsigmoid(neg_scores_neg - pos_scores_neg).mean()
@@ -306,22 +384,40 @@ class CREATEPlusPlusModel(nn.Module):
         negative_samples: torch.Tensor,
         epoch: int,
         ratings: torch.Tensor = None,
+        apply_contrastive: bool = True,
     ) -> dict:
         """
-        Compute CREATE++ joint loss with all four components.
+        Compute CREATE++ joint loss with all five components.
+
+        Loss components:
+        1. Sequential Loss (SASRec Cross-Entropy) - learns temporal patterns
+        2. Dual-Feedback Loss (Positive/Negative BPR) - learns from ratings
+        3. Barlow Twins Alignment Loss - redundancy reduction between encoders
+        4. Orthogonal Loss - decorrelates pos/neg embeddings
+        5. Contrastive Loss - InfoNCE-style cross-space alignment (every 10 epochs)
 
         Args:
             item_sequences: Item sequences (batch_size, seq_len)
             mask: Boolean mask (batch_size, seq_len)
-            labels: Target item labels
-            pos_edge_index: Positive edge indices
-            neg_edge_index: Negative edge indices
-            negative_samples: Negative samples for BPR
-            epoch: Current epoch
+            labels: Target item labels (batch_size,)
+            pos_edge_index: Positive edge indices (2, num_pos_edges)
+            neg_edge_index: Negative edge indices (2, num_neg_edges)
+            negative_samples: Negative samples for BPR (batch_size,)
+            epoch: Current epoch (for contrastive loss triggering)
             ratings: Optional ratings for dual-feedback weighting
+            apply_contrastive: Whether to apply contrastive loss
 
         Returns:
-            Dictionary of loss components
+            Dictionary of loss components:
+            - total_loss: Combined weighted loss
+            - sequential_loss: SASRec cross-entropy
+            - fused_loss: Fused prediction cross-entropy
+            - dual_feedback_loss: Combined positive + negative BPR
+            - pos_bpr_loss: Positive BPR loss
+            - neg_bpr_loss: Negative BPR loss
+            - barlow_loss: Barlow Twins alignment loss
+            - orthogonal_loss: Orthogonal regularization loss
+            - contrastive_loss: InfoNCE contrastive loss
         """
         users = item_sequences[:, 0]
 
@@ -342,10 +438,12 @@ class CREATEPlusPlusModel(nn.Module):
         user_neg_emb = output['user_neg_emb']
 
         # 1. Sequential Loss (SASRec Cross-Entropy)
+        # Learns temporal patterns in user behavior sequences
         seq_scores = output['sequential_scores']
         seq_loss = F.cross_entropy(seq_scores, labels)
 
         # 2. Dual-Feedback Loss (Positive/Negative BPR)
+        # Learns separately from positive and negative interactions
         pos_bpr_loss, neg_bpr_loss = self.dual_feedback_loss(
             users=users,
             pos_items=labels,
@@ -354,25 +452,39 @@ class CREATEPlusPlusModel(nn.Module):
             neg_emb=self.graph_encoder.neg_emb,
             ratings=ratings,
         )
-        dual_feedback_loss = pos_bpr_loss + neg_bpr_loss
+        dual_feedback_loss = self.dual_feedback_weight * (pos_bpr_loss + neg_bpr_loss)
 
         # 3. Barlow Twins Alignment Loss
+        # Reduces redundancy between sequential and graph encoders
         barlow_loss = self.barlow_twins_loss(sequential_emb, user_pos_emb)
 
-        # 4. Orthogonal Loss (decorrelate pos/neg embeddings)
+        # 4. Orthogonal Loss
+        # Decorrelates positive and negative embeddings
         ortho_loss = self.orthogonal_loss(user_pos_emb, user_neg_emb)
+
+        # 5. Contrastive Loss (InfoNCE-style)
+        # Applied every N epochs as per Pone-GNN design
+        # Aligns positive and negative embedding spaces
+        contrastive_loss = torch.tensor(0.0, device=sequential_emb.device)
+        if apply_contrastive and (epoch % self.contrastive_interval == 1 or epoch == 1):
+            contrastive_loss = self.graph_encoder.compute_contrastive_loss(
+                users=users,
+                pos_items=labels,
+                neg_items=neg_items,
+            )
 
         # Fused prediction loss
         fused_scores = output['fused_scores']
         fused_loss = F.cross_entropy(fused_scores, labels)
 
-        # Total loss
+        # Total loss: sum of all components with their weights
         total_loss = (
             seq_loss +
             fused_loss +
             dual_feedback_loss +
             self.barlow_weight * barlow_loss +
-            self.orthogonal_weight * ortho_loss
+            self.orthogonal_weight * ortho_loss +
+            contrastive_loss
         )
 
         return {
@@ -384,6 +496,7 @@ class CREATEPlusPlusModel(nn.Module):
             'neg_bpr_loss': neg_bpr_loss,
             'barlow_loss': barlow_loss,
             'orthogonal_loss': ortho_loss,
+            'contrastive_loss': contrastive_loss,
         }
 
     def predict(
@@ -394,7 +507,19 @@ class CREATEPlusPlusModel(nn.Module):
         neg_edge_index: torch.Tensor = None,
         top_k: int = 10,
     ) -> torch.Tensor:
-        """Generate top-k recommendations."""
+        """
+        Generate top-k recommendations.
+
+        Args:
+            item_sequences: Item sequences (batch_size, seq_len)
+            mask: Boolean mask (batch_size, seq_len)
+            pos_edge_index: Positive edge indices (optional for inference)
+            neg_edge_index: Negative edge indices (optional for inference)
+            top_k: Number of recommendations to return
+
+        Returns:
+            Top-k item indices (batch_size, top_k)
+        """
         output = self(
             item_sequences, mask,
             pos_edge_index, neg_edge_index,
@@ -402,7 +527,20 @@ class CREATEPlusPlusModel(nn.Module):
         )
 
         scores = output['fused_scores']
-        scores[:, 0] = -float('inf')  # Mask padding
+        scores[:, 0] = -float('inf')  # Mask padding item
 
         _, indices = torch.topk(scores, k=top_k, dim=-1)
         return indices
+
+    @torch.no_grad()
+    def get_all_item_scores(self, user_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Get recommendation scores for all items.
+
+        Args:
+            user_embedding: User embedding (batch_size, embedding_dim)
+
+        Returns:
+            Scores for all items (batch_size, num_items + 1)
+        """
+        return self.output_projection(user_embedding)
