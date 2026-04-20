@@ -1,4 +1,4 @@
-dataset/
+/dataset/
 # Python cache
 __pycache__/
 *.pyc
