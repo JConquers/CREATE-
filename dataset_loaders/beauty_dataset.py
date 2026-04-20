@@ -56,16 +56,26 @@ class BeautyDataset:
         n_users = len(user2idx)
         n_items = len(item2idx)
 
-        train_user_list, train_item_list, test_user_list, test_item_list = [], [], [], []
+        train_user_list, train_item_list, val_user_list, val_item_list, test_user_list, test_item_list = [], [], [], [], [], []
         for user_id, group in df.groupby('user_idx'):
             group = group.sort_values('timestamp')
-            if len(group) >= 2:
+            if len(group) >= 3:
+                # Last item for test, second last for validation, rest for train
                 test_user_list.append(user_id)
                 test_item_list.append(group.iloc[-1]['item_idx'])
-                for _, row in group.iloc[:-1].iterrows():
+                val_user_list.append(user_id)
+                val_item_list.append(group.iloc[-2]['item_idx'])
+                for _, row in group.iloc[:-2].iterrows():
                     train_user_list.append(user_id)
                     train_item_list.append(row['item_idx'])
+            elif len(group) == 2:
+                # Last item for test, first for validation
+                test_user_list.append(user_id)
+                test_item_list.append(group.iloc[-1]['item_idx'])
+                val_user_list.append(user_id)
+                val_item_list.append(group.iloc[0]['item_idx'])
             elif len(group) == 1:
+                # Only one interaction, put in test
                 test_user_list.append(user_id)
                 test_item_list.append(group.iloc[0]['item_idx'])
 
@@ -79,6 +89,8 @@ class BeautyDataset:
             'n_items': n_items,
             'train_user': torch.tensor(train_user_list, dtype=torch.long),
             'train_item': torch.tensor(train_item_list, dtype=torch.long),
+            'val_user': torch.tensor(val_user_list, dtype=torch.long),
+            'val_item': torch.tensor(val_item_list, dtype=torch.long),
             'test_user': torch.tensor(test_user_list, dtype=torch.long),
             'test_item': torch.tensor(test_item_list, dtype=torch.long),
             'user2idx': user2idx,
