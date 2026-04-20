@@ -1,4 +1,6 @@
-from .sequential_encoder import SASRec, BERT4Rec
-from .graph_encoder import LightGCN, UltraGCN, PoneGNN
+"""Encoder modules for sequential and graph-based recommendations."""
 
-__all__ = ['SASRec', 'BERT4Rec', 'LightGCN', 'UltraGCN', 'PoneGNN']
+from .sequential_encoder import SASRecEncoder
+from .graph_encoder import PoneGNNEncoder
+
+__all__ = ['SASRecEncoder', 'PoneGNNEncoder']

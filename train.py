@@ -1,436 +1,839 @@
-"""
-CREATE++ / CREATE-Pone Training Script with command-line argument parsing.
+#!/usr/bin/env python3
+"""Joint training script for CREATE++ Pone variant.
+
+Implements two-stage training:
+1. Pre-train PoneGNN graph encoder
+2. Jointly train SASRec + PoneGNN with fusion
 
 Usage:
-    # CREATE++ with LightGCN
-    python train.py --dataset beauty --sequential sasrec --graph lightgcn
-
-    # CREATE++ with PoneGNN (CREATE-Pone variant)
-    python train.py --dataset beauty --sequential sasrec --graph ponegnn
-
-    # CREATE-Pone with custom weights
-    python train.py --dataset books --sequential sasrec --graph ponegnn --w_contrast 0.1 --w_ortho 0.1
+    python train.py --dataset books --model ponegnn --mode pretrain
+    python train.py --dataset beauty --model create_plus_plus --mode joint
 """
 
 import argparse
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
+import os
+import random
+import time
+from datetime import datetime
 from pathlib import Path
 
-from models import CreatePlusPlus, CreatePone
-from dataset_loaders import BeautyDataset, BooksDataset
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
+from torch_geometric.data import Data
+from tqdm import tqdm
+
+
+def setup_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train CREATE++ / CREATE-Pone model")
-    parser.add_argument('--dataset', type=str, default='beauty',
-                       choices=['beauty', 'books'],
-                       help='Dataset to use')
-    parser.add_argument('--data_root', type=str, default='data',
-                       help='Root directory for data')
-    parser.add_argument('--sequential', type=str, default='sasrec',
-                       choices=['sasrec', 'bert4rec'],
-                       help='Sequential encoder model')
-    parser.add_argument('--graph', type=str, default='lightgcn',
-                       choices=['lightgcn', 'ultragcn', 'ponegnn'],
-                       help='Graph encoder model (use ponegnn for CREATE-Pone variant)')
-    parser.add_argument('--embedding_dim', type=int, default=64,
-                       help='Embedding dimension')
-    parser.add_argument('--max_seq_len', type=int, default=50,
-                       help='Maximum sequence length')
-    parser.add_argument('--n_heads', type=int, default=2,
-                       help='Number of attention heads')
-    parser.add_argument('--n_layers', type=int, default=3,
-                       help='Number of layers (for SASRec/BERT4Rec)')
-    parser.add_argument('--gnn_layers', type=int, default=4,
-                       help='Number of GNN layers (for graph encoder)')
-    parser.add_argument('--n_warmup_epochs', type=int, default=5,
-                       help='Number of warmup epochs for graph encoder')
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
-                       help='Learning rate')
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='CREATE++ Pone Variant Training',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
-    # Loss weights
-    parser.add_argument('--w_local', type=float, default=1.0,
-                       help='Weight for local (sequential) loss')
-    parser.add_argument('--w_global', type=float, default=1.0,
-                       help='Weight for global (graph) loss')
-    parser.add_argument('--w_barlow', type=float, default=0.1,
-                       help='Weight for Barlow Twins alignment loss')
-    parser.add_argument('--w_info', type=float, default=0.0,
-                       help='Weight for InfoNCE alignment loss')
-    parser.add_argument('--w_ortho', type=float, default=0.1,
-                       help='Weight for orthogonality loss (CREATE-Pone only, Eq. 15)')
-    parser.add_argument('--w_contrast', type=float, default=0.1,
-                       help='Weight for contrastive loss (CREATE-Pone only)')
+    # Dataset arguments
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default='books',
+        choices=['books', 'beauty'],
+        help='Dataset to use for training',
+    )
+    parser.add_argument(
+        '--data_dir',
+        type=str,
+        default='./data',
+        help='Path to data directory',
+    )
+    parser.add_argument(
+        '--max_sequence_length',
+        type=int,
+        default=50,
+        help='Maximum sequence length for sequential models',
+    )
 
-    # Fusion
-    parser.add_argument('--use_mlp_fusion', action='store_true', default=True,
-                       help='Use MLP fusion (CREATE++), otherwise linear (CREATE)')
-    parser.add_argument('--no_mlp_fusion', action='store_true',
-                       help='Use linear fusion instead of MLP')
+    # Model arguments
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='create_plus_plus',
+        choices=['ponegnn', 'sasrec', 'create_plus_plus'],
+        help='Model to train',
+    )
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='joint',
+        choices=['pretrain', 'joint', 'sequential_only'],
+        help='Training mode: pretrain (graph only), joint, or sequential_only',
+    )
+    parser.add_argument(
+        '--embedding_dim',
+        type=int,
+        default=64,
+        help='Embedding dimension',
+    )
+    parser.add_argument(
+        '--sasrec_heads',
+        type=int,
+        default=4,
+        help='Number of attention heads in SASRec',
+    )
+    parser.add_argument(
+        '--sasrec_layers',
+        type=int,
+        default=2,
+        help='Number of transformer layers in SASRec',
+    )
+    parser.add_argument(
+        '--ponegnn_layers',
+        type=int,
+        default=2,
+        help='Number of graph convolution layers in PoneGNN',
+    )
+    parser.add_argument(
+        '--fusion_type',
+        type=str,
+        default='concat',
+        choices=['concat', 'sum', 'gate', 'mlp'],
+        help='Fusion type for combining embeddings',
+    )
 
-    # PoneGNN specific
-    parser.add_argument('--epsilon_p', type=float, default=0.1,
-                       help='PoneGNN: learnable parameter for positive graph self-embedding')
-    parser.add_argument('--epsilon_n', type=float, default=0.1,
-                       help='PoneGNN: learnable parameter for negative graph self-embedding')
-    parser.add_argument('--lambda_cl', type=float, default=0.1,
-                       help='PoneGNN: contrastive learning coefficient')
-    parser.add_argument('--lambda_reg', type=float, default=5e-5,
-                       help='PoneGNN: L2 regularization coefficient')
-    parser.add_argument('--use_negative_edges', action='store_true', default=False,
-                       help='Use negative edges in training (for PoneGNN)')
+    # Training arguments
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=2048,
+        help='Batch size',
+    )
+    parser.add_argument(
+        '--lr',
+        type=float,
+        default=1e-3,
+        help='Learning rate',
+    )
+    parser.add_argument(
+        '--num_epochs',
+        type=int,
+        default=200,
+        help='Number of training epochs',
+    )
+    parser.add_argument(
+        '--pretrain_epochs',
+        type=int,
+        default=100,
+        help='Number of pre-training epochs for graph encoder',
+    )
+    parser.add_argument(
+        '--reg',
+        type=float,
+        default=1e-4,
+        help='L2 regularization coefficient',
+    )
+    parser.add_argument(
+        '--dropout',
+        type=float,
+        default=0.1,
+        help='Dropout rate',
+    )
+    parser.add_argument(
+        '--contrastive_weight',
+        type=float,
+        default=0.1,
+        help='Weight for contrastive loss',
+    )
+    parser.add_argument(
+        '--alpha',
+        type=float,
+        default=0.5,
+        help='Weight for sequential vs graph loss in joint training',
+    )
 
-    # Device and misc
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                       help='Device to use')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
-    parser.add_argument('--log_every', type=int, default=10,
-                       help='Log every n batches')
-    parser.add_argument('--eval_every', type=int, default=1,
-                       help='Evaluate every n epochs')
-    parser.add_argument('--save_dir', type=str, default='checkpoints',
-                       help='Directory to save checkpoints')
+    # Evaluation arguments
+    parser.add_argument(
+        '--eval_every',
+        type=int,
+        default=10,
+        help='Evaluate every N epochs',
+    )
+    parser.add_argument(
+        '--top_k',
+        type=int,
+        default=10,
+        help='Top-K for evaluation metrics',
+    )
+
+    # System arguments
+    parser.add_argument(
+        '--gpu',
+        type=int,
+        default=0,
+        help='GPU device ID (-1 for CPU)',
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed',
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='./outputs',
+        help='Output directory for checkpoints and logs',
+    )
+    parser.add_argument(
+        '--load_checkpoint',
+        type=str,
+        default=None,
+        help='Path to checkpoint to load',
+    )
+    parser.add_argument(
+        '--save_checkpoint',
+        action='store_true',
+        help='Save checkpoints during training',
+    )
+
     return parser.parse_args()
 
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+class NegativeSampler:
+    """Negative sampler for BPR training."""
+
+    def __init__(self, num_items: int, user2items: dict, power: float = 0.75):
+        self.num_items = num_items
+        self.user2items = user2items
+        self.power = power
+
+        # Compute item popularity distribution
+        item_counts = np.zeros(num_items)
+        for items in user2items.values():
+            for item in items:
+                item_counts[item] += 1
+        self.item_probs = item_counts ** power
+        self.item_probs /= self.item_probs.sum()
+
+    def sample(self, users: torch.Tensor, n_samples: int = 1) -> torch.Tensor:
+        """Sample negative items for users."""
+        batch_size = len(users)
+        negatives = []
+
+        for user_id in users.tolist():
+            user_items = set(self.user2items.get(user_id, []))
+            for _ in range(n_samples):
+                while True:
+                    neg = np.random.choice(
+                        self.num_items,
+                        size=1,
+                        p=self.item_probs,
+                    )[0]
+                    # Filter out positive items
+                    if neg not in user_items:
+                        negatives.append(neg)
+                        break
+        return torch.tensor(negatives, dtype=torch.long).view(batch_size, n_samples)
 
 
-def load_dataset(name, data_root):
-    """Load dataset by name."""
-    if name == 'beauty':
-        dataset = BeautyDataset(root=f"{data_root}/Beauty_and_Personal_Care")
-    elif name == 'books':
-        dataset = BooksDataset(root=f"{data_root}/Books")
-    else:
-        raise ValueError(f"Unknown dataset: {name}")
+class RatingBasedSampler:
+    """Rating-based negative sampler for PoneGNN."""
 
-    print(f"Loading {name} dataset...")
-    data = dataset.load()
-    stats = dataset.get_stats()
-    print(f"Dataset loaded: {stats['n_users']} users, {stats['n_items']} items, {stats['n_interactions']} interactions")
-    return data, stats
+    def __init__(self, train_df, num_users: int, num_items: int, offset: float = 3.5, k: int = 40):
+        self.num_users = num_users
+        self.num_items = num_items
+        self.offset = offset
+        self.k = k
+
+        # Build user-item-rating mapping
+        self.user_items = {}
+        for _, row in train_df.iterrows():
+            uid = int(row['user_id'])
+            iid = int(row['item_id'])
+            rating = row['rating']
+            if uid not in self.user_items:
+                self.user_items[uid] = {'pos': [], 'neg': [], 'all': []}
+            self.user_items[uid]['all'].append(iid)
+            if rating > offset:
+                self.user_items[uid]['pos'].append(iid)
+            else:
+                self.user_items[uid]['neg'].append(iid)
+
+        # Item distribution for sampling
+        self.tot = np.arange(num_items)
+
+    def generate_negatives(self, epoch: int = 0) -> dict:
+        """Generate negative samples for all users."""
+        negatives = {}
+        for user_id, data in self.user_items.items():
+            pos_items = data['pos']
+            if not pos_items:
+                continue
+
+            # Sample negatives
+            neg_candidates = np.setdiff1d(self.tot, pos_items)
+            if len(neg_candidates) == 0:
+                continue
+
+            # Sample k negatives per positive item
+            neg_samples = np.random.choice(
+                neg_candidates,
+                size=len(pos_items) * self.k,
+                replace=True,
+            )
+            negatives[user_id] = neg_samples.reshape(len(pos_items), self.k)
+
+        return negatives
 
 
-def create_sequences(train_user, train_item, max_seq_len, n_items):
-    """Create padded sequences from interaction data using vectorized operations."""
-    import pandas as pd
+def build_dataloaders(dataset, args, mode: str = 'train'):
+    """Build DataLoaders for training/evaluation."""
+    from dataset_loaders import SequenceDataset, SASRecCollator
 
-    df = pd.DataFrame({'user': train_user.numpy(), 'item': train_item.numpy()})
-    df = df.sort_values('user')
+    user_sequences = dataset.get_user_sequences()
 
-    sequences = []
-    for user_id, group in df.groupby('user', sort=False):
-        items = group['item'].values
-        if len(items) >= 2:
-            for i in range(1, len(items)):
-                start = max(0, i - max_seq_len)
-                seq = items[start:i]
-                pad_len = max_seq_len - len(seq)
-                sequences.append([0] * pad_len + seq.tolist())
+    if mode == 'train':
+        # Split for training
+        train_sequences = {}
+        for user_id, items in user_sequences.items():
+            if len(items) > 1:
+                train_sequences[user_id] = items[:-1]
+            else:
+                train_sequences[user_id] = items
 
-    if len(sequences) == 0:
-        return torch.zeros(1, max_seq_len, dtype=torch.long)
+        val_sequences = {}
+        for user_id, items in user_sequences.items():
+            if len(items) > 1:
+                val_sequences[user_id] = items[-2:]
+            else:
+                val_sequences[user_id] = items
 
-    return torch.tensor(sequences, dtype=torch.long)
+        train_dataset = SequenceDataset(train_sequences, mode='train')
+        val_dataset = SequenceDataset(val_sequences, mode='validation')
+
+        train_collator = SASRecCollator(pad_id=0, mode='train')
+        val_collator = SASRecCollator(pad_id=0, mode='validation')
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=train_collator,
+            num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=val_collator,
+            num_workers=0,
+        )
+
+        return train_loader, val_loader
+
+    return None, None
 
 
-def collate_fn(batch):
-    """Custom collate function for DataLoader."""
-    return torch.stack(batch)
-
-
-def evaluate(model, test_user, test_item, train_user, train_item, seqs, edge_index, edge_weight=None, neg_edge_index=None, k=10, user_map=None):
-    """Evaluate model with Recall@K and NDCG@K.
-
-    Args:
-        user_map: dict mapping global user ID -> local (contiguous) index for seqs lookup.
-                  If None, seqs is indexed by global user ID.
-    """
+def evaluate(model, dataloader, device, top_k: int = 10, max_items: int = None):
+    """Evaluate model on validation/test set."""
     model.eval()
-    device = next(model.parameters()).device
 
-    test_user = test_user.to(device)
-    test_item = test_item.to(device)
-    edge_index = edge_index.to(device)
-    if edge_weight is not None:
-        edge_weight = edge_weight.to(device)
-    if neg_edge_index is not None:
-        neg_edge_index = neg_edge_index.to(device)
+    hits = 0
+    ndcgs = 0
+    total = 0
 
-    user_hists = {}
-    for u, it in zip(train_user.tolist(), train_item.tolist()):
-        if u not in user_hists:
-            user_hists[u] = []
-        user_hists[u].append(it)
-    for u in user_hists:
-        user_hists[u] = set(user_hists[u])
-
-    recall_sum = 0.0
-    ndcg_sum = 0.0
-    n_test = 0
-
-    seqs = seqs.to(device)
     with torch.no_grad():
-        for i in range(len(test_user)):
-            global_u = test_user[i].item()
-            true_item = test_item[i].item()
+        for batch in dataloader:
+            item_sequences = batch['padded_sequence_ids'].to(device)
+            mask = batch['mask'].to(device)
+            labels = batch['labels.ids'].to(device)
 
-            if user_map is not None:
-                if global_u not in user_map:
-                    continue
-                u_local = user_map[global_u]
-                seq = seqs[u_local:u_local+1]
+            # Get predictions
+            if hasattr(model, 'predict'):
+                predictions = model.predict(item_sequences, mask, top_k=top_k)
             else:
-                if global_u >= len(seqs):
-                    continue
-                seq = seqs[global_u:global_u+1]
+                # For sequential encoder only
+                output = model(item_sequences, mask)
+                scores = output['item_scores']
+                _, predictions = torch.topk(scores, k=top_k, dim=-1)
 
-            if isinstance(model, CreatePone):
-                topk_items = model.recommend(seq, edge_index, neg_edge_index, k=k)
-            else:
-                fused_emb, item_emb_g = model(seq, edge_index, edge_weight)
-                scores = torch.mm(fused_emb, item_emb_g.t())[0]
-                if user_map is not None:
-                    hist_key = user_map.get(global_u, None)
-                else:
-                    hist_key = global_u
-                if hist_key is not None and hist_key in user_hists:
-                    scores[list(user_hists[hist_key])] = float('-inf')
-                _, topk_items = torch.topk(scores, k)
+            # Compute Hit Rate
+            for i, label in enumerate(labels):
+                if label in predictions[i]:
+                    hits += 1
 
-            topk_items = topk_items.cpu().tolist()
+                # Compute NDCG
+                rank = (predictions[i] == label).nonzero(as_tuple=True)[0]
+                if len(rank) > 0:
+                    ndcgs += 1.0 / np.log2(rank.item() + 2)
 
-            if true_item in topk_items:
-                recall_sum += 1
-                rank = topk_items.index(true_item) + 1
-                ndcg_sum += 1.0 / np.log2(rank + 1)
+            total += len(labels)
 
-    n_test = len(test_user)
-    recall = recall_sum / n_test if n_test > 0 else 0
-    ndcg = ndcg_sum / n_test if n_test > 0 else 0
-
-    return {'recall@10': recall, 'ndcg@10': ndcg}
+    model.train()
+    return {
+        'hit_rate': hits / total if total > 0 else 0,
+        'ndcg': ndcgs / total if total > 0 else 0,
+    }
 
 
-def train(args):
-    set_seed(args.seed)
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
+def train_ponegnn(model, train_df, dataset, args, device):
+    """Pre-train PoneGNN graph encoder."""
+    print("\n" + "=" * 60)
+    print("Stage 1: Pre-training PoneGNN Graph Encoder")
+    print("=" * 60)
 
-    data, stats = load_dataset(args.dataset, args.data_root)
+    # Build graph edges
+    from dataset_loaders import build_graph_edges
+    data_p, data_n = build_graph_edges(
+        train_df,
+        dataset.num_users,
+        dataset.num_items,
+        device=device,
+    )
+    data_p = data_p.to(device)
+    data_n = data_n.to(device)
 
-    n_users = stats['n_users']
-    n_items = stats['n_items']
-    edge_index = data['edge_index']
-    edge_weight = data.get('edge_weight', torch.ones(edge_index.shape[1]))
-    train_user = data['train_user']
-    train_item = data['train_item']
-    train_weight = data.get('train_weight', torch.ones_like(train_item).float())
-    test_user = data['test_user']
-    test_item = data['test_item']
+    # Create sampler
+    sampler = RatingBasedSampler(
+        train_df,
+        dataset.num_users,
+        dataset.num_items,
+        k=40,
+    )
 
-    # Positive and negative edge indices for PoneGNN
-    pos_edge_index = data['pos_edge_index'].to(device)
-    neg_edge_index = data['neg_edge_index'].to(device)
-    print(f"Positive edges: {pos_edge_index.shape[1]}, Negative edges: {neg_edge_index.shape[1]}")
+    # Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.pretrain_epochs)
 
-    # Build item popularity distribution for negative sampling (deg^0.75, like PoneGNN paper)
-    item_deg = torch.bincount(train_item, minlength=n_items).float()
-    item_deg = item_deg ** 0.75
-    item_deg = item_deg / item_deg.sum()
+    model.train()
+    best_loss = float('inf')
 
-    if args.dataset == 'beauty':
-        seqs = BeautyDataset(root=f"{args.data_root}/Beauty_and_Personal_Care").get_sequences(args.max_seq_len)
-    else:
-        seqs = BooksDataset(root=f"{args.data_root}/Books").get_sequences(args.max_seq_len)
+    for epoch in range(1, args.pretrain_epochs + 1):
+        # Generate negatives
+        negatives = sampler.generate_negatives(epoch)
 
-    # seqs[global_user_id] contains the sequence for that user (indexed by global user ID)
-    # Subsample: pick 10K users, remap their global IDs to 0..9999
-    # Then build a new seqs array indexed by local (contiguous) ID
-    n_seq = len(seqs)
-    unique_global_users = train_user.unique().tolist()
-    if len(unique_global_users) > 10000:
-        sampled_global_users = np.random.choice(unique_global_users, 10000, replace=False).tolist()
-        mask = sum((train_user == u) for u in sampled_global_users).bool()
-        train_user = train_user[mask]
-        train_item = train_item[mask]
-        train_weight = train_weight[mask]
-
-    # Remap global user IDs to 0..K-1 for contiguous indexing
-    unique_global = train_user.unique().tolist()
-    g2l = {g: i for i, g in enumerate(unique_global)}
-    seqs_local = torch.zeros((len(unique_global), seqs.size(1)), dtype=torch.long)
-    for new_id, global_id in enumerate(unique_global):
-        seqs_local[new_id] = seqs[global_id]
-    seqs = seqs_local
-    train_user = torch.tensor([g2l[g] for g in train_user.tolist()], dtype=torch.long)
-
-    K = 40  # negative samples per positive (PoneGNN paper default)
-
-    # Initialize model
-    if args.graph == 'ponegnn':
-        model = CreatePone(
-            n_users=n_users,
-            n_items=n_items,
-            embedding_dim=args.embedding_dim,
-            max_seq_len=args.max_seq_len,
-            sequential_model=args.sequential,
-            use_mlp_fusion=not args.no_mlp_fusion,
-            n_warmup_epochs=args.n_warmup_epochs,
-            w_local=args.w_local,
-            w_global=args.w_global,
-            w_barlow=args.w_barlow,
-            w_info=args.w_info,
-            w_ortho=args.w_ortho,
-            w_contrast=args.w_contrast,
-            ponegnn_kwargs={
-                'n_layers': args.gnn_layers,
-                'epsilon_p': 0.0,
-                'epsilon_n': 0.0,
-                'lambda_cl': args.w_contrast,
-                'lambda_reg': args.lambda_reg,
-                'temperature': 1.0,
-            },
-            n_heads=args.n_heads,
-            n_layers=args.n_layers,
-        ).to(device)
-        print(f"Model: CREATE-Pone with {args.sequential} + PoneGNN")
-    else:
-        model = CreatePlusPlus(
-            n_users=n_users,
-            n_items=n_items,
-            embedding_dim=args.embedding_dim,
-            max_seq_len=args.max_seq_len,
-            sequential_model=args.sequential,
-            graph_model=args.graph,
-            use_mlp_fusion=not args.no_mlp_fusion,
-            n_warmup_epochs=args.n_warmup_epochs,
-            w_local=args.w_local,
-            w_global=args.w_global,
-            w_barlow=args.w_barlow,
-            w_info=args.w_info,
-            n_heads=args.n_heads,
-            n_layers=args.n_layers,
-            n_layers_gnn=args.gnn_layers,
-        ).to(device)
-        print(f"Model: CREATE++ with {args.sequential} + {args.graph}")
-
-    edge_index = edge_index.to(device)
-    edge_weight = edge_weight.to(device)
-    seqs = seqs.to(device)
-    train_user = train_user.to(device)
-    train_item = train_item.to(device)
-    train_weight = train_weight.to(device)
-
-    # Build global->local user map for evaluation
-    sampled_user_map = {g: i for i, g in enumerate(train_user.unique().tolist())}
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    print(f"\nStarting training...")
-    print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}, Negatives: {K}")
-    print(f"Fusion: {'MLP + GELU (CREATE++)' if not args.no_mlp_fusion else 'Linear (CREATE)'}")
-    print(f"Loss weights: w_local={args.w_local}, w_global={args.w_global}, w_barlow={args.w_barlow}", end="")
-    if args.graph == 'ponegnn':
-        print(f", w_ortho={args.w_ortho}, w_contrast={args.w_contrast}")
-    else:
-        print()
-    print("-" * 50)
-
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        total_ponegnn = 0.0
-        total_local = 0.0
-        total_global = 0.0
-        total_align = 0.0
-        total_ortho = 0.0
-
-        perm = torch.randperm(len(seqs))
+        total_loss = 0
         n_batches = 0
 
-        for i in range(0, len(seqs), args.batch_size):
-            batch_idx = perm[i:i + args.batch_size]
-            # seqs is indexed by global user ID (0..n_users-1), so look up actual user IDs
-            batch_user = train_user[batch_idx]
-            batch_item = train_item[batch_idx]
-            batch_weight = train_weight[batch_idx]
-            batch_seqs = seqs[batch_user]
+        # Create mini-batches
+        users = list(sampler.user_items.keys())
+        random.shuffle(users)
 
-            # Sample K negatives per positive interaction
-            neg_items = torch.randint(0, n_items, (len(batch_seqs), K), device=device)
+        for batch_start in range(0, len(users), args.batch_size):
+            batch_users = users[batch_start:batch_start + args.batch_size]
+
+            for user_id in batch_users:
+                if user_id not in negatives:
+                    continue
+
+                user_data = sampler.user_items[user_id]
+                pos_items = user_data['pos']
+                if not pos_items:
+                    continue
+
+                for item_id in pos_items:
+                    u = torch.tensor([user_id], dtype=torch.long, device=device)
+                    i = torch.tensor([item_id], dtype=torch.long, device=device)
+                    w = torch.tensor([1.0], dtype=torch.float, device=device)
+                    negs = torch.tensor(
+                        [negatives[user_id][pos_items.index(item_id)]],
+                        dtype=torch.long,
+                        device=device,
+                    )
+
+                    optimizer.zero_grad()
+                    loss = model.compute_loss(
+                        u, i, w, negs,
+                        data_p.edge_index,
+                        data_n.edge_index,
+                        epoch,
+                    )
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        scheduler.step()
+
+        if epoch % args.eval_every == 0:
+            print(f"Epoch {epoch:3d}/{args.pretrain_epochs} | Loss: {avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            if args.save_checkpoint:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': best_loss,
+                }, os.path.join(args.output_dir, 'ponegnn_best.pt'))
+
+    print(f"\nPre-training complete. Best loss: {best_loss:.4f}")
+    return data_p, data_n
+
+
+def train_joint(model, train_loader, val_loader, dataset, args, device,
+                data_p=None, data_n=None):
+    """Joint training of SASRec + PoneGNN."""
+    print("\n" + "=" * 60)
+    print("Stage 2: Joint Training of SASRec + PoneGNN")
+    print("=" * 60)
+
+    # Negative sampler
+    neg_sampler = NegativeSampler(
+        dataset.num_items,
+        dataset.user2items,
+    )
+
+    # Optimizer - different learning rates for different components
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs)
+
+    model.train()
+    best_hr = 0
+    best_ndcg = 0
+
+    for epoch in range(1, args.num_epochs + 1):
+        total_loss = 0
+        n_batches = 0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}", disable=True):
+            item_sequences = batch['padded_sequence_ids'].to(device)
+            mask = batch['mask'].to(device)
+            labels = batch['labels.ids'].to(device)
+            users = batch['user.ids'].to(device)
+
+            # Sample negatives
+            neg_items = neg_sampler.sample(users, n_samples=1).to(device)
 
             optimizer.zero_grad()
 
-            if args.graph == 'ponegnn':
-                loss, loss_dict = model.compute_loss(
-                    batch_seqs,
-                    pos_edge_index,
-                    neg_edge_index,
-                    batch_user,
-                    batch_item,
-                    batch_weight,
-                    neg_items,
-                    epoch=epoch,
-                )
-            else:
-                loss, loss_dict = model.compute_loss(
-                    batch_seqs, edge_index, edge_weight
-                )
+            # Compute joint loss
+            loss_dict = model.compute_joint_loss(
+                item_sequences=item_sequences,
+                mask=mask,
+                labels=labels,
+                pos_edge_index=data_p.edge_index if data_p is not None else None,
+                neg_edge_index=data_n.edge_index if data_n is not None else None,
+                negative_samples=neg_items,
+                epoch=epoch,
+                alpha=args.alpha,
+            )
 
+            loss = loss_dict['total_loss']
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_loss += loss.item()
-            total_ponegnn += loss_dict.get('ponegnn_loss', 0.0)
-            total_local += loss_dict.get('local_loss', 0.0)
-            total_global += loss_dict.get('global_loss', 0.0)
-            total_align += loss_dict.get('alignment_loss', 0.0)
-            total_ortho += loss_dict.get('ortho_loss', 0.0)
             n_batches += 1
 
-        avg_loss = total_loss / n_batches
-        avg_ponegnn = total_ponegnn / n_batches
-        avg_local = total_local / n_batches
-        avg_global = total_global / n_batches
-        avg_align = total_align / n_batches
-        avg_ortho = total_ortho / n_batches
+        avg_loss = total_loss / max(n_batches, 1)
+        scheduler.step()
 
-        if (epoch + 1) % args.log_every == 0:
-            log_msg = (f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
-                      f"PoneGNN: {avg_ponegnn:.4f} | "
-                      f"Local: {avg_local:.4f} | Global: {avg_global:.4f} | "
-                      f"Align: {avg_align:.4f} | Ortho: {avg_ortho:.4f}")
-            print(log_msg)
+        # Evaluate
+        if epoch % args.eval_every == 0:
+            metrics = evaluate(model, val_loader, device, top_k=args.top_k)
 
-        if (epoch + 1) % args.eval_every == 0:
-            if args.graph == 'ponegnn':
-                metrics = evaluate(model, test_user, test_item, train_user, train_item,
-                                  seqs, pos_edge_index, neg_edge_index, k=10, user_map=sampled_user_map)
-            else:
-                metrics = evaluate(model, test_user, test_item, train_user, train_item,
-                                  seqs, edge_index, edge_weight, k=10, user_map=sampled_user_map)
-            print(f"  Evaluation @10 | Recall: {metrics['recall@10']:.4f} | NDCG: {metrics['ndcg@10']:.4f}")
+            if metrics['hit_rate'] > best_hr:
+                best_hr = metrics['hit_rate']
+            if metrics['ndcg'] > best_ndcg:
+                best_ndcg = metrics['ndcg']
 
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    model_name = f"create_pone_{args.sequential}_{args.dataset}" if args.graph == 'ponegnn' else f"create_plus_plus_{args.sequential}_{args.graph}_{args.dataset}"
-    torch.save(model.state_dict(), save_dir / f"{model_name}.pt")
-    print(f"\nModel saved to {save_dir}/{model_name}.pt")
+            print(
+                f"Epoch {epoch:3d}/{args.num_epochs} | "
+                f"Loss: {avg_loss:.4f} | "
+                f"HR@{args.top_k}: {metrics['hit_rate']:.4f} | "
+                f"NDCG@{args.top_k}: {metrics['ndcg']:.4f}"
+            )
+
+            if args.save_checkpoint:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'metrics': metrics,
+                }, os.path.join(args.output_dir, 'create_plus_plus_best.pt'))
+
+    print(f"\nJoint training complete.")
+    print(f"Best HR@{args.top_k}: {best_hr:.4f}")
+    print(f"Best NDCG@{args.top_k}: {best_ndcg:.4f}")
+
+
+def train_sequential_only(model, train_loader, val_loader, args, device):
+    """Train SASRec encoder only."""
+    print("\n" + "=" * 60)
+    print("Training SASRec (Sequential Only)")
+    print("=" * 60)
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs)
+
+    model.train()
+    best_hr = 0
+    best_ndcg = 0
+
+    for epoch in range(1, args.num_epochs + 1):
+        total_loss = 0
+        n_batches = 0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}"):
+            item_sequences = batch['padded_sequence_ids'].to(device)
+            mask = batch['mask'].to(device)
+            labels = batch['labels.ids'].to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            output = model(item_sequences, mask)
+            seq_scores = output['item_scores']
+
+            # Cross-entropy loss
+            loss = F.cross_entropy(seq_scores, labels)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        scheduler.step()
+
+        # Evaluate
+        if epoch % args.eval_every == 0:
+            metrics = evaluate(model, val_loader, device, top_k=args.top_k)
+
+            if metrics['hit_rate'] > best_hr:
+                best_hr = metrics['hit_rate']
+            if metrics['ndcg'] > best_ndcg:
+                best_ndcg = metrics['ndcg']
+
+            print(
+                f"Epoch {epoch:3d}/{args.num_epochs} | "
+                f"Loss: {avg_loss:.4f} | "
+                f"HR@{args.top_k}: {metrics['hit_rate']:.4f} | "
+                f"NDCG@{args.top_k}: {metrics['ndcg']:.4f}"
+            )
+
+    print(f"\nTraining complete.")
+    print(f"Best HR@{args.top_k}: {best_hr:.4f}")
+    print(f"Best NDCG@{args.top_k}: {best_ndcg:.4f}")
+
+
+def main():
+    """Main training function."""
+    args = parse_args()
+
+    # Setup device
+    if args.gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f'cuda:{args.gpu}')
+        print(f"Using GPU: {torch.cuda.get_device_name(args.gpu)}")
+    else:
+        device = torch.device('cpu')
+        print("Using CPU")
+
+    # Setup output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    run_name = f"{args.model}_{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = os.path.join(args.output_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    args.output_dir = run_dir
+
+    # Set random seed
+    setup_seed(args.seed)
+
+    # Load dataset
+    print(f"\nLoading dataset: {args.dataset}")
+    from dataset_loaders import get_dataset
+
+    dataset = get_dataset(
+        dataset_name=args.dataset,
+        data_dir=args.data_dir,
+        max_sequence_length=args.max_sequence_length,
+    )
+    train_df, val_df, test_df = dataset.load_data()
+
+    print(f"Dataset statistics:")
+    stats = dataset.get_statistics()
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+
+    # Build model
+    print(f"\nBuilding model: {args.model}")
+
+    if args.model == 'ponegnn':
+        from models.encoders import PoneGNNEncoder
+        model = PoneGNNEncoder(
+            num_users=dataset.num_users,
+            num_items=dataset.num_items,
+            embedding_dim=args.embedding_dim,
+            num_layers=args.ponegnn_layers,
+            reg=args.reg,
+            contrastive_weight=args.contrastive_weight,
+        )
+        args.mode = 'pretrain'
+
+    elif args.model == 'sasrec':
+        from models.encoders import SASRecEncoder
+        model = SASRecEncoder(
+            num_items=dataset.num_items,
+            embedding_dim=args.embedding_dim,
+            num_heads=args.sasrec_heads,
+            num_layers=args.sasrec_layers,
+            dropout=args.dropout,
+            max_sequence_length=args.max_sequence_length,
+        )
+        args.mode = 'sequential_only'
+
+    elif args.model == 'create_plus_plus':
+        from models.fusion import CREATEPlusPlusModel
+        model = CREATEPlusPlusModel(
+            num_users=dataset.num_users,
+            num_items=dataset.num_items,
+            embedding_dim=args.embedding_dim,
+            sasrec_heads=args.sasrec_heads,
+            sasrec_layers=args.sasrec_layers,
+            ponegnn_layers=args.ponegnn_layers,
+            max_sequence_length=args.max_sequence_length,
+            fusion_type=args.fusion_type,
+            dropout=args.dropout,
+            reg=args.reg,
+            contrastive_weight=args.contrastive_weight,
+        )
+
+    model = model.to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Build dataloaders
+    train_loader, val_loader = build_dataloaders(dataset, args)
+
+    # Load checkpoint if specified
+    if args.load_checkpoint:
+        print(f"\nLoading checkpoint: {args.load_checkpoint}")
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+
+    # Training based on mode
+    if args.mode == 'pretrain' or args.model == 'ponegnn':
+        # Stage 1: Pre-train graph encoder
+        data_p, data_n = train_ponegnn(model, train_df, dataset, args, device)
+
+        # Optionally proceed to joint training
+        if args.model == 'create_plus_plus':
+            print("\nProceeding to joint training...")
+            # Re-initialize joint model with pre-trained weights
+            from models.fusion import CREATEPlusPlusModel
+            joint_model = CREATEPlusPlusModel(
+                num_users=dataset.num_users,
+                num_items=dataset.num_items,
+                embedding_dim=args.embedding_dim,
+                sasrec_heads=args.sasrec_heads,
+                sasrec_layers=args.sasrec_layers,
+                ponegnn_layers=args.ponegnn_layers,
+                max_sequence_length=args.max_sequence_length,
+                fusion_type=args.fusion_type,
+                dropout=args.dropout,
+                reg=args.reg,
+                contrastive_weight=args.contrastive_weight,
+            )
+            joint_model = joint_model.to(device)
+
+            # Load pre-trained graph encoder weights
+            graph_encoder_state = model.state_dict()
+            joint_model.graph_encoder.load_state_dict(graph_encoder_state)
+
+            train_joint(joint_model, train_loader, val_loader, dataset, args, device, data_p, data_n)
+
+    elif args.mode == 'joint':
+        if args.model != 'create_plus_plus':
+            print("Joint mode only available for create_plus_plus model")
+            return
+
+        # Stage 1: Pre-train graph encoder first
+        print("\n" + "=" * 60)
+        print("Stage 1: Pre-training PoneGNN Graph Encoder (for joint training)")
+        print("=" * 60)
+        from models.encoders import PoneGNNEncoder
+        graph_model = PoneGNNEncoder(
+            num_users=dataset.num_users,
+            num_items=dataset.num_items,
+            embedding_dim=args.embedding_dim,
+            num_layers=args.ponegnn_layers,
+            reg=args.reg,
+            contrastive_weight=args.contrastive_weight,
+        )
+        graph_model = graph_model.to(device)
+
+        data_p, data_n = train_ponegnn(graph_model, train_df, dataset, args, device)
+
+        # Load pre-trained weights into joint model
+        print("\nLoading pre-trained graph encoder weights into CREATE++ model...")
+        graph_encoder_state = graph_model.state_dict()
+        model.graph_encoder.load_state_dict(graph_encoder_state)
+
+        # Stage 2: Joint training
+        train_joint(model, train_loader, val_loader, dataset, args, device, data_p, data_n)
+
+    elif args.mode == 'sequential_only':
+        train_sequential_only(model, train_loader, val_loader, args, device)
+
+    print("\n" + "=" * 60)
+    print("Training complete!")
+    print(f"Outputs saved to: {args.output_dir}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
-    args = parse_args()
-    train(args)
+    import torch.nn.functional as F
+    main()
+
+
+# ============================================================================
+# KAGGLE USAGE INSTRUCTIONS:
+# ============================================================================
+#
+# For Kaggle notebook usage, import this script and call main() with args:
+#
+# Option 1: Two-stage training (PoneGNN pretrain + joint training)
+# ---------------------------------------------------------------
+# !python train.py --dataset books --model create_plus_plus --mode joint \
+#     --embedding_dim 64 --ponegnn_layers 2 --sasrec_layers 2 \
+#     --pretrain_epochs 50 --num_epochs 100 --batch_size 256 \
+#     --lr 0.001 --fusion_type concat --gpu 0
+#
+# Option 2: Just SASRec (sequential only)
+# ---------------------------------------
+# !python train.py --dataset beauty --model sasrec --mode sequential_only \
+#     --embedding_dim 64 --sasrec_layers 2 --num_epochs 100 \
+#     --batch_size 256 --lr 0.001 --gpu 0
+#
+# Option 3: Just PoneGNN (graph only)
+# ------------------------------------
+# !python train.py --dataset books --model ponegnn --mode pretrain \
+#     --embedding_dim 64 --ponegnn_layers 2 --pretrain_epochs 100 \
+#     --batch_size 256 --lr 0.001 --gpu 0
+#
+# The script will automatically:
+# - Check for preprocessed data in common Kaggle paths
+# - Skip download/processing if already present
+# - Use leave-last-out splitting for train/val/test
+#
+# ============================================================================

@@ -1,3 +1,5 @@
-from .fusion import FusionModule, LinearFusion, MLPFusion
+"""Fusion modules for combining sequential and graph representations."""
 
-__all__ = ['FusionModule', 'LinearFusion', 'MLPFusion']
+from .joint_fusion import JointFusionModule, CREATEPlusPlusModel
+
+__all__ = ['JointFusionModule', 'CREATEPlusPlusModel']

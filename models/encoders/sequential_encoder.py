@@ -1,131 +1,127 @@
-"""
-Sequential encoders for CREATE++: SASRec and BERT4Rec.
-"""
+"""SASRec sequential encoder implementation."""
 
 import torch
-import torch.nn as nn
-import math
+from torch import nn
+import torch.nn.functional as F
 
 
-class SequentialEncoder(nn.Module):
-    """Base class for sequential encoders."""
+class SASRecEncoder(nn.Module):
+    """SASRec encoder using Transformer encoder layers.
 
-    def __init__(self, n_items, embedding_dim, max_seq_len, n_heads=2, n_layers=2, dropout=0.2):
+    This implementation follows the original SASRec paper with self-attention
+    for sequential pattern modeling in user behavior sequences.
+    """
+
+    def __init__(
+        self,
+        num_items: int,
+        embedding_dim: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        max_sequence_length: int = 50,
+    ):
         super().__init__()
-        self.n_items = n_items
+        self.num_items = num_items
         self.embedding_dim = embedding_dim
-        self.max_seq_len = max_seq_len
+        self.max_sequence_length = max_sequence_length
 
-        self.item_embedding = nn.Embedding(n_items + 1, embedding_dim, padding_idx=0)
-        self.pos_embedding = nn.Embedding(max_seq_len + 1, embedding_dim)
+        # Item and position embeddings
+        self.item_embedding = nn.Embedding(num_items + 2, embedding_dim, padding_idx=0)
+        self.position_embedding = nn.Embedding(max_sequence_length + 1, embedding_dim)
+
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            layer_norm_eps=1e-12,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        self.layer_norm = nn.LayerNorm(embedding_dim, eps=1e-12)
         self.dropout = nn.Dropout(dropout)
 
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.dropout_rate = dropout
+        self._init_weights()
 
-    def get_attention_mask(self, seq):
-        """Create causal attention mask. Shape (seq_len, seq_len), no batch dim."""
-        seq_len = seq.size(1)
-        return torch.tril(torch.ones(seq_len, seq_len, device=seq.device))
+    def _init_weights(self):
+        """Initialize embeddings with Xavier initialization."""
+        nn.init.xavier_normal_(self.item_embedding.weight)
+        nn.init.xavier_normal_(self.position_embedding.weight)
 
+    @property
+    def device(self):
+        """Get the device of the model."""
+        return next(self.parameters()).device
 
-class SASRec(SequentialEncoder):
-    """SASRec: Self-Attentive Sequential Recommendation.
+    def _create_attention_mask(self, seq_length: int) -> torch.Tensor:
+        """Create causal attention mask for self-attention."""
+        mask = torch.tril(
+            torch.ones(seq_length, seq_length, device=self.device)
+        ).bool()
+        return ~mask  # Invert: True means mask out
 
-    Uses causal (lower triangular) attention for next-item prediction.
-    """
-
-    def __init__(self, n_items, embedding_dim=64, max_seq_len=50, n_heads=2, n_layers=2, dropout=0.2):
-        super().__init__(n_items, embedding_dim, max_seq_len, n_heads, n_layers, dropout)
-
-        self.attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(embedding_dim, n_heads, dropout=dropout, batch_first=True)
-            for _ in range(n_layers)
-        ])
-        self.norm_layers = nn.ModuleList([nn.LayerNorm(embedding_dim) for _ in range(n_layers)])
-        self.ffn_layers = nn.ModuleList([nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim * 4, embedding_dim)
-        ) for _ in range(n_layers)])
-
-    def forward(self, seq):
+    def forward(self, item_sequences: torch.Tensor,
+                mask: torch.Tensor = None) -> dict:
         """
+        Forward pass for SASRec encoder.
+
         Args:
-            seq: LongTensor of shape (batch_size, seq_len) with item indices
+            item_sequences: Batch of item sequences (batch_size, seq_len)
+            mask: Boolean mask for valid positions (batch_size, seq_len)
+
         Returns:
-            item_embeddings: FloatTensor of shape (batch_size, seq_len, embedding_dim)
+            Dictionary containing:
+                - 'sequence_output': Output embeddings for each position
+                - 'user_embedding': Final user representation (last item)
+                - 'item_scores': Scores for all items
         """
-        seq_len = seq.size(1)
-        positions = torch.arange(seq_len, device=seq.device).unsqueeze(0).expand_as(seq)
-        pos_emb = self.pos_embedding(positions)
+        batch_size, seq_len = item_sequences.shape
 
-        embeddings = self.item_embedding(seq) + pos_emb
-        embeddings = self.dropout(embeddings)
+        # Get embeddings
+        item_emb = self.item_embedding(item_sequences) * (self.embedding_dim ** 0.5)
 
-        attention_mask = self.get_attention_mask(seq)
+        # Add position embeddings
+        positions = torch.arange(seq_len - 1, -1, step=-1, device=self.device)
+        positions = positions.unsqueeze(0).expand(batch_size, -1)
+        pos_emb = self.position_embedding(positions)
 
-        for i in range(self.n_layers):
-            attn_out, _ = self.attention_layers[i](embeddings, embeddings, embeddings,
-                                                     attn_mask=attention_mask)
-            attn_out = self.dropout(attn_out)
-            embeddings = self.norm_layers[i](embeddings + attn_out)
+        # Combine and normalize
+        hidden = self.layer_norm(item_emb + pos_emb)
+        hidden = self.dropout(hidden)
 
-            ffn_out = self.ffn_layers[i](embeddings)
-            embeddings = self.norm_layers[i](embeddings + ffn_out)
+        # Create attention mask
+        attn_mask = self._create_attention_mask(seq_len)
 
-        return embeddings
+        # Apply transformer encoder
+        transformer_output = self.transformer_encoder(
+            hidden,
+            mask=attn_mask,
+            src_key_padding_mask=~mask if mask is not None else None,
+        )
 
+        # Get last valid embedding for each user
+        lengths = mask.sum(dim=-1) - 1  # Last valid position
+        user_indices = lengths.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.embedding_dim)
+        user_embeddings = torch.gather(transformer_output, 1, user_indices).squeeze(1)
 
-class BERT4Rec(SequentialEncoder):
-    """BERT4Rec: Sequential Recommendation with Bidirectional Transformer.
+        # Compute scores for all items
+        item_scores = user_embeddings @ self.item_embedding.weight.T
 
-    Uses bidirectional attention (no causal mask) and is trained with masked item prediction.
-    """
+        return {
+            'sequence_output': transformer_output,
+            'user_embedding': user_embeddings,
+            'item_scores': item_scores,
+        }
 
-    def __init__(self, n_items, embedding_dim=64, max_seq_len=50, n_heads=2, n_layers=2, dropout=0.2):
-        super().__init__(n_items, embedding_dim, max_seq_len, n_heads, n_layers, dropout)
+    def get_item_embedding(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Get embedding for specific item IDs."""
+        return self.item_embedding(item_ids)
 
-        self.attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(embedding_dim, n_heads, dropout=dropout, batch_first=True)
-            for _ in range(n_layers)
-        ])
-        self.norm_layers = nn.ModuleList([nn.LayerNorm(embedding_dim) for _ in range(n_layers * 2)])
-        self.ffn_layers = nn.ModuleList([nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim * 4, embedding_dim)
-        ) for _ in range(n_layers)])
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embedding_dim))
-
-    def forward(self, seq):
-        """
-        Args:
-            seq: LongTensor of shape (batch_size, seq_len) with item indices
-        Returns:
-            item_embeddings: FloatTensor of shape (batch_size, seq_len, embedding_dim)
-        """
-        batch_size, seq_len = seq.shape
-
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        positions = torch.arange(seq_len + 1, device=seq.device).unsqueeze(0)
-        pos_emb = self.pos_embedding(positions)
-
-        embeddings = self.item_embedding(seq)
-        embeddings = torch.cat([cls_tokens, embeddings], dim=1)
-        embeddings = embeddings + pos_emb
-        embeddings = self.dropout(embeddings)
-
-        for i in range(self.n_layers):
-            attn_out, _ = self.attention_layers[i](embeddings, embeddings, embeddings)
-            attn_out = self.dropout(attn_out)
-            embeddings = self.norm_layers[i * 2](embeddings + attn_out)
-
-            ffn_out = self.ffn_layers[i](embeddings)
-            embeddings = self.norm_layers[i * 2 + 1](embeddings + ffn_out)
-
-        return embeddings[:, 1:, :]
+    def get_all_item_embeddings(self) -> torch.Tensor:
+        """Get embeddings for all items."""
+        return self.item_embedding.weight

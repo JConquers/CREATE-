@@ -1,199 +1,217 @@
-"""
-Amazon Books dataset loader for CREATE++.
-Downloads and processes the 5-core Books dataset from Amazon Reviews 2023.
-"""
+"""Amazon Books dataset loader with automatic download and preprocessing."""
 
-import pandas as pd
-import torch
-from torch_geometric.data import download_url
+import hashlib
+import pickle
 from pathlib import Path
 
+import pandas as pd
+from .base_dataset import BaseDataset
 
-class BooksDataset:
-    """Amazon Books dataset (5-core)."""
+
+class AmazonBooksDataset(BaseDataset):
+    """Amazon Books dataset (5-core).
+
+    Downloads from:
+    https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Books.csv.gz
+
+    Uses leave-last-out splitting:
+    - For each user, the last interaction (by timestamp) goes to test
+    - The second-to-last goes to validation
+    - All earlier interactions go to training
+    """
 
     URL = "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Books.csv.gz"
 
-    def __init__(self, root="data"):
-        self.root = Path(root)
-        self.raw_dir = self.root / "raw"
-        self.processed_dir = self.root / "processed"
-        self.raw_file = self.raw_dir / "Books.csv.gz"
-        self.processed_file = self.processed_dir / "books_data.pt"
-        self.sequences_file = self.processed_dir / "books_sequences.pt"
+    def __init__(self, data_dir: str, max_sequence_length: int = 50):
+        super().__init__(data_dir, max_sequence_length)
+        self.dataset_name = 'amazon_books'
 
-    def download(self):
-        """Download the dataset if not present."""
+        # Check multiple possible locations for Kaggle compatibility
+        data_dir_path = Path(data_dir)
+
+        # Check if preprocessed file exists in common Kaggle locations
+        possible_processed_paths = [
+            data_dir_path / 'books_processed.pkl',
+            Path('./data/books_processed.pkl'),
+            Path('../input/books_processed.pkl'),
+            Path('/kaggle/input/books_processed.pkl'),
+            Path('./books_processed.pkl'),
+        ]
+
+        self.processed_file = None
+        self.raw_file = None
+
+        # Check for preprocessed file first (skip processing if found)
+        for p in possible_processed_paths:
+            if p.exists():
+                self.processed_file = p
+                print(f"Found preprocessed data at: {self.processed_file}")
+                break
+
+        # If no preprocessed file found, look for raw file
+        if self.processed_file is None:
+            possible_raw_paths = [
+                data_dir_path / 'Books.csv.gz',
+                Path('./data/Books.csv.gz'),
+                Path('../input/books/Books.csv.gz'),
+                Path('/kaggle/input/books/Books.csv.gz'),
+            ]
+            for p in possible_raw_paths:
+                if p.exists():
+                    self.raw_file = p
+                    self.processed_file = data_dir_path / 'books_processed.pkl'
+                    print(f"Found raw file at: {self.raw_file}")
+                    break
+
+            # Default to download if no raw file found
+            if self.raw_file is None:
+                self.raw_file = data_dir_path / 'Books.csv.gz'
+                self.processed_file = data_dir_path / 'books_processed.pkl'
+        else:
+            # Set raw_file for potential re-download if needed
+            self.raw_file = data_dir_path / 'Books.csv.gz'
+
+    def _download(self):
+        """Download the dataset if not already present."""
         if self.raw_file.exists():
-            print(f"Dataset already exists at {self.raw_file}")
+            print(f"Raw file already exists: {self.raw_file}")
             return
 
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading Books dataset from {self.URL}...")
-        download_url(self.URL, self.raw_dir)
+        print(f"Downloading Amazon Books dataset from {self.URL}...")
+        import urllib.request
 
-    def _create_sequences(self, df, max_seq_len):
-        """Create padded sequences from interaction dataframe."""
-        import pandas as pd
-        df = df.sort_values('user_idx')
-        sequences = []
-        for user_id, group in df.groupby('user_idx', sort=False):
-            items = group['item_idx'].values
-            if len(items) >= 2:
-                for i in range(1, len(items)):
-                    start = max(0, i - max_seq_len)
-                    seq = items[start:i]
-                    pad_len = max_seq_len - len(seq)
-                    sequences.append([0] * pad_len + seq.tolist())
-        return torch.tensor(sequences, dtype=torch.long) if sequences else torch.zeros(1, max_seq_len, dtype=torch.long)
+        self.raw_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def process(self, max_seq_len=50, rating_offset=3.5):
-        """Process the raw CSV into train/test splits with dual feedback graphs.
+        def reporthook(blocknum, blocksize, totalsize):
+            readsofar = blocknum * blocksize
+            if totalsize > 0:
+                percent = readsofar * 100 / totalsize
+                print(f"\rDownload progress: {percent:.1f}%", end='')
 
-        Args:
-            max_seq_len: max sequence length for sequences (not used in processing)
-            rating_offset: threshold for positive/negative feedback (default 3.5)
-        """
-        if self.processed_file.exists():
-            print(f"Processed data already exists at {self.processed_file}")
-            return self._load_processed()
+        urllib.request.urlretrieve(self.URL, self.raw_file, reporthook)
+        print(f"\nDownload complete: {self.raw_file}")
 
-        print("Processing dataset...")
+    def _preprocess(self):
+        """Preprocess the raw dataset with leave-last-out splitting."""
+        # Check if processed file exists
+        if self.processed_file and self.processed_file.exists():
+            print(f"Loading preprocessed data from {self.processed_file}")
+            with open(self.processed_file, 'rb') as f:
+                data = pickle.load(f)
+                self.train_df = data['train_df']
+                self.val_df = data['val_df']
+                self.test_df = data['test_df']
+                self.num_users = data['num_users']
+                self.num_items = data['num_items']
+                self.user2items = data['user2items']
+                self.item2users = data['item2users']
+                self.user_sequences = data.get('user_sequences', {})
+            return
 
-        df = pd.read_csv(self.raw_file, compression='gzip')
-        print(f"Columns: {df.columns.tolist()}")
-        print(f"Sample rows:\n{df.head()}")
+        # Download if needed
+        self._download()
+
+        print("Preprocessing dataset...")
+
+        # Read the CSV
+        import gzip
+        with gzip.open(self.raw_file, 'rt') as f:
+            df = pd.read_csv(f)
+
+        # Expected columns: user_id, item_id, parent_asin, rating, timestamp
+        # Keep only needed columns
+        df = df[['user_id', 'item_id', 'rating', 'timestamp']].copy()
+
+        # Sort by user and timestamp to ensure chronological order
         df = df.sort_values(['user_id', 'timestamp'])
 
-        user_col = 'user_id'
-        item_col = 'parent_asin' if 'parent_asin' in df.columns else 'asin'
+        # Leave-last-out splitting
+        train_rows = []
+        val_rows = []
+        test_rows = []
 
-        user2idx = {u: i for i, u in enumerate(df[user_col].unique())}
-        item2idx = {i: idx for idx, i in enumerate(df[item_col].unique())}
+        for user_id, user_data in df.groupby('user_id'):
+            user_interactions = user_data.values.tolist()
+            n = len(user_interactions)
 
-        df['user_idx'] = df[user_col].map(user2idx)
-        df['item_idx'] = df[item_col].map(item2idx)
+            if n >= 3:
+                # Train: all except last 2
+                train_rows.extend(user_interactions[:-2])
+                # Val: second to last
+                val_rows.append(user_interactions[-2])
+                # Test: last
+                test_rows.append(user_interactions[-1])
+            elif n == 2:
+                # Train: first
+                train_rows.append(user_interactions[0])
+                # Val: second (no test)
+                val_rows.append(user_interactions[1])
+            else:
+                # Only 1 interaction - put in train
+                train_rows.extend(user_interactions)
 
-        n_users = len(user2idx)
-        n_items = len(item2idx)
-        item_offset = n_users
+        self.train_df = pd.DataFrame(train_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
+        self.val_df = pd.DataFrame(val_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
+        self.test_df = pd.DataFrame(test_rows, columns=['user_id', 'item_id', 'rating', 'timestamp'])
 
-        df['weight'] = df['rating'] - rating_offset
+        # Create contiguous IDs
+        all_users = set()
+        all_items = set()
+        for df in [self.train_df, self.val_df, self.test_df]:
+            all_users.update(df['user_id'].unique())
+            all_items.update(df['item_id'].unique())
 
-        train_user_list, train_item_list, train_weight_list = [], [], []
-        val_user_list, val_item_list, test_user_list, test_item_list = [], [], [], []
+        user_map = {old: new for new, old in enumerate(sorted(all_users))}
+        item_map = {old: new for new, old in enumerate(sorted(all_items))}
 
-        for user_id, group in df.groupby('user_idx'):
-            group = group.sort_values('timestamp')
-            if len(group) >= 3:
-                test_user_list.append(user_id)
-                test_item_list.append(group.iloc[-1]['item_idx'])
-                val_user_list.append(user_id)
-                val_item_list.append(group.iloc[-2]['item_idx'])
-                for _, row in group.iloc[:-2].iterrows():
-                    train_user_list.append(user_id)
-                    train_item_list.append(row['item_idx'])
-                    train_weight_list.append(row['weight'])
-            elif len(group) == 2:
-                test_user_list.append(user_id)
-                test_item_list.append(group.iloc[-1]['item_idx'])
-                val_user_list.append(user_id)
-                val_item_list.append(group.iloc[0]['item_idx'])
-            elif len(group) == 1:
-                test_user_list.append(user_id)
-                test_item_list.append(group.iloc[0]['item_idx'])
+        for df in [self.train_df, self.val_df, self.test_df]:
+            df['user_id'] = df['user_id'].map(user_map).astype(int)
+            df['item_id'] = df['item_id'].map(item_map).astype(int)
 
-        edge_weight = torch.ones(len(train_user_list))
+        self.num_users = len(all_users)
+        self.num_items = len(all_items)
 
-        # Positive edges
-        pos_df = df[df['rating'] > rating_offset]
-        pos_edge_user = torch.tensor(pos_df['user_idx'].values, dtype=torch.long)
-        pos_edge_item = torch.tensor(pos_df['item_idx'].values, dtype=torch.long) + item_offset
-        pos_edge_index = torch.stack([
-            torch.cat([pos_edge_user, pos_edge_item], dim=0),
-            torch.cat([pos_edge_item, pos_edge_user], dim=0)
-        ], dim=0)
+        # Build mappings
+        self.build_user_item_index()
 
-        # Negative edges
-        neg_df = df[df['rating'] < rating_offset]
-        neg_edge_user = torch.tensor(neg_df['user_idx'].values, dtype=torch.long)
-        neg_edge_item = torch.tensor(neg_df['item_idx'].values, dtype=torch.long) + item_offset
-        neg_edge_index = torch.stack([
-            torch.cat([neg_edge_user, neg_edge_item], dim=0),
-            torch.cat([neg_edge_item, neg_edge_user], dim=0)
-        ], dim=0)
+        # Build user sequences for sequential models
+        self.user_sequences = {}
+        for user_id, group in self.train_df.groupby('user_id'):
+            items = group.sort_values('timestamp')['item_id'].tolist()
+            self.user_sequences[user_id] = items[-self.max_sequence_length:]
 
+        # Save processed data
+        print(f"Saving preprocessed data to {self.processed_file}")
         data = {
-            'edge_index': torch.tensor([train_user_list, train_item_list], dtype=torch.long),
-            'edge_weight': edge_weight,
-            'pos_edge_index': pos_edge_index,
-            'neg_edge_index': neg_edge_index,
-            'n_users': n_users,
-            'n_items': n_items,
-            'train_user': torch.tensor(train_user_list, dtype=torch.long),
-            'train_item': torch.tensor(train_item_list, dtype=torch.long),
-            'train_weight': torch.tensor(train_weight_list, dtype=torch.float),
-            'val_user': torch.tensor(val_user_list, dtype=torch.long),
-            'val_item': torch.tensor(val_item_list, dtype=torch.long),
-            'test_user': torch.tensor(test_user_list, dtype=torch.long),
-            'test_item': torch.tensor(test_item_list, dtype=torch.long),
-            'user2idx': user2idx,
-            'item2idx': item2idx,
+            'train_df': self.train_df,
+            'val_df': self.val_df,
+            'test_df': self.test_df,
+            'num_users': self.num_users,
+            'num_items': self.num_items,
+            'user2items': dict(self.user2items),
+            'item2users': dict(self.item2users),
+            'user_sequences': self.user_sequences,
         }
+        with open(self.processed_file, 'wb') as f:
+            pickle.dump(data, f)
 
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(data, self.processed_file)
-        print(f"Saved processed data to {self.processed_file}")
-        return data
+        print(f"Preprocessing complete!")
+        print(f"  Users: {self.num_users:,}")
+        print(f"  Items: {self.num_items:,}")
+        print(f"  Train interactions: {len(self.train_df):,}")
+        print(f"  Val interactions: {len(self.val_df):,}")
+        print(f"  Test interactions: {len(self.test_df):,}")
 
-    def _load_processed(self):
-        """Load processed data from disk."""
-        return torch.load(self.processed_file)
+    def load_data(self):
+        """Load or preprocess and load the dataset."""
+        self._preprocess()
+        return self.train_df, self.val_df, self.test_df
 
-    def get_edge_index(self):
-        """Get the interaction graph edge index."""
-        data = self.process()
-        return data['edge_index'], data['edge_weight']
-
-    def get_stats(self):
-        """Return dataset statistics."""
-        data = self.process()
-        return {
-            'n_users': data['n_users'],
-            'n_items': data['n_items'],
-            'n_interactions': data['edge_index'].shape[1]
-        }
-
-    def load(self):
-        """Main entry point to load and process the dataset."""
-        self.download()
-        return self.process()
-
-    def get_sequences(self, max_seq_len=50):
-        """Get cached sequences indexed by global user ID (0..n_users-1).
-
-        Builds one sequence per user (last max_seq_len items of their training history).
-        Returns a tensor of shape (n_users, max_seq_len).
-        """
-        if self.sequences_file.exists():
-            return torch.load(self.sequences_file)
-        data = self.process()
-        user_items = {}
-        for u, it in zip(data['train_user'].tolist(), data['train_item'].tolist()):
-            if u not in user_items:
-                user_items[u] = []
-            user_items[u].append(it)
-        n_users = data['n_users']
-        seqs = torch.zeros((n_users, max_seq_len), dtype=torch.long)
-        for u, items in user_items.items():
-            seq = items[-max_seq_len:]
-            seqs[u, max_seq_len - len(seq):] = torch.tensor(seq, dtype=torch.long)
-        torch.save(seqs, self.sequences_file)
-        print(f"Saved sequences to {self.sequences_file}")
-        return seqs
-
-
-if __name__ == "__main__":
-    dataset = BooksDataset(root="data/Books")
-    stats = dataset.load()
-    print(f"Dataset stats: {stats}")
+    def get_user_sequences(self) -> dict:
+        """Return user-item sequences for sequential models."""
+        if not hasattr(self, 'user_sequences'):
+            self.user_sequences = {}
+            for user_id, group in self.train_df.groupby('user_id'):
+                items = group.sort_values('timestamp')['item_id'].tolist()
+                self.user_sequences[user_id] = items[-self.max_sequence_length:]
+        return self.user_sequences
