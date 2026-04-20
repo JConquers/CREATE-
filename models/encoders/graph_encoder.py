@@ -1,10 +1,20 @@
 """
 Graph encoders for CREATE++: LightGCN, UltraGCN, and PoneGNN.
+
+PoneGNN implementation follows the paper:
+"Pone-GNN: Integrating Positive and Negative Feedback in Graph Neural Networks
+for Recommender Systems" (https://github.com/Young0222/Pone-GNN)
+
+Key architecture:
+- LightGINConv2: message passing with (1+eps)*self-emb + neighbor aggregation
+- Forward pass: pos_emb propagated on positive edges; neg_emb propagated on negative edges
+- Loss: dual BPR (positive + negative) + contrastive loss (every 10 epochs)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple, Union
 
 
 class GraphEncoder(nn.Module):
@@ -143,229 +153,255 @@ class UltraGCN(GraphEncoder):
         return item_emb + aggregated / (self.gamma + 1)
 
 
-class PoneGNN(GraphEncoder):
-    """PoneGNN: Integrating Positive and Negative Feedback in Graph Neural Networks.
 
-    Based on the paper "Pone-GNN: Integrating Positive and Negative Feedback in
-    Graph Neural Networks for Recommender Systems" (2025).
+# ---------------------------------------------------------------------------
+# LightGINConv2 — PoneGNN's convolution layer
+# ---------------------------------------------------------------------------
+
+class LightGINConv2(nn.Module):
+    """Light Graph Isomorphism Network layer used by PoneGNN.
+
+    Forward: out = (1 + eps) * self_emb + aggregate(neighbors)
+    Both positive and negative embeddings are updated per layer.
+
+    Args:
+        x: Tuple (pos_emb, neg_emb) of shape (n_users + n_items, embedding_dim)
+        pos_edge_index: edges for positive graph
+        neg_edge_index: edges for negative graph (can be same as pos for non-first layers)
+    """
+
+    def __init__(self, embedding_dim: int, first_aggr: bool):
+        super().__init__()
+        self.first_aggr = first_aggr
+        self.eps = nn.Parameter(torch.zeros(1))  # eps in paper, initialized to 0
+
+    def forward(self, x: Tuple[torch.Tensor, torch.Tensor],
+                pos_edge_index: torch.Tensor,
+                neg_edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: tuple of (pos_emb, neg_emb), each (n_users+n_items, dim)
+            pos_edge_index: (2, n_pos_edges)
+            neg_edge_index: (2, n_neg_edges)
+        Returns:
+            (out_pos, out_neg) each (n_users+n_items, dim)
+        """
+        pos_emb, neg_emb = x
+
+        def get_norm(node_size: int, edge_index: torch.Tensor):
+            row, col = edge_index
+            deg = torch.bincount(col, minlength=node_size).float().clamp(min=1)
+            deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+            return norm, deg_inv_sqrt
+
+        def gin_norm(out: torch.Tensor, input_x: torch.Tensor,
+                     deg_inv_sqrt: torch.Tensor) -> torch.Tensor:
+            # (1 + eps) * self_emb + neighbor_agg
+            norm_self = deg_inv_sqrt.unsqueeze(1) * deg_inv_sqrt.unsqueeze(1) * input_x
+            out = out + (1 + self.eps) * norm_self
+            return out
+
+        norm_pos, deg_inv_sqrt_pos = get_norm(pos_emb.size(0), pos_edge_index)
+        norm_neg, deg_inv_sqrt_neg = get_norm(neg_emb.size(0), neg_edge_index)
+
+        # Aggregate from positive edges
+        row_pos, col_pos = pos_edge_index[0], pos_edge_index[1]
+        msg_pos = norm_pos.unsqueeze(1) * pos_emb[col_pos]
+        out_pos = torch.zeros_like(pos_emb)
+        out_pos = out_pos.scatter_add(0, row_pos.unsqueeze(1).expand_as(msg_pos), msg_pos)
+
+        # Aggregate from negative edges
+        row_neg, col_neg = neg_edge_index[0], neg_edge_index[1]
+        msg_neg = norm_neg.unsqueeze(1) * neg_emb[col_neg]
+        out_neg = torch.zeros_like(neg_emb)
+        out_neg = out_neg.scatter_add(0, row_neg.unsqueeze(1).expand_as(msg_neg), msg_neg)
+
+        if self.first_aggr:
+            # First layer: positive neighbors aggregate from pos_emb, negative from pos_emb
+            out_pos = gin_norm(out_pos, pos_emb, deg_inv_sqrt_pos)
+            out_neg = gin_norm(out_neg, neg_emb, deg_inv_sqrt_neg)
+        else:
+            # Subsequent layers: positive neighbors aggregate from pos_emb on pos edges
+            # negative neighbors aggregate from neg_emb on pos edges (using pos norms)
+            out_pos = gin_norm(out_pos, pos_emb, deg_inv_sqrt_pos)
+            out_neg = gin_norm(out_neg, neg_emb, deg_inv_sqrt_pos)
+
+        return out_pos, out_neg
+
+
+# ---------------------------------------------------------------------------
+# PoneGNN — positive/negative dual-embedding GNN
+# ---------------------------------------------------------------------------
+
+class PoneGNN(GraphEncoder):
+    """PoneGNN: Positive/Negative Feedback GNN.
+
+    Follows the official implementation from https://github.com/Young0222/Pone-GNN
 
     Key features:
-    - Dual embeddings: interest embeddings (Z) for likes, disinterest embeddings (V) for dislikes
-    - Separate message passing on positive and negative feedback graphs
-    - Light graph isomorphism network (no feature transformation, no nonlinear activation)
-    - Contrastive learning between positive and negative embeddings
-    - Disinterest-score filter for recommendations
-
-    Note: This implementation focuses on the graph encoder component. The full PoneGNN
-    includes a disinterest-score filter which can be applied during inference.
+    - Dual embeddings: Z (interest) for likes, V (disinterest) for dislikes
+    - LightGINConv2 message passing on positive and negative graphs
+    - Skip connections with alpha = 1 / (n_layers + 1)
+    - BPR loss on both positive and negative branches
+    - Contrastive loss between positive and negative user embeddings (every 10 epochs)
     """
 
     def __init__(
         self,
-        n_users,
-        n_items,
-        embedding_dim=64,
-        n_layers=4,
-        epsilon_p=0.1,
-        epsilon_n=0.1,
-        lambda_cl=0.1,
-        lambda_reg=5e-5,
-        temperature=1.0,
+        n_users: int,
+        n_items: int,
+        embedding_dim: int = 64,
+        n_layers: int = 4,
+        epsilon_p: float = 0.0,   # not used directly — eps is learned in LightGINConv2
+        epsilon_n: float = 0.0,
+        lambda_cl: float = 1.0,   # contrastive loss weight
+        lambda_reg: float = 5e-5,
+        temperature: float = 1.0,
     ):
         super().__init__(n_users, n_items, embedding_dim)
-
         self.n_layers = n_layers
-        self.epsilon_p = epsilon_p  # Learnable parameter for positive graph self-embedding
-        self.epsilon_n = epsilon_n  # Learnable parameter for negative graph self-embedding
-        self.lambda_cl = lambda_cl  # Contrastive learning coefficient
-        self.lambda_reg = lambda_reg  # L2 regularization coefficient
+        self.lambda_cl = lambda_cl
+        self.lambda_reg = lambda_reg
         self.temperature = temperature
 
-        # Interest embeddings (positive feedback)
+        n_total = n_users + n_items
+
+        # Positive embeddings (interest)
         self.user_embedding_pos = nn.Embedding(n_users, embedding_dim)
         self.item_embedding_pos = nn.Embedding(n_items, embedding_dim)
 
-        # Disinterest embeddings (negative feedback)
+        # Negative embeddings (disinterest)
         self.user_embedding_neg = nn.Embedding(n_users, embedding_dim)
         self.item_embedding_neg = nn.Embedding(n_items, embedding_dim)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize embeddings using Xavier normal initialization."""
         nn.init.xavier_normal_(self.user_embedding_pos.weight)
         nn.init.xavier_normal_(self.item_embedding_pos.weight)
         nn.init.xavier_normal_(self.user_embedding_neg.weight)
         nn.init.xavier_normal_(self.item_embedding_neg.weight)
 
-    def forward(self, edge_index, edge_weight=None, negative_edge_index=None):
-        """
+        # LightGINConv2 layers: first layer uses pos_emb→neg on neg edges,
+        # subsequent layers use pos_emb→neg on pos edges
+        self.conv = nn.ModuleList()
+        for i in range(n_layers):
+            self.conv.append(LightGINConv2(embedding_dim, first_aggr=(i == 0)))
+
+    def forward(self, pos_edge_index: torch.Tensor, neg_edge_index: torch.Tensor):
+        """Full forward pass computing positive and negative embeddings.
+
         Args:
-            edge_index: LongTensor of shape (2, n_edges) with positive user-item interactions
-            edge_weight: Optional FloatTensor of shape (n_edges,) for positive edges
-            negative_edge_index: Optional LongTensor of shape (2, n_neg_edges) for negative interactions
+            pos_edge_index: (2, n_pos_edges) user-item positive interaction edges
+            neg_edge_index: (2, n_neg_edges) user-item negative interaction edges
         Returns:
-            user_emb: FloatTensor of shape (n_users, embedding_dim) - interest embeddings
-            item_emb: FloatTensor of shape (n_items, embedding_dim) - interest embeddings
-            user_emb_neg: FloatTensor of shape (n_users, embedding_dim) - disinterest embeddings
-            item_emb_neg: FloatTensor of shape (n_items, embedding_dim) - disinterest embeddings
+            pos_emb: (n_users + n_items, embedding_dim) positive/interest embeddings
+            neg_emb: (n_users + n_items, embedding_dim) negative/disinterest embeddings
         """
-        # Initialize embeddings
-        user_emb_pos = self.user_embedding_pos.weight
-        item_emb_pos = self.item_embedding_pos.weight
-        user_emb_neg = self.user_embedding_neg.weight
-        item_emb_neg = self.item_embedding_neg.weight
+        # Combine user + item embeddings into unified node table
+        pos_emb = torch.cat([self.user_embedding_pos.weight, self.item_embedding_pos.weight], dim=0)
+        neg_emb = torch.cat([self.user_embedding_neg.weight, self.item_embedding_neg.weight], dim=0)
 
-        # Store embeddings from all layers for averaging
-        all_user_emb_pos = [user_emb_pos]
-        all_item_emb_pos = [item_emb_pos]
-        all_user_emb_neg = [user_emb_neg]
-        all_item_emb_neg = [item_emb_neg]
+        alpha = 1.0 / (self.n_layers + 1)
 
-        # Message passing on positive graph
-        for layer in range(self.n_layers):
-            user_emb_pos, item_emb_pos = self._propagate_positive(
-                edge_index, user_emb_pos, item_emb_pos, edge_weight
-            )
-            all_user_emb_pos.append(user_emb_pos)
-            all_item_emb_pos.append(item_emb_pos)
+        for i in range(self.n_layers):
+            pos_emb, neg_emb = self.conv[i]((pos_emb, neg_emb), pos_edge_index, neg_edge_index)
+            # Skip connection: accum = prev + alpha * new
+            pos_emb = pos_emb + alpha * torch.cat(
+                [self.user_embedding_pos.weight, self.item_embedding_pos.weight], dim=0)
+            neg_emb = neg_emb + alpha * torch.cat(
+                [self.user_embedding_neg.weight, self.item_embedding_neg.weight], dim=0)
 
-        # Message passing on negative graph (if negative edges provided)
-        if negative_edge_index is not None:
-            for layer in range(self.n_layers):
-                user_emb_neg, item_emb_neg = self._propagate_negative(
-                    negative_edge_index, user_emb_neg, item_emb_neg
-                )
-                all_user_emb_neg.append(user_emb_neg)
-                all_item_emb_neg.append(item_emb_neg)
+        return pos_emb, neg_emb
 
-        # Average embeddings from all layers (Eq. 2 and 4 in paper)
-        user_emb_pos = torch.stack(all_user_emb_pos, dim=0).mean(dim=0)
-        item_emb_pos = torch.stack(all_item_emb_pos, dim=0).mean(dim=0)
-        user_emb_neg = torch.stack(all_user_emb_neg, dim=0).mean(dim=0)
-        item_emb_neg = torch.stack(all_item_emb_neg, dim=0).mean(dim=0)
+    def split_embeddings(self, pos_emb: torch.Tensor, neg_emb: torch.Tensor):
+        """Split unified embeddings into (user_pos, item_pos, user_neg, item_neg)."""
+        u_pos, i_pos = pos_emb[:self.n_users], pos_emb[self.n_users:]
+        u_neg, i_neg = neg_emb[:self.n_users], neg_emb[self.n_users:]
+        return u_pos, i_pos, u_neg, i_neg
 
-        return user_emb_pos, item_emb_pos, user_emb_neg, item_emb_neg
+    def compute_loss(
+        self,
+        users: torch.Tensor,
+        items: torch.Tensor,
+        weights: torch.Tensor,         # rating - offset (for weighted BPR)
+        negative_samples: torch.Tensor, # (batch, n_neg) item indices
+        pos_edge_index: torch.Tensor,
+        neg_edge_index: torch.Tensor,
+        epoch: int = 0,
+    ):
+        """Compute full PoneGNN loss (dual BPR + contrastive).
 
-    def _propagate_positive(self, edge_index, user_emb, item_emb, edge_weight=None):
+        Args:
+            users: (batch,) user indices
+            items: (batch,) positive item indices
+            weights: (batch,) rating - offset, used for weighted BPR
+            negative_samples: (batch, n_neg) negative item indices
+            pos_edge_index: (2, n_pos_edges)
+            neg_edge_index: (2, n_neg_edges)
+            epoch: current epoch — contrastive loss triggered every 10 epochs
         """
-        Propagate embeddings on positive graph using light graph isomorphism.
-        Eq. (1) in PoneGNN paper.
-        """
-        row, col = edge_index[0], edge_index[1]  # row: users, col: items
+        pos_emb, neg_emb = self.forward(pos_edge_index, neg_edge_index)
+        u_pos, i_pos, u_neg, i_neg = self.split_embeddings(pos_emb, neg_emb)
 
-        if edge_weight is None:
-            edge_weight = torch.ones(row.shape[0], device=row.device)
+        # Shift indices: items are offset by n_users in the unified embedding table
+        item_offset = self.n_users
 
-        # Compute normalization factors
-        deg_user = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
-        deg_item = torch.bincount(col, minlength=self.n_items).float().clamp(min=1)
+        u_p = u_pos[users]                                    # (batch, dim)
+        i_p = i_pos[items]                                    # (batch, dim)
+        i_n = i_pos[negative_samples]                         # (batch, n_neg, dim)
+        u_n = u_neg[users]
+        i_n_emb = i_neg[items]                                # (batch, dim)
+        i_n_neg = i_neg[negative_samples]                      # (batch, n_neg, dim)
 
-        deg_inv_sqrt_user = torch.pow(deg_user, -0.5)
-        deg_inv_sqrt_item = torch.pow(deg_item, -0.5)
+        # Positive BPR loss on interest embeddings
+        pos_score = torch.sum(u_p * i_p, dim=1)                # (batch,)
+        neg_score = torch.bmm(i_n, u_p.unsqueeze(2)).squeeze(2)  # (batch, n_neg)
+        weight_factor = (-0.5 * torch.sign(weights) + 1.5).unsqueeze(1)  # like→1.0, dislike→2.0
+        pos_bpr = F.logsigmoid(weight_factor * pos_score.unsqueeze(1) - neg_score).sum(dim=1)
+        pos_bpr_loss = -torch.mean(pos_bpr)
 
-        # Normalize edge weights
-        norm = deg_inv_sqrt_user[row] * deg_inv_sqrt_item[col] * edge_weight
+        # Regularization on positive embeddings
+        reg_loss_pos = (u_p ** 2).sum() + (i_p ** 2).sum() + (i_n ** 2).sum()
 
-        # Aggregate item embeddings to users
-        item_to_user = torch.zeros_like(user_emb)
-        item_to_user = item_to_user.scatter_add_(
-            0, row.unsqueeze(1).expand_as(item_emb[col]),
-            item_emb[col] * norm.unsqueeze(1)
-        )
+        total_loss = pos_bpr_loss + self.lambda_reg * reg_loss_pos
 
-        # Aggregate user embeddings to items
-        user_to_item = torch.zeros_like(item_emb)
-        user_to_item = user_to_item.scatter_add_(
-            0, col.unsqueeze(1).expand_as(user_emb[row]),
-            user_emb[row] * norm.unsqueeze(1)
-        )
+        # Negative BPR + Contrastive loss: triggered every 10 epochs
+        if epoch % 10 == 1:
+            u_n_full = u_neg[users]
+            i_n_full = i_neg[items]
+            i_neg_neg = i_neg[negative_samples]
 
-        # Apply self-embedding strengthening and normalize (Eq. 1 in PoneGNN paper)
-        deg = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
-        self_emb_factor = (1 + self.epsilon_p) / (deg + 1)
+            neg_score_bpr = torch.bmm(i_neg_neg, u_n_full.unsqueeze(2)).squeeze(2)
+            pos_score_neg = torch.sum(u_n_full * i_n_full, dim=1)
+            weight_factor_neg = (0.5 * torch.sign(weights) + 1.5).unsqueeze(1)
+            neg_bpr = F.logsigmoid(neg_score_bpr - weight_factor_neg * pos_score_neg.unsqueeze(1)).sum(dim=1)
+            neg_bpr_loss = -torch.mean(neg_bpr)
 
-        new_user_emb = self_emb_factor.unsqueeze(1) * user_emb + item_to_user
-        new_item_emb = self_emb_factor.unsqueeze(1) * item_emb + user_to_item
+            reg_loss_neg = (u_n_full ** 2).sum() + (i_n_full ** 2).sum() + (i_neg_neg ** 2).sum()
+            total_loss = total_loss + neg_bpr_loss + self.lambda_reg * reg_loss_neg
 
-        return new_user_emb, new_item_emb
+            # Contrastive loss: push u_pos away from u_neg
+            u_p_norm = F.normalize(u_p, dim=1)
+            u_n_norm = F.normalize(u_n, dim=1)
+            pos_sim = torch.sum(u_p_norm * F.normalize(i_pos[items], dim=1), dim=1)
+            neg_sim = torch.sum(u_n_norm * F.normalize(i_neg[items], dim=1), dim=1)
+            pos_pair = torch.exp(pos_sim / self.temperature)
+            neg_pair = torch.exp(neg_sim / self.temperature)
+            contrastive_loss = -torch.log(pos_pair / (pos_pair + neg_pair)).mean()
+            total_loss = total_loss + self.lambda_cl * contrastive_loss
 
-    def _propagate_negative(self, edge_index, user_emb, item_emb):
-        """
-        Propagate embeddings on negative graph using light graph isomorphism.
-        Eq. (3) in PoneGNN paper.
-        """
-        row, col = edge_index[0], edge_index[1]  # row: users, col: items
-
-        # Compute normalization factors
-        deg_user = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
-        deg_item = torch.bincount(col, minlength=self.n_items).float().clamp(min=1)
-
-        deg_inv_sqrt_user = torch.pow(deg_user, -0.5)
-        deg_inv_sqrt_item = torch.pow(deg_item, -0.5)
-
-        # Normalize edge weights (assume uniform weight for negative edges)
-        norm = deg_inv_sqrt_user[row] * deg_inv_sqrt_item[col]
-
-        # Aggregate item embeddings to users
-        item_to_user = torch.zeros_like(user_emb)
-        item_to_user = item_to_user.scatter_add_(
-            0, row.unsqueeze(1).expand_as(item_emb[col]),
-            item_emb[col] * norm.unsqueeze(1)
-        )
-
-        # Aggregate user embeddings to items
-        user_to_item = torch.zeros_like(item_emb)
-        user_to_item = user_to_item.scatter_add_(
-            0, col.unsqueeze(1).expand_as(user_emb[row]),
-            user_emb[row] * norm.unsqueeze(1)
-        )
-
-        # Apply self-embedding strengthening and normalize (Eq. 3 in PoneGNN paper)
-        deg = torch.bincount(row, minlength=self.n_users).float().clamp(min=1)
-        self_emb_factor = (1 + self.epsilon_n) / (deg + 1)
-
-        new_user_emb = self_emb_factor.unsqueeze(1) * user_emb + item_to_user
-        new_item_emb = self_emb_factor.unsqueeze(1) * item_emb + user_to_item
-
-        return new_user_emb, new_item_emb
-
-    def compute_contrastive_loss(self, user_emb_pos, item_emb_pos, user_emb_neg, item_emb_neg):
-        """
-        Compute contrastive learning loss (Eq. 7 and 13 in PoneGNN paper).
-
-        Positive pairs: user_emb_pos ↔ item_emb_pos (user's interest with items they liked)
-        Negative pairs: user_emb_pos ↔ item_emb_neg (user's interest with items they disliked)
-
-        Items themselves don't have user-anchored pairs without interaction data,
-        so we use user-centric contrastive learning: pull user_emb_pos closer to
-        item_emb_pos, push it away from item_emb_neg.
-        """
-        # Normalize embeddings
-        user_emb_pos = F.normalize(user_emb_pos, p=2, dim=1)
-        item_emb_pos = F.normalize(item_emb_pos, p=2, dim=1)
-        user_emb_neg = F.normalize(user_emb_neg, p=2, dim=1)
-        item_emb_neg = F.normalize(item_emb_neg, p=2, dim=1)
-
-        # Positive: user interest embedding should be close to items they liked
-        pos_sim_user = torch.sum(user_emb_pos * item_emb_pos, dim=1)
-
-        # Negative: user interest embedding should be far from items they disliked
-        neg_sim_user = torch.sum(user_emb_pos * item_emb_neg, dim=1)
-
-        # InfoNCE-style: maximize pos similarity, minimize neg similarity
-        user_loss = -torch.log(torch.exp(pos_sim_user / self.temperature) /
-                               (torch.exp(pos_sim_user / self.temperature) +
-                                torch.exp(neg_sim_user / self.temperature) + 1e-8)).mean()
-
-        return self.lambda_cl * user_loss
+        return total_loss
 
     def compute_reg_loss(self):
-        """Compute L2 regularization loss on initial embeddings."""
-        reg_loss = (
+        """L2 regularization on all embedding tables."""
+        return self.lambda_reg * (
             torch.norm(self.user_embedding_pos.weight) ** 2 +
             torch.norm(self.item_embedding_pos.weight) ** 2 +
             torch.norm(self.user_embedding_neg.weight) ** 2 +
             torch.norm(self.item_embedding_neg.weight) ** 2
         )
-        return self.lambda_reg * reg_loss
+
+    def get_embeddings(self, pos_edge_index: torch.Tensor, neg_edge_index: torch.Tensor):
+        """Return all four embedding matrices (for inference / evaluation)."""
+        pos_emb, neg_emb = self.forward(pos_edge_index, neg_edge_index)
+        return self.split_embeddings(pos_emb, neg_emb)

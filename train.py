@@ -124,21 +124,21 @@ def load_dataset(name, data_root):
 
 
 def create_sequences(train_user, train_item, max_seq_len, n_items):
-    """Create padded sequences from interaction data."""
-    user_sequences = {}
-    for u, it in zip(train_user.tolist(), train_item.tolist()):
-        if u not in user_sequences:
-            user_sequences[u] = []
-        user_sequences[u].append(it)
+    """Create padded sequences from interaction data using vectorized operations."""
+    import pandas as pd
+
+    df = pd.DataFrame({'user': train_user.numpy(), 'item': train_item.numpy()})
+    df = df.sort_values('user')
 
     sequences = []
-    for u in sorted(user_sequences.keys()):
-        seq = user_sequences[u]
-        if len(seq) >= 2:
-            for i in range(1, len(seq)):
-                padded = [0] * (max_seq_len - min(i, max_seq_len))
-                clipped = seq[max(0, i - max_seq_len):i]
-                sequences.append(padded + clipped)
+    for user_id, group in df.groupby('user', sort=False):
+        items = group['item'].values
+        if len(items) >= 2:
+            for i in range(1, len(items)):
+                start = max(0, i - max_seq_len)
+                seq = items[start:i]
+                pad_len = max_seq_len - len(seq)
+                sequences.append([0] * pad_len + seq.tolist())
 
     if len(sequences) == 0:
         return torch.zeros(1, max_seq_len, dtype=torch.long)
@@ -151,8 +151,13 @@ def collate_fn(batch):
     return torch.stack(batch)
 
 
-def evaluate(model, test_user, test_item, train_user, train_item, seqs, edge_index, edge_weight, negative_edge_index=None, k=10):
-    """Evaluate model with Recall@K and NDCG@K."""
+def evaluate(model, test_user, test_item, train_user, train_item, seqs, edge_index, edge_weight=None, neg_edge_index=None, k=10, user_map=None):
+    """Evaluate model with Recall@K and NDCG@K.
+
+    Args:
+        user_map: dict mapping global user ID -> local (contiguous) index for seqs lookup.
+                  If None, seqs is indexed by global user ID.
+    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -161,15 +166,16 @@ def evaluate(model, test_user, test_item, train_user, train_item, seqs, edge_ind
     edge_index = edge_index.to(device)
     if edge_weight is not None:
         edge_weight = edge_weight.to(device)
-
-    n_users = test_user.max().item() + 1
-    n_items = model.n_items
+    if neg_edge_index is not None:
+        neg_edge_index = neg_edge_index.to(device)
 
     user_hists = {}
     for u, it in zip(train_user.tolist(), train_item.tolist()):
         if u not in user_hists:
             user_hists[u] = []
         user_hists[u].append(it)
+    for u in user_hists:
+        user_hists[u] = set(user_hists[u])
 
     recall_sum = 0.0
     ndcg_sum = 0.0
@@ -178,29 +184,37 @@ def evaluate(model, test_user, test_item, train_user, train_item, seqs, edge_ind
     seqs = seqs.to(device)
     with torch.no_grad():
         for i in range(len(test_user)):
-            u = test_user[i].item()
+            global_u = test_user[i].item()
             true_item = test_item[i].item()
 
-            if u >= seqs.size(0):
-                continue
+            if user_map is not None:
+                if global_u not in user_map:
+                    continue
+                u_local = user_map[global_u]
+                seq = seqs[u_local:u_local+1]
+            else:
+                if global_u >= len(seqs):
+                    continue
+                seq = seqs[global_u:global_u+1]
 
-            seq = seqs[u:u+1]
-
-            # Handle CREATE-Pone vs CREATE++
             if isinstance(model, CreatePone):
-                fused_emb, item_emb_g = model(seq, edge_index, edge_weight, negative_edge_index)
+                topk_items = model.recommend(seq, edge_index, neg_edge_index, k=k)
             else:
                 fused_emb, item_emb_g = model(seq, edge_index, edge_weight)
+                scores = torch.mm(fused_emb, item_emb_g.t())[0]
+                if user_map is not None:
+                    hist_key = user_map.get(global_u, None)
+                else:
+                    hist_key = global_u
+                if hist_key is not None and hist_key in user_hists:
+                    scores[list(user_hists[hist_key])] = float('-inf')
+                _, topk_items = torch.topk(scores, k)
 
-            scores = torch.mm(fused_emb, item_emb_g.t())[0]
-            scores[list(set(user_hists.get(u, [])))] = float('-inf')
+            topk_items = topk_items.cpu().tolist()
 
-            _, topk = torch.topk(scores, k)
-            topk = topk.cpu().tolist()
-
-            if true_item in topk:
+            if true_item in topk_items:
                 recall_sum += 1
-                rank = topk.index(true_item) + 1
+                rank = topk_items.index(true_item) + 1
                 ndcg_sum += 1.0 / np.log2(rank + 1)
 
     n_test = len(test_user)
@@ -223,19 +237,50 @@ def train(args):
     edge_weight = data.get('edge_weight', torch.ones(edge_index.shape[1]))
     train_user = data['train_user']
     train_item = data['train_item']
+    train_weight = data.get('train_weight', torch.ones_like(train_item).float())
     test_user = data['test_user']
     test_item = data['test_item']
 
-    print(f"Creating sequences (max_len={args.max_seq_len})...")
-    seqs = create_sequences(train_user, train_item, args.max_seq_len, n_items)
+    # Positive and negative edge indices for PoneGNN
+    pos_edge_index = data['pos_edge_index'].to(device)
+    neg_edge_index = data['neg_edge_index'].to(device)
+    print(f"Positive edges: {pos_edge_index.shape[1]}, Negative edges: {neg_edge_index.shape[1]}")
 
-    if len(seqs) > 10000:
-        indices = np.random.choice(len(seqs), 10000, replace=False)
-        seqs = seqs[indices]
+    # Build item popularity distribution for negative sampling (deg^0.75, like PoneGNN paper)
+    item_deg = torch.bincount(train_item, minlength=n_items).float()
+    item_deg = item_deg ** 0.75
+    item_deg = item_deg / item_deg.sum()
 
-    # Initialize model based on graph encoder choice
+    if args.dataset == 'beauty':
+        seqs = BeautyDataset(root=f"{args.data_root}/Beauty_and_Personal_Care").get_sequences(args.max_seq_len)
+    else:
+        seqs = BooksDataset(root=f"{args.data_root}/Books").get_sequences(args.max_seq_len)
+
+    # seqs[global_user_id] contains the sequence for that user (indexed by global user ID)
+    # Subsample: pick 10K users, remap their global IDs to 0..9999
+    # Then build a new seqs array indexed by local (contiguous) ID
+    n_seq = len(seqs)
+    unique_global_users = train_user.unique().tolist()
+    if len(unique_global_users) > 10000:
+        sampled_global_users = np.random.choice(unique_global_users, 10000, replace=False).tolist()
+        mask = sum((train_user == u) for u in sampled_global_users).bool()
+        train_user = train_user[mask]
+        train_item = train_item[mask]
+        train_weight = train_weight[mask]
+
+    # Remap global user IDs to 0..K-1 for contiguous indexing
+    unique_global = train_user.unique().tolist()
+    g2l = {g: i for i, g in enumerate(unique_global)}
+    seqs_local = torch.zeros((len(unique_global), seqs.size(1)), dtype=torch.long)
+    for new_id, global_id in enumerate(unique_global):
+        seqs_local[new_id] = seqs[global_id]
+    seqs = seqs_local
+    train_user = torch.tensor([g2l[g] for g in train_user.tolist()], dtype=torch.long)
+
+    K = 40  # negative samples per positive (PoneGNN paper default)
+
+    # Initialize model
     if args.graph == 'ponegnn':
-        # Use CREATE-Pone variant
         model = CreatePone(
             n_users=n_users,
             n_items=n_items,
@@ -252,17 +297,17 @@ def train(args):
             w_contrast=args.w_contrast,
             ponegnn_kwargs={
                 'n_layers': args.gnn_layers,
-                'epsilon_p': args.epsilon_p,
-                'epsilon_n': args.epsilon_n,
-                'lambda_cl': args.lambda_cl,
+                'epsilon_p': 0.0,
+                'epsilon_n': 0.0,
+                'lambda_cl': args.w_contrast,
                 'lambda_reg': args.lambda_reg,
+                'temperature': 1.0,
             },
             n_heads=args.n_heads,
             n_layers=args.n_layers,
         ).to(device)
         print(f"Model: CREATE-Pone with {args.sequential} + PoneGNN")
     else:
-        # Use standard CREATE++ with LightGCN or UltraGCN
         model = CreatePlusPlus(
             n_users=n_users,
             n_items=n_items,
@@ -285,47 +330,60 @@ def train(args):
     edge_index = edge_index.to(device)
     edge_weight = edge_weight.to(device)
     seqs = seqs.to(device)
+    train_user = train_user.to(device)
+    train_item = train_item.to(device)
+    train_weight = train_weight.to(device)
+
+    # Build global->local user map for evaluation
+    sampled_user_map = {g: i for i, g in enumerate(train_user.unique().tolist())}
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     print(f"\nStarting training...")
-    print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}, Negatives: {K}")
     print(f"Fusion: {'MLP + GELU (CREATE++)' if not args.no_mlp_fusion else 'Linear (CREATE)'}")
-    print(f"Loss weights: w_local={args.w_local}, w_global={args.w_global}, w_barlow={args.w_barlow}, w_info={args.w_info}", end="")
+    print(f"Loss weights: w_local={args.w_local}, w_global={args.w_global}, w_barlow={args.w_barlow}", end="")
     if args.graph == 'ponegnn':
         print(f", w_ortho={args.w_ortho}, w_contrast={args.w_contrast}")
     else:
         print()
     print("-" * 50)
 
-    # Prepare negative edges for PoneGNN (ratings <= 3 as negative feedback)
-    negative_edge_index = None
-    if args.graph == 'ponegnn' and args.use_negative_edges:
-        # Create negative edge index from low-rated interactions
-        # This would require dataset support for negative edges
-        print("Note: Negative edges would be constructed from low-rated items")
-        print("      Currently using only positive graph for message passing")
-
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
+        total_ponegnn = 0.0
         total_local = 0.0
         total_global = 0.0
         total_align = 0.0
         total_ortho = 0.0
-        total_contrast = 0.0
-        total_reg = 0.0
 
         perm = torch.randperm(len(seqs))
+        n_batches = 0
+
         for i in range(0, len(seqs), args.batch_size):
-            batch_idx = perm[i:i+args.batch_size]
-            batch_seqs = seqs[batch_idx]
+            batch_idx = perm[i:i + args.batch_size]
+            # seqs is indexed by global user ID (0..n_users-1), so look up actual user IDs
+            batch_user = train_user[batch_idx]
+            batch_item = train_item[batch_idx]
+            batch_weight = train_weight[batch_idx]
+            batch_seqs = seqs[batch_user]
+
+            # Sample K negatives per positive interaction
+            neg_items = torch.randint(0, n_items, (len(batch_seqs), K), device=device)
 
             optimizer.zero_grad()
 
             if args.graph == 'ponegnn':
                 loss, loss_dict = model.compute_loss(
-                    batch_seqs, edge_index, edge_weight, negative_edge_index, epoch=epoch
+                    batch_seqs,
+                    pos_edge_index,
+                    neg_edge_index,
+                    batch_user,
+                    batch_item,
+                    batch_weight,
+                    neg_items,
+                    epoch=epoch,
                 )
             else:
                 loss, loss_dict = model.compute_loss(
@@ -336,43 +394,38 @@ def train(args):
             optimizer.step()
 
             total_loss += loss.item()
-            total_local += loss_dict['local_loss']
-            total_global += loss_dict['global_loss']
-            total_align += loss_dict.get('alignment_loss', 0.0) + loss_dict.get('info_loss', 0.0)
+            total_ponegnn += loss_dict.get('ponegnn_loss', 0.0)
+            total_local += loss_dict.get('local_loss', 0.0)
+            total_global += loss_dict.get('global_loss', 0.0)
+            total_align += loss_dict.get('alignment_loss', 0.0)
             total_ortho += loss_dict.get('ortho_loss', 0.0)
-            total_contrast += loss_dict.get('contrastive_loss', 0.0)
-            total_reg += loss_dict.get('reg_loss', 0.0)
+            n_batches += 1
 
-        n_batches = len(seqs) // args.batch_size + 1
         avg_loss = total_loss / n_batches
+        avg_ponegnn = total_ponegnn / n_batches
         avg_local = total_local / n_batches
         avg_global = total_global / n_batches
         avg_align = total_align / n_batches
         avg_ortho = total_ortho / n_batches
-        avg_contrast = total_contrast / n_batches
-        avg_reg = total_reg / n_batches
 
         if (epoch + 1) % args.log_every == 0:
             log_msg = (f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
+                      f"PoneGNN: {avg_ponegnn:.4f} | "
                       f"Local: {avg_local:.4f} | Global: {avg_global:.4f} | "
-                      f"Align: {avg_align:.4f} | Reg: {avg_reg:.6f}")
-            if args.graph == 'ponegnn':
-                log_msg += f" | Ortho: {avg_ortho:.4f} | Contrast: {avg_contrast:.4f}"
+                      f"Align: {avg_align:.4f} | Ortho: {avg_ortho:.4f}")
             print(log_msg)
 
         if (epoch + 1) % args.eval_every == 0:
             if args.graph == 'ponegnn':
                 metrics = evaluate(model, test_user, test_item, train_user, train_item,
-                                  seqs, edge_index, edge_weight, negative_edge_index, k=10)
+                                  seqs, pos_edge_index, neg_edge_index, k=10, user_map=sampled_user_map)
             else:
                 metrics = evaluate(model, test_user, test_item, train_user, train_item,
-                                  seqs, edge_index, edge_weight, k=10)
+                                  seqs, edge_index, edge_weight, k=10, user_map=sampled_user_map)
             print(f"  Evaluation @10 | Recall: {metrics['recall@10']:.4f} | NDCG: {metrics['ndcg@10']:.4f}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save with appropriate model name
     model_name = f"create_pone_{args.sequential}_{args.dataset}" if args.graph == 'ponegnn' else f"create_plus_plus_{args.sequential}_{args.graph}_{args.dataset}"
     torch.save(model.state_dict(), save_dir / f"{model_name}.pt")
     print(f"\nModel saved to {save_dir}/{model_name}.pt")
