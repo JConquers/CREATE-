@@ -25,10 +25,9 @@ class SequentialEncoder(nn.Module):
         self.dropout_rate = dropout
 
     def get_attention_mask(self, seq):
-        """Create causal attention mask."""
-        batch_size, seq_len = seq.shape
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=seq.device))
-        return mask.unsqueeze(0).expand(batch_size, -1, -1)
+        """Create causal attention mask. Shape (seq_len, seq_len), no batch dim."""
+        seq_len = seq.size(1)
+        return torch.tril(torch.ones(seq_len, seq_len, device=seq.device))
 
 
 class SASRec(SequentialEncoder):
