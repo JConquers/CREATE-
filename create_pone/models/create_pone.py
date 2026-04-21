@@ -52,6 +52,7 @@ class CreatePoneModel(nn.Module):
         batch: dict,
         signed_graph: SignedGraph,
         run_sequence: bool,
+        compute_sequence_logits: bool = True,
     ) -> dict:
         (
             interest_user_embeddings,
@@ -84,7 +85,6 @@ class CreatePoneModel(nn.Module):
             attention_mask=batch["attention_mask"],
         )
 
-        logits = encoded_sequence @ interest_item_embeddings.t()
         last_hidden = self.sequence_encoder.get_last_hidden(
             encoded=encoded_sequence,
             attention_mask=batch["attention_mask"],
@@ -93,10 +93,12 @@ class CreatePoneModel(nn.Module):
         outputs.update(
             {
                 "sequence_hidden": encoded_sequence,
-                "sequence_logits": logits,
                 "sequence_user_embedding": last_hidden,
             }
         )
+
+        if compute_sequence_logits:
+            outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
 
         return outputs
 
@@ -108,7 +110,12 @@ class CreatePoneModel(nn.Module):
         topk: int,
     ) -> torch.Tensor:
         self.eval()
-        outputs = self.forward(batch=batch, signed_graph=signed_graph, run_sequence=True)
+        outputs = self.forward(
+            batch=batch,
+            signed_graph=signed_graph,
+            run_sequence=True,
+            compute_sequence_logits=False,
+        )
         scores = outputs["sequence_user_embedding"] @ outputs["interest_item_embeddings"].t()
         _, indices = torch.topk(scores, k=min(topk, self.num_items), dim=-1)
         return indices

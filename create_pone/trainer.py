@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import random
 import shutil
@@ -11,6 +12,10 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+# Helps reduce CUDA memory fragmentation on long-running jobs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -170,6 +175,16 @@ def free_disk_gb(path: Path) -> float:
         return -1.0
 
 
+def cuda_free_gb(device: torch.device) -> float:
+    if device.type != "cuda":
+        return -1.0
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device=device)
+        return free_bytes / (1024 ** 3)
+    except RuntimeError:
+        return -1.0
+
+
 def prune_epoch_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
     if keep_last <= 0 or not checkpoint_dir.exists():
         return
@@ -201,21 +216,30 @@ def build_eval_examples(
     split: str,
     max_sequence_length: int,
     max_users: int,
-) -> list[tuple[int, list[int], int]]:
+    min_positive_rating: float,
+) -> list[tuple[int, list[int], list[int]]]:
     eval_df = bundle.val_df if split == "val" else bundle.test_df
     if eval_df is None or eval_df.empty:
         return []
 
-    ordered_df = eval_df
-    if "timestamp" in eval_df.columns:
-        ordered_df = eval_df.sort_values(["user_id", "timestamp"])
+    positive_df = eval_df
+    if "rating" in eval_df.columns:
+        positive_df = eval_df[eval_df["rating"] >= min_positive_rating]
+    if positive_df.empty:
+        return []
 
-    target_df = ordered_df.groupby("user_id", as_index=False).tail(1)
+    ordered_df = positive_df
+    if "timestamp" in positive_df.columns:
+        ordered_df = positive_df.sort_values(["user_id", "timestamp"])
 
-    examples: list[tuple[int, list[int], int]] = []
+    target_df = ordered_df.groupby("user_id", as_index=False).agg({"item_id": list})
+
+    examples: list[tuple[int, list[int], list[int]]] = []
     for row in target_df.itertuples(index=False):
         user_id = int(getattr(row, "user_id"))
-        target_item_id = int(getattr(row, "item_id"))
+        target_items = [int(item_id) for item_id in dict.fromkeys(getattr(row, "item_id"))]
+        if not target_items:
+            continue
 
         context = bundle.user_sequences.get(user_id)
         if not context:
@@ -225,7 +249,7 @@ def build_eval_examples(
         if not trimmed_context:
             continue
 
-        examples.append((user_id, trimmed_context, target_item_id))
+        examples.append((user_id, trimmed_context, target_items))
 
     if max_users > 0 and len(examples) > max_users:
         examples = examples[:max_users]
@@ -233,11 +257,32 @@ def build_eval_examples(
     return examples
 
 
+def build_seen_items_lookup(
+    train_df,
+    user_ids: set[int],
+) -> dict[int, list[int]]:
+    if not user_ids:
+        return {}
+
+    subset = train_df.loc[
+        train_df["user_id"].isin(user_ids),
+        ["user_id", "item_id"],
+    ].drop_duplicates()
+
+    lookup: dict[int, list[int]] = {}
+    for row in subset.itertuples(index=False):
+        user_id = int(row.user_id)
+        item_id = int(row.item_id)
+        lookup.setdefault(user_id, []).append(item_id)
+
+    return lookup
+
+
 @torch.no_grad()
 def evaluate_ranking(
     model: CreatePoneModel,
     signed_graph,
-    eval_examples: list[tuple[int, list[int], int]],
+    eval_examples: list[tuple[int, list[int], list[int]]],
     pad_id: int,
     device: torch.device,
     topk: int,
@@ -245,6 +290,8 @@ def evaluate_ranking(
     split: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    filter_seen: bool,
+    seen_items_lookup: dict[int, list[int]] | None,
 ) -> dict:
     if not eval_examples:
         return {
@@ -252,7 +299,10 @@ def evaluate_ranking(
             "users": 0,
             "topk": max(1, topk),
             "hr": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
             "ndcg": 0.0,
+            "avg_targets": 0.0,
         }
 
     model.eval()
@@ -271,10 +321,11 @@ def evaluate_ranking(
     sequence_item_table = torch.cat([interest_item_embeddings, pad_row], dim=0)
 
     hits_total = 0.0
+    precision_total = 0.0
+    recall_total = 0.0
     ndcg_total = 0.0
+    target_count_total = 0
     user_count = len(eval_examples)
-
-    rank_positions = torch.arange(eval_topk, device=device, dtype=torch.long)
 
     for start_idx in range(0, user_count, max(1, batch_size)):
         batch_examples = eval_examples[start_idx:start_idx + max(1, batch_size)]
@@ -288,14 +339,12 @@ def evaluate_ranking(
             device=device,
         )
         attention_mask = torch.zeros((batch_len, max_len), dtype=torch.bool, device=device)
-        target_ids = torch.empty((batch_len,), dtype=torch.long, device=device)
 
-        for row_idx, (_, context, target_item_id) in enumerate(batch_examples):
+        for row_idx, (_, context, _) in enumerate(batch_examples):
             context_tensor = torch.tensor(context, dtype=torch.long, device=device)
             seq_len = context_tensor.numel()
             input_ids[row_idx, :seq_len] = context_tensor
             attention_mask[row_idx, :seq_len] = True
-            target_ids[row_idx] = int(target_item_id)
 
         autocast_ctx = (
             torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
@@ -313,25 +362,39 @@ def evaluate_ranking(
                 attention_mask=attention_mask,
             )
             scores = last_hidden @ interest_item_embeddings.t()
+
+        if filter_seen:
+            # Match common recommendation protocol: remove seen context items from candidates.
+            for row_idx, (user_id, context, target_items) in enumerate(batch_examples):
+                target_tensor = torch.tensor(target_items, dtype=torch.long, device=device)
+                target_scores = scores[row_idx, target_tensor].clone()
+                seen_items = seen_items_lookup.get(user_id) if seen_items_lookup is not None else context
+                if seen_items:
+                    scores[row_idx, seen_items] = float("-inf")
+                scores[row_idx, target_tensor] = target_scores
+
         _, topk_indices = torch.topk(scores, k=eval_topk, dim=1)
 
-        matches = topk_indices.eq(target_ids.unsqueeze(1))
-        hit_mask = matches.any(dim=1)
-        hits_total += float(hit_mask.float().sum().item())
+        for row_idx, (_, _, target_items) in enumerate(batch_examples):
+            target_set = set(target_items)
+            target_count = len(target_set)
+            recommended_items = topk_indices[row_idx].tolist()
 
-        fallback_positions = torch.full_like(topk_indices, eval_topk)
-        hit_positions = torch.where(
-            matches,
-            rank_positions.unsqueeze(0).expand_as(topk_indices),
-            fallback_positions,
-        ).min(dim=1).values
+            hit_count = 0
+            dcg = 0.0
+            for rank, item_id in enumerate(recommended_items):
+                if item_id in target_set:
+                    hit_count += 1
+                    dcg += 1.0 / math.log2(rank + 2.0)
 
-        ndcg = torch.where(
-            hit_mask,
-            1.0 / torch.log2(hit_positions.float() + 2.0),
-            torch.zeros_like(hit_positions, dtype=torch.float32),
-        )
-        ndcg_total += float(ndcg.sum().item())
+            ideal_count = min(target_count, eval_topk)
+            idcg = sum(1.0 / math.log2(rank + 2.0) for rank in range(ideal_count))
+
+            hits_total += 1.0 if hit_count > 0 else 0.0
+            precision_total += hit_count / max(1, eval_topk)
+            recall_total += hit_count / max(1, target_count)
+            ndcg_total += (dcg / idcg) if idcg > 0 else 0.0
+            target_count_total += target_count
 
     model.train()
 
@@ -340,7 +403,10 @@ def evaluate_ranking(
         "users": user_count,
         "topk": eval_topk,
         "hr": hits_total / max(1, user_count),
+        "precision": precision_total / max(1, user_count),
+        "recall": recall_total / max(1, user_count),
         "ndcg": ndcg_total / max(1, user_count),
+        "avg_targets": target_count_total / max(1, user_count),
     }
 
 
@@ -388,8 +454,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-logit-elements",
         type=int,
-        default=350_000_000,
+        default=120_000_000,
         help="CUDA safety cap for batch*seq_len*num_items; batch is reduced automatically.",
+    )
+    parser.add_argument(
+        "--local-loss-chunk-size",
+        type=int,
+        default=4096,
+        help="Chunk size across items for local full-softmax CE (<=0 uses dense logits).",
     )
     parser.add_argument(
         "--global-user-sample",
@@ -424,32 +496,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--joint-refresh-every",
         type=int,
-        default=200,
+        default=500,
         help="Run a full graph+sequence joint step every N local batches (<=0 disables).",
+    )
+    parser.add_argument(
+        "--min-free-gb-for-joint-refresh",
+        type=float,
+        default=4.0,
+        help="Skip full joint refresh when free CUDA memory falls below this threshold.",
     )
     parser.add_argument(
         "--eval-split",
         choices=["val", "test"],
-        default="val",
+        default="test",
         help="Dataset split used for checkpoint-time ranking evaluation.",
     )
     parser.add_argument(
         "--eval-topk",
         type=int,
         default=10,
-        help="Top-K cutoff used for HR/NDCG evaluation at checkpoints.",
+        help="Top-K cutoff used for Precision/Recall/NDCG evaluation at checkpoints.",
     )
     parser.add_argument(
         "--eval-batch-size",
         type=int,
-        default=256,
+        default=128,
         help="Batch size used for checkpoint-time ranking evaluation.",
     )
     parser.add_argument(
         "--eval-max-users",
         type=int,
-        default=5000,
+        default=0,
         help="Maximum users evaluated per checkpoint (<=0 means all).",
+    )
+    parser.add_argument(
+        "--eval-min-rating",
+        type=float,
+        default=3.0,
+        help="Minimum rating treated as relevant for evaluation targets.",
     )
     parser.add_argument(
         "--eval-every",
@@ -457,12 +541,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Run standalone evaluation every N epochs (checkpoint-triggered eval still runs).",
     )
+    parser.add_argument(
+        "--eval-filter-seen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask seen context items during ranking evaluation.",
+    )
 
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--mixed-precision",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Enable CUDA AMP for sequence-heavy training steps.",
     )
     parser.add_argument(
@@ -604,7 +695,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         orthogonal_mu=args.orthogonal_mu,
         contrastive_tau=args.contrastive_tau,
         neg_branch_scale=args.neg_branch_scale,
+        local_loss_chunk_size=args.local_loss_chunk_size,
     )
+    compute_dense_sequence_logits = args.local_loss_chunk_size <= 0
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -631,7 +724,15 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         split=args.eval_split,
         max_sequence_length=args.max_seq_len,
         max_users=args.eval_max_users,
+        min_positive_rating=args.eval_min_rating,
     )
+    eval_seen_items = None
+    if args.eval_filter_seen and eval_examples:
+        eval_user_ids = {user_id for user_id, _, _ in eval_examples}
+        eval_seen_items = build_seen_items_lookup(
+            train_df=bundle.train_df,
+            user_ids=eval_user_ids,
+        )
     last_eval_metrics = None
     free_gb_at_start = free_disk_gb(output_dir)
 
@@ -646,10 +747,15 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"warmup_global_steps={max(1, args.warmup_global_steps)}",
         f"global_steps={max(1, args.global_steps_per_epoch)}",
         f"joint_refresh_every={args.joint_refresh_every}",
+        f"min_free_gb_for_refresh={args.min_free_gb_for_joint_refresh}",
         f"eval_split={args.eval_split}",
         f"eval_users={len(eval_examples)}",
         f"eval_topk={args.eval_topk}",
+        f"eval_min_rating={args.eval_min_rating}",
+        f"eval_filter_seen={args.eval_filter_seen}",
+        f"eval_filter_seen_users={0 if eval_seen_items is None else len(eval_seen_items)}",
         f"mixed_precision={use_amp}",
+        f"local_loss_chunk_size={args.local_loss_chunk_size}",
         f"effective_logit_cap={effective_logit_elements}",
         f"keep_last_checkpoints={args.keep_last_checkpoints}",
         f"save_opt_periodic={args.save_optimizer_periodic}",
@@ -740,6 +846,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         step_count = 0
 
         joint_refresh_steps = 0
+        skipped_refresh_low_mem = 0
+        oom_recovery_steps = 0
+        oom_skipped_batches = 0
 
         if not warmup:
             model.eval()
@@ -777,15 +886,35 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                     and (batch_idx % args.joint_refresh_every == 0)
                 )
 
+                if (
+                    run_full_joint
+                    and device.type == "cuda"
+                    and args.min_free_gb_for_joint_refresh > 0
+                ):
+                    free_gb_before_refresh = cuda_free_gb(device)
+                    if 0 < free_gb_before_refresh < args.min_free_gb_for_joint_refresh:
+                        run_full_joint = False
+                        skipped_refresh_low_mem += 1
+
                 if run_full_joint:
-                    outputs = model(batch=batch, signed_graph=signed_graph, run_sequence=True)
-                    losses = criterion(
-                        outputs=outputs,
-                        batch=batch,
-                        triplets=empty_triplets,
-                        warmup=False,
+                    autocast_ctx = (
+                        torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
+                        if use_amp
+                        else nullcontext()
                     )
-                    joint_refresh_steps += 1
+                    with autocast_ctx:
+                        outputs = model(
+                            batch=batch,
+                            signed_graph=signed_graph,
+                            run_sequence=True,
+                            compute_sequence_logits=compute_dense_sequence_logits,
+                        )
+                        losses = criterion(
+                            outputs=outputs,
+                            batch=batch,
+                            triplets=empty_triplets,
+                            warmup=False,
+                        )
                 else:
                     autocast_ctx = (
                         torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
@@ -799,7 +928,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             attention_mask=batch["attention_mask"],
                         )
 
-                        logits = encoded_sequence @ interest_item_embeddings.t()
                         last_hidden = model.sequence_encoder.get_last_hidden(
                             encoded=encoded_sequence,
                             attention_mask=batch["attention_mask"],
@@ -811,9 +939,10 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             "interest_item_embeddings": interest_item_embeddings,
                             "disinterest_item_embeddings": disinterest_item_embeddings,
                             "sequence_hidden": encoded_sequence,
-                            "sequence_logits": logits,
                             "sequence_user_embedding": last_hidden,
                         }
+                        if compute_dense_sequence_logits:
+                            outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
 
                         losses = criterion(
                             outputs=outputs,
@@ -822,15 +951,91 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             warmup=False,
                         )
 
-                backward_and_step(
-                    loss=losses["total"],
-                    optimizer=optimizer,
-                    model=model,
-                    grad_clip=args.grad_clip,
-                    scaler=scaler,
-                )
+                used_full_joint_step = run_full_joint
 
-                if run_full_joint:
+                try:
+                    backward_and_step(
+                        loss=losses["total"],
+                        optimizer=optimizer,
+                        model=model,
+                        grad_clip=args.grad_clip,
+                        scaler=scaler,
+                    )
+                except torch.OutOfMemoryError as exc:
+                    if device.type == "cuda":
+                        optimizer.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+
+                    if run_full_joint:
+                        oom_recovery_steps += 1
+                        used_full_joint_step = False
+                        print(
+                            f"Warning: OOM on full-joint refresh at batch {batch_idx}; "
+                            "retrying with sequence-only step."
+                        )
+
+                        autocast_ctx = (
+                            torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
+                            if use_amp
+                            else nullcontext()
+                        )
+                        with autocast_ctx:
+                            input_item_embeddings = sequence_item_table[batch["input_ids"]]
+                            encoded_sequence = model.sequence_encoder(
+                                item_embeddings=input_item_embeddings,
+                                attention_mask=batch["attention_mask"],
+                            )
+
+                            last_hidden = model.sequence_encoder.get_last_hidden(
+                                encoded=encoded_sequence,
+                                attention_mask=batch["attention_mask"],
+                            )
+
+                            outputs = {
+                                "interest_user_embeddings": interest_user_embeddings,
+                                "disinterest_user_embeddings": disinterest_user_embeddings,
+                                "interest_item_embeddings": interest_item_embeddings,
+                                "disinterest_item_embeddings": disinterest_item_embeddings,
+                                "sequence_hidden": encoded_sequence,
+                                "sequence_user_embedding": last_hidden,
+                            }
+                            if compute_dense_sequence_logits:
+                                outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
+
+                            losses = criterion(
+                                outputs=outputs,
+                                batch=batch,
+                                triplets=empty_triplets,
+                                warmup=False,
+                            )
+
+                        try:
+                            backward_and_step(
+                                loss=losses["total"],
+                                optimizer=optimizer,
+                                model=model,
+                                grad_clip=args.grad_clip,
+                                scaler=scaler,
+                            )
+                        except torch.OutOfMemoryError:
+                            if device.type == "cuda":
+                                optimizer.zero_grad(set_to_none=True)
+                                torch.cuda.empty_cache()
+                            oom_skipped_batches += 1
+                            print(
+                                f"Warning: skipped batch {batch_idx} after OOM retry. "
+                                "Consider larger --joint-refresh-every or lower batch."
+                            )
+                            continue
+                    else:
+                        oom_skipped_batches += 1
+                        print(
+                            f"Warning: skipped batch {batch_idx} due to CUDA OOM: {exc}."
+                        )
+                        continue
+
+                if used_full_joint_step:
+                    joint_refresh_steps += 1
                     model.eval()
                     with torch.no_grad():
                         cached_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
@@ -872,6 +1077,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         f"local={losses['local'].detach().item():.4f} | "
                         f"align={losses['align'].detach().item():.4f} | "
                         f"refresh_steps={joint_refresh_steps} | "
+                        f"refresh_skipped={skipped_refresh_low_mem} | "
+                        f"oom_recovered={oom_recovery_steps} | "
+                        f"oom_skipped={oom_skipped_batches} | "
                         f"eta={format_duration(eta_seconds)}"
                     )
 
@@ -887,6 +1095,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "align": 0.0,
                 "local_steps": 0,
                 "joint_refresh_steps": 0,
+                "refresh_skipped": 0,
+                "oom_recovered": 0,
+                "oom_skipped": 0,
             }
         else:
             step_count = max(step_count, 1)
@@ -904,6 +1115,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "align": align_avg,
                 "local_steps": step_count,
                 "joint_refresh_steps": joint_refresh_steps,
+                "refresh_skipped": skipped_refresh_low_mem,
+                "oom_recovered": oom_recovery_steps,
+                "oom_skipped": oom_skipped_batches,
             }
 
         should_save_best = epoch_metrics["total"] < best_total
@@ -931,13 +1145,18 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 split=args.eval_split,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                filter_seen=args.eval_filter_seen,
+                seen_items_lookup=eval_seen_items,
             )
             eval_elapsed = time.time() - eval_start_time
             print(
                 f"Eval {eval_metrics['split']}@{eval_metrics['topk']} | "
                 f"users={eval_metrics['users']} | "
-                f"HR={eval_metrics['hr']:.4f} | "
+                f"P={eval_metrics['precision']:.4f} | "
+                f"R={eval_metrics['recall']:.4f} | "
                 f"NDCG={eval_metrics['ndcg']:.4f} | "
+                f"HR={eval_metrics['hr']:.4f} | "
+                f"targets/user={eval_metrics['avg_targets']:.2f} | "
                 f"time={format_duration(eval_elapsed)}"
             )
             last_eval_metrics = eval_metrics
@@ -961,6 +1180,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             f"align={epoch_metrics['align']:.4f} | "
             f"local_steps={epoch_metrics['local_steps']} | "
             f"refresh_steps={epoch_metrics['joint_refresh_steps']} | "
+            f"refresh_skipped={epoch_metrics['refresh_skipped']} | "
+            f"oom_recovered={epoch_metrics['oom_recovered']} | "
+            f"oom_skipped={epoch_metrics['oom_skipped']} | "
             f"time={format_duration(epoch_elapsed)}"
         )
 

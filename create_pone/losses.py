@@ -15,6 +15,7 @@ class CreatePoneLoss:
         orthogonal_mu: float,
         contrastive_tau: float,
         neg_branch_scale: float,
+        local_loss_chunk_size: int = 0,
     ):
         self.w_global = w_global
         self.w_align = w_align
@@ -22,21 +23,69 @@ class CreatePoneLoss:
         self.orthogonal_mu = orthogonal_mu
         self.contrastive_tau = contrastive_tau
         self.neg_branch_scale = neg_branch_scale
+        self.local_loss_chunk_size = local_loss_chunk_size
 
     @staticmethod
     def _zero_like(reference: torch.Tensor) -> torch.Tensor:
         return reference.sum() * 0.0
 
     def _local_loss(self, outputs: dict, batch: dict) -> torch.Tensor:
-        logits = outputs["sequence_logits"]
         target_ids = batch["target_ids"]
         attention_mask = batch["attention_mask"]
 
         valid_mask = attention_mask & (target_ids >= 0)
         if not valid_mask.any():
-            return self._zero_like(logits)
+            reference = outputs.get("sequence_hidden")
+            if reference is None:
+                reference = outputs["sequence_logits"]
+            return self._zero_like(reference)
 
-        return F.cross_entropy(logits[valid_mask], target_ids[valid_mask], reduction="mean")
+        if self.local_loss_chunk_size <= 0 and "sequence_logits" in outputs:
+            logits = outputs["sequence_logits"]
+            return F.cross_entropy(logits[valid_mask], target_ids[valid_mask], reduction="mean")
+
+        return self._local_loss_chunked(outputs=outputs, valid_mask=valid_mask, target_ids=target_ids)
+
+    def _local_loss_chunked(
+        self,
+        outputs: dict,
+        valid_mask: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        sequence_hidden = outputs["sequence_hidden"]
+        item_embeddings = outputs["interest_item_embeddings"]
+
+        hidden = sequence_hidden[valid_mask]
+        targets = target_ids[valid_mask]
+
+        if hidden.numel() == 0:
+            return self._zero_like(sequence_hidden)
+
+        target_vectors = item_embeddings[targets]
+        target_logits = (hidden * target_vectors).sum(dim=1)
+
+        chunk_size = max(1, int(self.local_loss_chunk_size))
+        num_items = item_embeddings.size(0)
+
+        max_scores = torch.full_like(target_logits, -float("inf"))
+        sum_exp = torch.zeros_like(target_logits)
+
+        for start in range(0, num_items, chunk_size):
+            end = min(start + chunk_size, num_items)
+            item_chunk = item_embeddings[start:end]
+            chunk_scores = hidden @ item_chunk.t()
+
+            chunk_max = chunk_scores.max(dim=1).values
+            updated_max = torch.maximum(max_scores, chunk_max)
+
+            sum_exp = (
+                sum_exp * torch.exp(max_scores - updated_max)
+                + torch.exp(chunk_scores - updated_max.unsqueeze(1)).sum(dim=1)
+            )
+            max_scores = updated_max
+
+        log_denom = max_scores + torch.log(sum_exp + 1e-12)
+        return -(target_logits - log_denom).mean()
 
     def _dual_feedback_loss(self, outputs: dict, triplets: dict) -> torch.Tensor:
         interest_user = outputs["interest_user_embeddings"]
