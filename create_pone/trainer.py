@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 # Helps reduce CUDA memory fragmentation on long-running jobs.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -84,8 +85,9 @@ def resolve_effective_batch_size(
     num_items: int,
     device: torch.device,
     max_logit_elements: int,
+    use_dense_sequence_logits: bool,
 ) -> int:
-    if device.type != "cuda" or max_logit_elements <= 0:
+    if device.type != "cuda" or max_logit_elements <= 0 or not use_dense_sequence_logits:
         return requested_batch_size
 
     per_batch_elements = requested_batch_size * max_seq_len * max(1, num_items)
@@ -113,6 +115,30 @@ def resolve_amp_config(
         print("Requested bf16 AMP but device does not support bf16. Falling back to fp16 AMP.")
 
     return True, torch.float16
+
+
+def build_grad_scaler(use_amp: bool, device: torch.device):
+    if device.type != "cuda":
+        return None
+
+    try:
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
+def amp_autocast_context(
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    device: torch.device,
+):
+    if not use_amp or device.type != "cuda":
+        return nullcontext()
+
+    try:
+        return torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
 
 
 def backward_and_step(
@@ -213,8 +239,8 @@ def safe_torch_save(payload: dict, path: Path, label: str) -> bool:
 
 def build_eval_examples(
     bundle,
+    context_sequences: dict[int, list[int]],
     split: str,
-    max_sequence_length: int,
     max_users: int,
     min_positive_rating: float,
 ) -> list[tuple[int, list[int], list[int]]]:
@@ -241,15 +267,11 @@ def build_eval_examples(
         if not target_items:
             continue
 
-        context = bundle.user_sequences.get(user_id)
+        context = context_sequences.get(user_id)
         if not context:
             continue
 
-        trimmed_context = context[-max_sequence_length:]
-        if not trimmed_context:
-            continue
-
-        examples.append((user_id, trimmed_context, target_items))
+        examples.append((user_id, context, target_items))
 
     if max_users > 0 and len(examples) > max_users:
         examples = examples[:max_users]
@@ -276,6 +298,26 @@ def build_seen_items_lookup(
         lookup.setdefault(user_id, []).append(item_id)
 
     return lookup
+
+
+def build_user_sequences_from_df(
+    interactions_df: pd.DataFrame,
+    max_sequence_length: int,
+) -> dict[int, list[int]]:
+    if interactions_df is None or interactions_df.empty:
+        return {}
+
+    ordered_df = interactions_df
+    if "timestamp" in interactions_df.columns:
+        ordered_df = interactions_df.sort_values(["user_id", "timestamp"])
+
+    sequences: dict[int, list[int]] = {}
+    for user_id, group in ordered_df.groupby("user_id", sort=False):
+        item_ids = [int(item_id) for item_id in group["item_id"].tolist()]
+        if item_ids:
+            sequences[int(user_id)] = item_ids[-max_sequence_length:]
+
+    return sequences
 
 
 @torch.no_grad()
@@ -346,10 +388,10 @@ def evaluate_ranking(
             input_ids[row_idx, :seq_len] = context_tensor
             attention_mask[row_idx, :seq_len] = True
 
-        autocast_ctx = (
-            torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
-            if use_amp
-            else nullcontext()
+        autocast_ctx = amp_autocast_context(
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            device=device,
         )
         with autocast_ctx:
             input_item_embeddings = sequence_item_table[input_ids]
@@ -455,7 +497,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-logit-elements",
         type=int,
         default=120_000_000,
-        help="CUDA safety cap for batch*seq_len*num_items; batch is reduced automatically.",
+        help="CUDA safety cap for batch*seq_len*num_items when dense logits are enabled.",
     )
     parser.add_argument(
         "--local-loss-chunk-size",
@@ -536,6 +578,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Minimum rating treated as relevant for evaluation targets.",
     )
     parser.add_argument(
+        "--eval-include-val-context",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When evaluating on test split, include validation interactions in user context.",
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=1,
@@ -601,7 +649,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         amp_dtype_name=args.amp_dtype,
         device=device,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = build_grad_scaler(use_amp=use_amp, device=device)
 
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -626,6 +674,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
 
     amp_element_multiplier = 2 if use_amp else 1
     effective_logit_elements = int(args.max_logit_elements * amp_element_multiplier)
+    compute_dense_sequence_logits = args.local_loss_chunk_size <= 0
 
     effective_batch_size = resolve_effective_batch_size(
         requested_batch_size=args.batch_size,
@@ -633,12 +682,15 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         num_items=bundle.num_items,
         device=device,
         max_logit_elements=effective_logit_elements,
+        use_dense_sequence_logits=compute_dense_sequence_logits,
     )
     if effective_batch_size < args.batch_size:
         print(
             f"Reducing batch size from {args.batch_size} to {effective_batch_size} "
             "for CUDA memory safety on full-softmax logits."
         )
+    elif not compute_dense_sequence_logits:
+        print("Using chunked local loss; skipping dense-logit batch-size cap.")
 
     train_dataset = UserSequenceDataset(bundle.user_sequences)
     if len(train_dataset) == 0:
@@ -697,7 +749,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         neg_branch_scale=args.neg_branch_scale,
         local_loss_chunk_size=args.local_loss_chunk_size,
     )
-    compute_dense_sequence_logits = args.local_loss_chunk_size <= 0
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -719,10 +770,24 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     best_checkpoint_path = output_dir / f"{run_prefix}_best.pt"
     best_total = float("inf")
 
+    eval_context_df = bundle.train_df
+    if (
+        args.eval_split == "test"
+        and args.eval_include_val_context
+        and bundle.val_df is not None
+        and not bundle.val_df.empty
+    ):
+        eval_context_df = pd.concat([bundle.train_df, bundle.val_df], ignore_index=True)
+
+    eval_context_sequences = build_user_sequences_from_df(
+        interactions_df=eval_context_df,
+        max_sequence_length=args.max_seq_len,
+    )
+
     eval_examples = build_eval_examples(
         bundle=bundle,
+        context_sequences=eval_context_sequences,
         split=args.eval_split,
-        max_sequence_length=args.max_seq_len,
         max_users=args.eval_max_users,
         min_positive_rating=args.eval_min_rating,
     )
@@ -730,7 +795,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     if args.eval_filter_seen and eval_examples:
         eval_user_ids = {user_id for user_id, _, _ in eval_examples}
         eval_seen_items = build_seen_items_lookup(
-            train_df=bundle.train_df,
+            train_df=eval_context_df,
             user_ids=eval_user_ids,
         )
     last_eval_metrics = None
@@ -752,6 +817,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"eval_users={len(eval_examples)}",
         f"eval_topk={args.eval_topk}",
         f"eval_min_rating={args.eval_min_rating}",
+        f"eval_include_val_context={args.eval_include_val_context}",
         f"eval_filter_seen={args.eval_filter_seen}",
         f"eval_filter_seen_users={0 if eval_seen_items is None else len(eval_seen_items)}",
         f"mixed_precision={use_amp}",
@@ -767,6 +833,11 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         print(
             "Warning: low free disk space detected. "
             "Consider removing old outputs or lowering checkpoint retention."
+        )
+    if args.warmup_epochs > 0 and args.eval_every > 0:
+        print(
+            "Note: warmup epochs optimize global loss only; "
+            "ranking metrics are often low until joint training starts."
         )
 
     empty_triplets = build_empty_triplets(device)
@@ -897,11 +968,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         skipped_refresh_low_mem += 1
 
                 if run_full_joint:
-                    autocast_ctx = (
-                        torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
-                        if use_amp
-                        else nullcontext()
-                    )
+                    # Keep signed sparse propagation in fp32; sparse CUDA matmul does not support fp16.
+                    autocast_ctx = nullcontext()
                     with autocast_ctx:
                         outputs = model(
                             batch=batch,
@@ -916,10 +984,10 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             warmup=False,
                         )
                 else:
-                    autocast_ctx = (
-                        torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
-                        if use_amp
-                        else nullcontext()
+                    autocast_ctx = amp_autocast_context(
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        device=device,
                     )
                     with autocast_ctx:
                         input_item_embeddings = sequence_item_table[batch["input_ids"]]
@@ -974,10 +1042,10 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             "retrying with sequence-only step."
                         )
 
-                        autocast_ctx = (
-                            torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
-                            if use_amp
-                            else nullcontext()
+                        autocast_ctx = amp_autocast_context(
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
+                            device=device,
                         )
                         with autocast_ctx:
                             input_item_embeddings = sequence_item_table[batch["input_ids"]]
