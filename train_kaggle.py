@@ -43,15 +43,10 @@ def setup_seed(seed: int = 42):
 
 class BipartiteDataset(Dataset):
     """
-    Optimized bipartite dataset matching official PoneGNN implementation.
-
-    Key features:
-    - Pre-stores edges as tensors (no pandas per-epoch)
-    - Pre-computed negatives for all epochs (no per-epoch sampling)
-    - Efficient DataLoader integration
+    Efficient bipartite dataset - negatives generated per epoch (matching official).
     """
 
-    def __init__(self, train_df, neg_dist, offset, num_users, num_items, K, num_epochs):
+    def __init__(self, train_df, neg_dist, offset, num_users, num_items, K):
         """
         Args:
             train_df: DataFrame with user_id, item_id, rating columns (0-based contiguous IDs)
@@ -59,80 +54,66 @@ class BipartiteDataset(Dataset):
             offset: Rating threshold for positive/negative split
             num_users, num_items: Dataset statistics
             K: Number of negative samples per positive
-            num_epochs: Number of epochs to pre-compute negatives for
         """
-        # Build edges (IDs are already 0-based from dataset loader)
-        self.edge_1 = torch.tensor(train_df['user_id'].values).long()  # user indices (0-based)
-        self.edge_2 = torch.tensor(train_df['item_id'].values).long() + num_users  # item indices + offset
-        self.edge_3 = torch.tensor(train_df['rating'].values).float() - offset  # weights (rating - offset)
+        # Build edges
+        self.edge_1 = torch.tensor(train_df['user_id'].values).long()
+        self.edge_2 = torch.tensor(train_df['item_id'].values).long() + num_users
+        self.edge_3 = torch.tensor(train_df['rating'].values).float() - offset
 
         self.num_users = num_users
         self.num_v = num_items
         self.K = K
-        self.num_epochs = num_epochs
+        self.neg_dist = neg_dist
 
-        # Pre-compute negatives for ALL epochs at once (major optimization!)
-        print('Pre-computing negative samples for all epochs...')
-        st = time.time()
-        self.edge_4_tot = self._generate_negatives_all_epochs(train_df, neg_dist, num_epochs)
-        print(f'Negative sampling complete! Time: {time.time() - st:.2f}s')
-
-        # Current epoch's negatives (will be updated each epoch)
-        self.edge_4 = None
-
-    def _generate_negatives_all_epochs(self, train_df, neg_dist, num_epochs):
-        """Generate negatives for all epochs upfront - O(1) per epoch afterwards."""
-        num_pos_edges = len(self.edge_1)
-
-        # Pre-allocate tensor: [num_edges, K, num_epochs]
-        edge_4_tot = torch.empty((num_pos_edges, self.K, num_epochs), dtype=torch.long)
-
-        # Group by user for efficiency
-        user_to_pos = {}
+        # Build user->positive_items mapping (done once)
+        print('Building user->positive items mapping...')
+        self.user_pos_items = {}
         for idx in range(len(self.edge_1)):
             user = self.edge_1[idx].item()
-            if user not in user_to_pos:
-                user_to_pos[user] = []
-            user_to_pos[user].append((idx, self.edge_2[idx].item()))
+            item = self.edge_2[idx].item() - self.num_users
+            if user not in self.user_pos_items:
+                self.user_pos_items[user] = set()
+            self.user_pos_items[user].add(item)
 
-        # Generate negatives for each epoch
-        for epoch in range(num_epochs):
-            epoch_negs = torch.empty((num_pos_edges, self.K), dtype=torch.long)
+        print(f'Dataset ready: {len(self.edge_1)} edges, {len(self.user_pos_items)} users')
 
-            for user, pos_items in tqdm(user_to_pos.items(), desc=f'Epoch {epoch+1}/{num_epochs}', leave=False):
-                # Items this user has interacted with (positive items)
-                pos_item_ids = [item_id for _, item_id in pos_items]
+    def generate_negatives(self, epoch):
+        """Generate negatives for current epoch - simple per-edge sampling."""
+        num_edges = len(self.edge_1)
+        K = self.K
+        num_v = self.num_v
+        neg_dist = self.neg_dist.numpy() if hasattr(self.neg_dist, 'numpy') else self.neg_dist
 
-                # All items minus positive items = negative candidates
-                neg_candidates = np.setdiff1d(np.arange(self.num_v), pos_item_ids)
+        # Pre-sample all negatives at once (matching official)
+        all_negs = np.random.choice(
+            num_v,
+            size=num_edges * K,
+            replace=True,
+            p=neg_dist
+        )
 
-                if len(neg_candidates) == 0:
-                    continue
+        # Convert to tensor and reshape
+        edge_4 = torch.from_numpy(all_negs).long().view(num_edges, K) + self.num_users
 
-                # Sample negatives based on popularity distribution
-                neg_probs = neg_dist[neg_candidates] / neg_dist[neg_candidates].sum()
-                n_samples = len(pos_items) * self.K
-
-                negs = np.random.choice(
-                    neg_candidates,
-                    size=n_samples,
-                    replace=True,
-                    p=neg_probs
-                )
-
-                # Assign to correct positions
-                for i, (edge_idx, _) in enumerate(pos_items):
-                    start = i * self.K
-                    end = start + self.K
-                    epoch_negs[edge_idx] = torch.tensor(negs[start:end]) + self.num_users
-
-            edge_4_tot[:, :, epoch] = epoch_negs
-
-        return edge_4_tot
+        return edge_4
 
     def set_epoch(self, epoch):
-        """Set current epoch's negatives (O(1) operation)."""
-        self.edge_4 = self.edge_4_tot[:, :, epoch % self.num_epochs]
+        """Set current epoch's negatives by generating them on-the-fly."""
+        self.edge_4 = self.generate_negatives(epoch)
+
+    def __len__(self):
+        return len(self.edge_1)
+
+    def __getitem__(self, idx):
+        u = self.edge_1[idx]
+        v = self.edge_2[idx]
+        w = self.edge_3[idx]
+        negs = self.edge_4[idx]
+        return u, v, w, negs
+
+    def set_epoch(self, epoch):
+        """Generate negatives for this epoch."""
+        self.edge_4 = self.generate_negatives(epoch)
 
     def __len__(self):
         return len(self.edge_1)
@@ -167,15 +148,10 @@ def train_ponegnn_optimized(model, train_df, dataset, device, pretrain_epochs=50
                              batch_size=2048, lr=1e-3, K=40, eval_every=10,
                              save_path=None):
     """
-    Optimized Stage 1: Pre-train PoneGNN graph encoder.
-
-    This version matches official PoneGNN performance by:
-    1. Pre-computing all negatives for all epochs
-    2. Using efficient DataLoader with tensor data
-    3. Proper mixed precision training
+    Stage 1: Pre-train PoneGNN graph encoder - matching official PoneGNN performance.
     """
     print("\n" + "=" * 60)
-    print("Stage 1: Pre-training PoneGNN Graph Encoder (Optimized)")
+    print("Stage 1: Pre-training PoneGNN Graph Encoder")
     print("=" * 60)
 
     num_users = dataset.num_users
@@ -190,9 +166,9 @@ def train_ponegnn_optimized(model, train_df, dataset, device, pretrain_epochs=50
     # Create negative sampling distribution
     neg_dist = create_negative_distribution(train_df, num_items)
 
-    # Create optimized dataset (pre-computes all negatives)
+    # Create dataset (negatives generated per-epoch, matching official)
     training_dataset = BipartiteDataset(
-        train_df, neg_dist, 3.5, num_users, num_items, K, pretrain_epochs
+        train_df, neg_dist, 3.5, num_users, num_items, K
     )
 
     # DataLoader
@@ -222,11 +198,13 @@ def train_ponegnn_optimized(model, train_df, dataset, device, pretrain_epochs=50
     neg_edge = data_n.edge_index
 
     print(f"\nStarting {pretrain_epochs} epochs of pre-training...")
-    print(f"Batch size: {batch_size}, Batches per epoch: {len(dataloader)}")
+    print(f"Batch size: {batch_size}, Batches per epoch: ~{len(training_dataset) // batch_size}")
 
     for epoch in range(1, pretrain_epochs + 1):
-        # Set epoch's pre-computed negatives (O(1))
-        training_dataset.set_epoch(epoch - 1)
+        # Generate negatives for this epoch (fast - just samples + simple rejection)
+        st = time.time()
+        training_dataset.set_epoch(epoch)
+        print(f"  Negative sampling: {time.time() - st:.2f}s")
 
         total_loss = 0
         n_batches = 0
@@ -241,11 +219,9 @@ def train_ponegnn_optimized(model, train_df, dataset, device, pretrain_epochs=50
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Forward pass with mixed precision
             with autocast():
                 loss = model.compute_loss(u, v, w, negs, pos_edge, neg_edge, epoch)
 
-            # Backward pass
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -269,7 +245,7 @@ def train_ponegnn_optimized(model, train_df, dataset, device, pretrain_epochs=50
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': best_loss,
                 }, save_path)
-                pbar.write(f"  -> Best checkpoint saved (loss: {best_loss:.4f})")
+            pbar.write(f"  -> Best checkpoint saved (loss: {best_loss:.4f})")
 
         # Log periodically
         if epoch % eval_every == 0:
