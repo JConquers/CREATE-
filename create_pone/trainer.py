@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -159,6 +160,40 @@ def format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def free_disk_gb(path: Path) -> float:
+    try:
+        usage = shutil.disk_usage(path)
+        return usage.free / (1024 ** 3)
+    except OSError:
+        return -1.0
+
+
+def prune_epoch_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
+    if keep_last <= 0 or not checkpoint_dir.exists():
+        return
+
+    checkpoint_files = sorted(checkpoint_dir.glob("*.pt"))
+    excess = len(checkpoint_files) - keep_last
+    if excess <= 0:
+        return
+
+    for checkpoint_path in checkpoint_files[:excess]:
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+            print(f"Removed old checkpoint to free space: {checkpoint_path}")
+        except OSError as exc:
+            print(f"Warning: failed to remove old checkpoint {checkpoint_path}: {exc}")
+
+
+def safe_torch_save(payload: dict, path: Path, label: str) -> bool:
+    try:
+        torch.save(payload, path)
+        return True
+    except (RuntimeError, OSError) as exc:
+        print(f"Warning: failed to save {label} at {path}: {exc}")
+        return False
 
 
 def build_eval_examples(
@@ -442,6 +477,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Save an epoch checkpoint every N epochs. Use <=0 to disable periodic saves.",
     )
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=3,
+        help="Keep only the most recent periodic checkpoints on disk. <=0 keeps all.",
+    )
+    parser.add_argument(
+        "--save-optimizer-periodic",
+        action="store_true",
+        help="Include optimizer state in periodic epoch checkpoints (larger files).",
+    )
+    parser.add_argument(
+        "--save-optimizer-best",
+        action="store_true",
+        help="Include optimizer state in best checkpoint (larger file).",
+    )
+    parser.add_argument(
+        "--save-optimizer-final",
+        action="store_true",
+        help="Include optimizer state in final checkpoint (larger file).",
+    )
 
     return parser
 
@@ -577,6 +633,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         max_users=args.eval_max_users,
     )
     last_eval_metrics = None
+    free_gb_at_start = free_disk_gb(output_dir)
 
     print(
         "Loaded dataset:",
@@ -594,9 +651,43 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"eval_topk={args.eval_topk}",
         f"mixed_precision={use_amp}",
         f"effective_logit_cap={effective_logit_elements}",
+        f"keep_last_checkpoints={args.keep_last_checkpoints}",
+        f"save_opt_periodic={args.save_optimizer_periodic}",
+        f"save_opt_best={args.save_optimizer_best}",
+        f"save_opt_final={args.save_optimizer_final}",
+        f"free_disk_gb={free_gb_at_start:.2f}",
     )
+    if 0 < free_gb_at_start < 5.0:
+        print(
+            "Warning: low free disk space detected. "
+            "Consider removing old outputs or lowering checkpoint retention."
+        )
 
     empty_triplets = build_empty_triplets(device)
+
+    def build_checkpoint_payload(
+        epoch_index: int,
+        eval_data,
+        include_optimizer: bool,
+        best_total_value: float | None = None,
+        best_path: Path | None = None,
+    ) -> dict:
+        payload = {
+            "epoch": epoch_index,
+            "model_state_dict": model.state_dict(),
+            "args": vars(args),
+            "num_users": bundle.num_users,
+            "num_items": bundle.num_items,
+            "pad_id": bundle.num_items,
+            "eval_metrics": eval_data,
+        }
+        if include_optimizer:
+            payload["optimizer_state_dict"] = optimizer.state_dict()
+        if best_total_value is not None:
+            payload["best_total"] = best_total_value
+        if best_path is not None:
+            payload["best_checkpoint_path"] = str(best_path)
+        return payload
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
@@ -874,63 +965,57 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         )
 
         if should_save_best:
-            best_total = epoch_metrics["total"]
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "best_total": best_total,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "args": vars(args),
-                    "num_users": bundle.num_users,
-                    "num_items": bundle.num_items,
-                    "pad_id": bundle.num_items,
-                    "eval_metrics": checkpoint_eval_metrics,
-                },
-                best_checkpoint_path,
+            candidate_best = epoch_metrics["total"]
+            best_payload = build_checkpoint_payload(
+                epoch_index=epoch + 1,
+                eval_data=checkpoint_eval_metrics,
+                include_optimizer=args.save_optimizer_best,
+                best_total_value=candidate_best,
             )
-            print(f"Saved best checkpoint to: {best_checkpoint_path}")
+            if safe_torch_save(best_payload, best_checkpoint_path, "best checkpoint"):
+                best_total = candidate_best
+                print(f"Saved best checkpoint to: {best_checkpoint_path}")
 
         if should_save_periodic:
+            if args.keep_last_checkpoints > 0:
+                prune_epoch_checkpoints(
+                    checkpoint_dir=checkpoint_dir,
+                    keep_last=max(0, args.keep_last_checkpoints - 1),
+                )
+
             epoch_checkpoint_path = checkpoint_dir / f"{run_prefix}_epoch_{epoch + 1:03d}.pt"
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "args": vars(args),
-                    "num_users": bundle.num_users,
-                    "num_items": bundle.num_items,
-                    "pad_id": bundle.num_items,
-                    "eval_metrics": checkpoint_eval_metrics,
-                },
-                epoch_checkpoint_path,
+            periodic_payload = build_checkpoint_payload(
+                epoch_index=epoch + 1,
+                eval_data=checkpoint_eval_metrics,
+                include_optimizer=args.save_optimizer_periodic,
             )
-            print(f"Saved epoch checkpoint to: {epoch_checkpoint_path}")
+            if safe_torch_save(periodic_payload, epoch_checkpoint_path, "periodic checkpoint"):
+                print(f"Saved epoch checkpoint to: {epoch_checkpoint_path}")
+                if args.keep_last_checkpoints > 0:
+                    prune_epoch_checkpoints(
+                        checkpoint_dir=checkpoint_dir,
+                        keep_last=args.keep_last_checkpoints,
+                    )
 
     checkpoint_path = output_dir / f"{run_prefix}.pt"
     history_path = output_dir / f"{run_prefix}_history.json"
 
-    torch.save(
-        {
-            "epoch": args.epochs,
-            "best_total": best_total,
-            "best_checkpoint_path": str(best_checkpoint_path),
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-            "num_users": bundle.num_users,
-            "num_items": bundle.num_items,
-            "pad_id": bundle.num_items,
-            "eval_metrics": last_eval_metrics,
-        },
-        checkpoint_path,
+    final_payload = build_checkpoint_payload(
+        epoch_index=args.epochs,
+        eval_data=last_eval_metrics,
+        include_optimizer=args.save_optimizer_final,
+        best_total_value=best_total,
+        best_path=best_checkpoint_path,
     )
+    final_saved = safe_torch_save(final_payload, checkpoint_path, "final checkpoint")
+    if final_saved:
+        print(f"Saved checkpoint to: {checkpoint_path}")
+    else:
+        print("Warning: final checkpoint was not saved due to storage write failure.")
 
     with history_path.open("w", encoding="utf-8") as file_obj:
         json.dump(history, file_obj, indent=2)
 
-    print(f"Saved checkpoint to: {checkpoint_path}")
     print(f"Saved history to: {history_path}")
 
     return checkpoint_path, history_path
