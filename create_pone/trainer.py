@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -89,6 +90,49 @@ def resolve_effective_batch_size(
     return min(requested_batch_size, safe_batch)
 
 
+def resolve_amp_config(
+    use_mixed_precision: bool,
+    amp_dtype_name: str,
+    device: torch.device,
+) -> tuple[bool, torch.dtype]:
+    if not use_mixed_precision or device.type != "cuda":
+        return False, torch.float32
+
+    if amp_dtype_name == "bf16":
+        supports_bf16 = bool(
+            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        )
+        if supports_bf16:
+            return True, torch.bfloat16
+        print("Requested bf16 AMP but device does not support bf16. Falling back to fp16 AMP.")
+
+    return True, torch.float16
+
+
+def backward_and_step(
+    loss: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    grad_clip: float,
+    scaler,
+) -> None:
+    optimizer.zero_grad(set_to_none=True)
+
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        return
+
+    loss.backward()
+    if grad_clip > 0:
+        clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+    optimizer.step()
+
+
 def build_empty_triplets(device: torch.device) -> dict[str, torch.Tensor]:
     empty = torch.empty(0, dtype=torch.long, device=device)
     return {
@@ -164,6 +208,8 @@ def evaluate_ranking(
     topk: int,
     batch_size: int,
     split: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
 ) -> dict:
     if not eval_examples:
         return {
@@ -216,17 +262,22 @@ def evaluate_ranking(
             attention_mask[row_idx, :seq_len] = True
             target_ids[row_idx] = int(target_item_id)
 
-        input_item_embeddings = sequence_item_table[input_ids]
-        encoded_sequence = model.sequence_encoder(
-            item_embeddings=input_item_embeddings,
-            attention_mask=attention_mask,
+        autocast_ctx = (
+            torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
+            if use_amp
+            else nullcontext()
         )
-        last_hidden = model.sequence_encoder.get_last_hidden(
-            encoded=encoded_sequence,
-            attention_mask=attention_mask,
-        )
-
-        scores = last_hidden @ interest_item_embeddings.t()
+        with autocast_ctx:
+            input_item_embeddings = sequence_item_table[input_ids]
+            encoded_sequence = model.sequence_encoder(
+                item_embeddings=input_item_embeddings,
+                attention_mask=attention_mask,
+            )
+            last_hidden = model.sequence_encoder.get_last_hidden(
+                encoded=encoded_sequence,
+                attention_mask=attention_mask,
+            )
+            scores = last_hidden @ interest_item_embeddings.t()
         _, topk_indices = torch.topk(scores, k=eval_topk, dim=1)
 
         matches = topk_indices.eq(target_ids.unsqueeze(1))
@@ -375,6 +426,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Enable CUDA AMP for sequence-heavy training steps.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP dtype when --mixed-precision is enabled.",
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         default=1,
@@ -387,6 +449,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     set_random_seed(args.seed)
     device = resolve_device(args.device, allow_kaggle_cpu=args.allow_kaggle_cpu)
+    use_amp, amp_dtype = resolve_amp_config(
+        use_mixed_precision=args.mixed_precision,
+        amp_dtype_name=args.amp_dtype,
+        device=device,
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -400,6 +468,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
+    if use_amp:
+        print(f"Using mixed precision AMP with dtype={args.amp_dtype}")
 
     bundle = load_dataset_bundle(
         dataset_name=args.dataset,
@@ -407,12 +477,15 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         max_sequence_length=args.max_seq_len,
     )
 
+    amp_element_multiplier = 2 if use_amp else 1
+    effective_logit_elements = int(args.max_logit_elements * amp_element_multiplier)
+
     effective_batch_size = resolve_effective_batch_size(
         requested_batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
         num_items=bundle.num_items,
         device=device,
-        max_logit_elements=args.max_logit_elements,
+        max_logit_elements=effective_logit_elements,
     )
     if effective_batch_size < args.batch_size:
         print(
@@ -519,6 +592,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"eval_split={args.eval_split}",
         f"eval_users={len(eval_examples)}",
         f"eval_topk={args.eval_topk}",
+        f"mixed_precision={use_amp}",
+        f"effective_logit_cap={effective_logit_elements}",
     )
 
     empty_triplets = build_empty_triplets(device)
@@ -552,11 +627,13 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 global_losses["global"] if warmup else args.w_global * global_losses["global"]
             )
 
-            optimizer.zero_grad(set_to_none=True)
-            global_step_loss.backward()
-            if args.grad_clip > 0:
-                clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            optimizer.step()
+            backward_and_step(
+                loss=global_step_loss,
+                optimizer=optimizer,
+                model=model,
+                grad_clip=args.grad_clip,
+                scaler=scaler,
+            )
 
             global_value_sum += float(global_losses["global"].detach().item())
             global_df_sum += float(global_losses["global_df"].detach().item())
@@ -619,40 +696,48 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                     )
                     joint_refresh_steps += 1
                 else:
-                    input_item_embeddings = sequence_item_table[batch["input_ids"]]
-                    encoded_sequence = model.sequence_encoder(
-                        item_embeddings=input_item_embeddings,
-                        attention_mask=batch["attention_mask"],
+                    autocast_ctx = (
+                        torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
+                        if use_amp
+                        else nullcontext()
                     )
+                    with autocast_ctx:
+                        input_item_embeddings = sequence_item_table[batch["input_ids"]]
+                        encoded_sequence = model.sequence_encoder(
+                            item_embeddings=input_item_embeddings,
+                            attention_mask=batch["attention_mask"],
+                        )
 
-                    logits = encoded_sequence @ interest_item_embeddings.t()
-                    last_hidden = model.sequence_encoder.get_last_hidden(
-                        encoded=encoded_sequence,
-                        attention_mask=batch["attention_mask"],
-                    )
+                        logits = encoded_sequence @ interest_item_embeddings.t()
+                        last_hidden = model.sequence_encoder.get_last_hidden(
+                            encoded=encoded_sequence,
+                            attention_mask=batch["attention_mask"],
+                        )
 
-                    outputs = {
-                        "interest_user_embeddings": interest_user_embeddings,
-                        "disinterest_user_embeddings": disinterest_user_embeddings,
-                        "interest_item_embeddings": interest_item_embeddings,
-                        "disinterest_item_embeddings": disinterest_item_embeddings,
-                        "sequence_hidden": encoded_sequence,
-                        "sequence_logits": logits,
-                        "sequence_user_embedding": last_hidden,
-                    }
+                        outputs = {
+                            "interest_user_embeddings": interest_user_embeddings,
+                            "disinterest_user_embeddings": disinterest_user_embeddings,
+                            "interest_item_embeddings": interest_item_embeddings,
+                            "disinterest_item_embeddings": disinterest_item_embeddings,
+                            "sequence_hidden": encoded_sequence,
+                            "sequence_logits": logits,
+                            "sequence_user_embedding": last_hidden,
+                        }
 
-                    losses = criterion(
-                        outputs=outputs,
-                        batch=batch,
-                        triplets=empty_triplets,
-                        warmup=False,
-                    )
+                        losses = criterion(
+                            outputs=outputs,
+                            batch=batch,
+                            triplets=empty_triplets,
+                            warmup=False,
+                        )
 
-                optimizer.zero_grad(set_to_none=True)
-                losses["total"].backward()
-                if args.grad_clip > 0:
-                    clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-                optimizer.step()
+                backward_and_step(
+                    loss=losses["total"],
+                    optimizer=optimizer,
+                    model=model,
+                    grad_clip=args.grad_clip,
+                    scaler=scaler,
+                )
 
                 if run_full_joint:
                     model.eval()
@@ -753,6 +838,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 topk=args.eval_topk,
                 batch_size=args.eval_batch_size,
                 split=args.eval_split,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
             )
             eval_elapsed = time.time() - eval_start_time
             print(
