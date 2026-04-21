@@ -31,6 +31,9 @@ class SASRecEncoder(nn.Module):
         self.item_embedding = nn.Embedding(num_items + 2, embedding_dim, padding_idx=0)
         self.position_embedding = nn.Embedding(max_sequence_length + 1, embedding_dim)
 
+        # Pre-compute and cache position indices for common lengths (register as non-learnable buffer)
+        self._register_positions(max_sequence_length)
+
         # Transformer encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
@@ -47,6 +50,18 @@ class SASRecEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self._init_weights()
+
+    def _register_positions(self, max_len):
+        """Pre-compute position indices for common sequence lengths."""
+        # Store reverse positions [seq_len-1, seq_len-2, ..., 0] for various lengths
+        self.register_buffer('_pos_indices_cache', {}, persistent=False)
+
+    def _get_cached_positions(self, seq_len: int) -> torch.Tensor:
+        """Get cached position indices or compute if not cached."""
+        if seq_len not in self._pos_indices_cache:
+            positions = torch.arange(seq_len - 1, -1, step=-1, device=self.device)
+            self._pos_indices_cache[seq_len] = positions
+        return self._pos_indices_cache[seq_len]
 
     def _init_weights(self):
         """Initialize embeddings with Xavier initialization."""
@@ -82,13 +97,12 @@ class SASRecEncoder(nn.Module):
         """
         batch_size, seq_len = item_sequences.shape
 
-        # Get embeddings
+        # Get embeddings with scaling
         item_emb = self.item_embedding(item_sequences) * (self.embedding_dim ** 0.5)
 
-        # Add position embeddings
-        positions = torch.arange(seq_len - 1, -1, step=-1, device=self.device)
-        positions = positions.unsqueeze(0).expand(batch_size, -1)
-        pos_emb = self.position_embedding(positions)
+        # Use cached or compute positions
+        positions = self._get_cached_positions(seq_len)
+        pos_emb = self.position_embedding(positions.unsqueeze(0).expand(batch_size, -1))
 
         # Combine and normalize
         hidden = self.layer_norm(item_emb + pos_emb)
@@ -104,10 +118,10 @@ class SASRecEncoder(nn.Module):
             src_key_padding_mask=~mask if mask is not None else None,
         )
 
-        # Get last valid embedding for each user
+        # Get last valid embedding for each user using optimized gather
         lengths = mask.sum(dim=-1) - 1  # Last valid position
-        user_indices = lengths.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.embedding_dim)
-        user_embeddings = torch.gather(transformer_output, 1, user_indices).squeeze(1)
+        batch_indices = torch.arange(batch_size, device=self.device)
+        user_embeddings = transformer_output[batch_indices, lengths]
 
         # Compute scores for all items
         item_scores = user_embeddings @ self.item_embedding.weight.T

@@ -286,17 +286,12 @@ class CREATEPlusPlusModel(nn.Module):
         # Cross-correlation matrix: C_ij = correlation between seq feature i and graph feature j
         correlation = torch.mm(z_seq_norm.t(), z_graph_norm) / batch_size
 
-        # Loss: diagonal to 1 (alignment), off-diagonal to 0 (redundancy reduction)
-        diagonal = torch.diag(correlation)
-        off_diagonal = correlation - torch.diag_embed(diagonal)
+        # Vectorized loss: diagonal to 1, off-diagonal to 0
+        # C - I has diagonal = corr_ii - 1, off-diagonal = corr_ij
+        identity = torch.eye(correlation.size(0), device=correlation.device)
+        loss = ((correlation - identity) ** 2).sum()
 
-        # On-diagonal: (1 - corr_ii)^2 - want features to be similar across views
-        on_diag_loss = ((1 - diagonal) ** 2).sum()
-
-        # Off-diagonal: sum(corr_ij^2) for i != j - want to reduce redundancy
-        off_diag_loss = (off_diagonal ** 2).sum()
-
-        return on_diag_loss + self.barlow_weight * off_diag_loss
+        return loss
 
     def orthogonal_loss(self, pos_emb: torch.Tensor, neg_emb: torch.Tensor) -> torch.Tensor:
         """

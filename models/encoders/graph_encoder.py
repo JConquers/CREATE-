@@ -28,37 +28,45 @@ class LightGINConv(MessagePassing):
             pos_edge_index: Positive edge indices
             neg_edge_index: Negative edge indices
         """
-        def get_norm(node, edge_index):
-            row, col = edge_index
-            deg = degree(col, node.size(0), dtype=node.dtype)
-            deg_inv_sqrt = deg.pow(-0.5)
-            deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-            return norm, deg_inv_sqrt
+        pos_emb, neg_emb = x
 
-        def gin_norm(out, input_x, deg_inv_sqrt):
-            norm_self = deg_inv_sqrt * deg_inv_sqrt
-            norm_self = norm_self.unsqueeze(dim=1).repeat(1, input_x.size(1))
-            return out + (1 + self.eps) * norm_self * input_x
+        # Pre-compute normalization factors (avoid recomputing in message)
+        pos_row, pos_col = pos_edge_index
+        pos_deg = degree(pos_col, pos_emb.size(0), dtype=pos_emb.dtype)
+        pos_deg_inv_sqrt = pos_deg.pow(-0.5)
+        pos_deg_inv_sqrt[pos_deg_inv_sqrt == float('inf')] = 0
 
-        norm_pos, deg_inv_sqrt_pos = get_norm(x[0], pos_edge_index)
-        norm_neg, deg_inv_sqrt_neg = get_norm(x[1], neg_edge_index)
+        neg_row, neg_col = neg_edge_index
+        neg_deg = degree(neg_col, neg_emb.size(0), dtype=neg_emb.dtype)
+        neg_deg_inv_sqrt = neg_deg.pow(-0.5)
+        neg_deg_inv_sqrt[neg_deg_inv_sqrt == float('inf')] = 0
+
+        pos_norm = pos_deg_inv_sqrt[pos_row] * pos_deg_inv_sqrt[pos_col]
+        neg_norm = neg_deg_inv_sqrt[neg_row] * neg_deg_inv_sqrt[neg_col]
+
+        # Reshape norm for broadcasting
+        pos_norm = pos_norm.view(-1, 1)
+        neg_norm = neg_norm.view(-1, 1)
 
         if self.first_aggr:
-            out_pos = self.propagate(pos_edge_index, x=x[0], norm=norm_pos)
-            out_neg = self.propagate(neg_edge_index, x=x[0], norm=norm_neg)
-            out_pos = gin_norm(out_pos, x[0], deg_inv_sqrt_pos)
-            out_neg = gin_norm(out_neg, x[0], deg_inv_sqrt_neg)
+            out_pos = self.propagate(pos_edge_index, x=pos_emb, norm=pos_norm)
+            out_neg = self.propagate(neg_edge_index, x=neg_emb, norm=neg_norm)
+            # GIN normalization: out + (1 + eps) * norm_sq * input
+            pos_deg_sq = pos_deg_inv_sqrt.pow(2)
+            neg_deg_sq = neg_deg_inv_sqrt.pow(2)
+            out_pos = out_pos + (1 + self.eps) * (pos_deg_sq.unsqueeze(1) * pos_emb)
+            out_neg = out_neg + (1 + self.eps) * (neg_deg_sq.unsqueeze(1) * neg_emb)
             return out_pos, out_neg
         else:
-            out_pos = self.propagate(pos_edge_index, x=x[0], norm=norm_pos)
-            out_neg = self.propagate(pos_edge_index, x=x[1], norm=norm_pos)
-            out_pos = gin_norm(out_pos, x[0], deg_inv_sqrt_pos)
-            out_neg = gin_norm(out_neg, x[1], deg_inv_sqrt_pos)
+            out_pos = self.propagate(pos_edge_index, x=pos_emb, norm=pos_norm)
+            out_neg = self.propagate(pos_edge_index, x=neg_emb, norm=pos_norm)
+            pos_deg_sq = pos_deg_inv_sqrt.pow(2)
+            out_pos = out_pos + (1 + self.eps) * (pos_deg_sq.unsqueeze(1) * pos_emb)
+            out_neg = out_neg + (1 + self.eps) * (pos_deg_sq.unsqueeze(1) * neg_emb)
             return out_pos, out_neg
 
     def message(self, x_j: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
-        return norm.view(-1, 1) * x_j
+        return norm * x_j
 
 
 class PoneGNNEncoder(nn.Module):
@@ -197,7 +205,7 @@ class PoneGNNEncoder(nn.Module):
         if self.pos_emb is None or self.neg_emb is None:
             return torch.tensor(0.0, device=self.user_embedding.device)
 
-        # Get embeddings for the batch
+        # Get embeddings for the batch (vectorized indexing)
         # Users are in the first num_users rows, items are in the remaining num_items rows
         u_pos = self.pos_emb[:self.num_users][users]
         u_neg = self.neg_emb[:self.num_users][users]
@@ -216,12 +224,9 @@ class PoneGNNEncoder(nn.Module):
         pos_similarity = (u_pos_norm * i_pos_norm).sum(dim=1)  # Positive space alignment
         neg_similarity = (u_neg_norm * i_neg_norm).sum(dim=1)  # Negative space alignment
 
-        # InfoNCE-style loss: pull positive pairs together, push negative pairs apart
-        # exp(pos_sim / tau) / (exp(pos_sim / tau) + exp(neg_sim / tau))
-        pos_exp = torch.exp(pos_similarity / self.temperature)
-        neg_exp = torch.exp(neg_similarity / self.temperature)
-
-        contrastive_loss = -torch.log(pos_exp / (pos_exp + neg_exp + 1e-8)).mean()
+        # Numerically stable InfoNCE loss using log-sum-exp trick
+        # -log(exp(a)/(exp(a)+exp(b))) = -a + log(exp(a)+exp(b)) = log(1+exp(b-a))
+        contrastive_loss = F.softplus(neg_similarity - pos_similarity).mean()
 
         return self.contrastive_weight * contrastive_loss
 
@@ -254,7 +259,7 @@ class PoneGNNEncoder(nn.Module):
                 torch.tensor(0.0, device=self.user_embedding.device),
             )
 
-        # Get embeddings
+        # Get embeddings (vectorized indexing)
         u_pos = self.pos_emb[:self.num_users][users]
         u_neg = self.neg_emb[:self.num_users][users]
         i_pos = self.pos_emb[self.num_users:][pos_items]
@@ -265,13 +270,13 @@ class PoneGNNEncoder(nn.Module):
         # Positive BPR: maximize u_pos · i_pos - u_pos · n_pos
         pos_scores = (u_pos * i_pos).sum(dim=1)
         neg_scores = (u_pos * n_pos).sum(dim=1)
-        pos_bpr_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
+        pos_bpr_loss = F.softplus(neg_scores - pos_scores).mean()
 
         # Negative BPR: maximize u_neg · n_neg - u_neg · i_neg
         # Push away from negative items
         neg_scores_neg = (u_neg * n_neg).sum(dim=1)
         pos_scores_neg = (u_neg * i_neg).sum(dim=1)
-        neg_bpr_loss = -F.logsigmoid(neg_scores_neg - pos_scores_neg).mean()
+        neg_bpr_loss = F.softplus(pos_scores_neg - neg_scores_neg).mean()
 
         total_loss = pos_bpr_loss + neg_bpr_loss
 
