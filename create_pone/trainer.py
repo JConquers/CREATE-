@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -88,6 +89,34 @@ def resolve_effective_batch_size(
     return min(requested_batch_size, safe_batch)
 
 
+def build_empty_triplets(device: torch.device) -> dict[str, torch.Tensor]:
+    empty = torch.empty(0, dtype=torch.long, device=device)
+    return {
+        "pos_users": empty,
+        "pos_items": empty,
+        "pos_negs": empty,
+        "neg_users": empty,
+        "neg_items": empty,
+        "neg_negs": empty,
+    }
+
+
+def sample_global_user_ids(num_users: int, sample_size: int) -> torch.Tensor:
+    if sample_size <= 0 or sample_size >= num_users:
+        return torch.arange(num_users, dtype=torch.long)
+    return torch.randperm(num_users)[:sample_size]
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train CREATE-Pone (CREATE++ signed variant)")
 
@@ -134,6 +163,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=350_000_000,
         help="CUDA safety cap for batch*seq_len*num_items; batch is reduced automatically.",
+    )
+    parser.add_argument(
+        "--global-user-sample",
+        type=int,
+        default=50_000,
+        help="Users sampled per epoch for the global signed loss. Use <=0 for all users.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=200,
+        help="Print batch progress every N mini-batches during joint epochs.",
+    )
+    parser.add_argument(
+        "--max-steps-per-epoch",
+        type=int,
+        default=0,
+        help="Limit joint-epoch mini-batches (0 means full epoch).",
     )
 
     parser.add_argument("--device", type=str, default="auto")
@@ -268,55 +315,172 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"train_interactions={len(bundle.train_df)}",
         f"train_sequences={len(train_dataset)}",
         f"batch_size={effective_batch_size}",
+        f"steps_per_epoch={len(train_loader)}",
     )
 
+    empty_triplets = build_empty_triplets(device)
+
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
         warmup = epoch < args.warmup_epochs
         model.train()
 
-        running = {
-            "total": 0.0,
-            "local": 0.0,
-            "global": 0.0,
-            "global_df": 0.0,
-            "global_cl": 0.0,
-            "align": 0.0,
-        }
+        sampled_user_ids = sample_global_user_ids(
+            num_users=bundle.num_users,
+            sample_size=args.global_user_sample,
+        )
+        global_triplets = triplet_sampler.sample(sampled_user_ids, device=device)
+
+        global_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+        global_losses = criterion(
+            outputs=global_outputs,
+            batch={},
+            triplets=global_triplets,
+            warmup=True,
+        )
+
+        global_step_loss = (
+            global_losses["global"] if warmup else args.w_global * global_losses["global"]
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        global_step_loss.backward()
+        if args.grad_clip > 0:
+            clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+        optimizer.step()
+
+        global_value = float(global_losses["global"].detach().item())
+        global_df_value = float(global_losses["global_df"].detach().item())
+        global_cl_value = float(global_losses["global_cl"].detach().item())
+
+        local_total_sum = 0.0
+        local_loss_sum = 0.0
+        align_loss_sum = 0.0
         step_count = 0
 
-        for batch in train_loader:
-            batch = move_batch_to_device(batch, device)
-            triplets = triplet_sampler.sample(batch["user_ids"], device=device)
+        if not warmup:
+            model.eval()
+            with torch.no_grad():
+                cached_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+            model.train()
 
-            outputs = model(
-                batch=batch,
-                signed_graph=signed_graph,
-                run_sequence=not warmup,
+            interest_user_embeddings = cached_outputs["interest_user_embeddings"]
+            disinterest_user_embeddings = cached_outputs["disinterest_user_embeddings"]
+            interest_item_embeddings = cached_outputs["interest_item_embeddings"]
+            disinterest_item_embeddings = cached_outputs["disinterest_item_embeddings"]
+
+            pad_row = torch.zeros(
+                1,
+                interest_item_embeddings.size(1),
+                dtype=interest_item_embeddings.dtype,
+                device=interest_item_embeddings.device,
             )
-            losses = criterion(
-                outputs=outputs,
-                batch=batch,
-                triplets=triplets,
-                warmup=warmup,
-            )
+            sequence_item_table = torch.cat([interest_item_embeddings, pad_row], dim=0)
 
-            optimizer.zero_grad(set_to_none=True)
-            losses["total"].backward()
-            if args.grad_clip > 0:
-                clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            optimizer.step()
+            steps_target = len(train_loader)
+            if args.max_steps_per_epoch > 0:
+                steps_target = min(steps_target, args.max_steps_per_epoch)
 
-            for key in running:
-                running[key] += float(losses[key].detach().item())
-            step_count += 1
+            local_start_time = time.time()
 
-        step_count = max(step_count, 1)
-        epoch_metrics = {
-            "epoch": epoch + 1,
-            "warmup": warmup,
-            **{key: value / step_count for key, value in running.items()},
-        }
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                if args.max_steps_per_epoch > 0 and batch_idx > args.max_steps_per_epoch:
+                    break
+
+                batch = move_batch_to_device(batch, device)
+
+                input_item_embeddings = sequence_item_table[batch["input_ids"]]
+                encoded_sequence = model.sequence_encoder(
+                    item_embeddings=input_item_embeddings,
+                    attention_mask=batch["attention_mask"],
+                )
+
+                logits = encoded_sequence @ interest_item_embeddings.t()
+                last_hidden = model.sequence_encoder.get_last_hidden(
+                    encoded=encoded_sequence,
+                    attention_mask=batch["attention_mask"],
+                )
+
+                outputs = {
+                    "interest_user_embeddings": interest_user_embeddings,
+                    "disinterest_user_embeddings": disinterest_user_embeddings,
+                    "interest_item_embeddings": interest_item_embeddings,
+                    "disinterest_item_embeddings": disinterest_item_embeddings,
+                    "sequence_hidden": encoded_sequence,
+                    "sequence_logits": logits,
+                    "sequence_user_embedding": last_hidden,
+                }
+
+                losses = criterion(
+                    outputs=outputs,
+                    batch=batch,
+                    triplets=empty_triplets,
+                    warmup=False,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                if args.grad_clip > 0:
+                    clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+
+                local_total_sum += float(losses["total"].detach().item())
+                local_loss_sum += float(losses["local"].detach().item())
+                align_loss_sum += float(losses["align"].detach().item())
+                step_count += 1
+
+                should_log = (
+                    args.log_every > 0
+                    and (
+                        step_count == 1
+                        or step_count % args.log_every == 0
+                        or step_count == steps_target
+                    )
+                )
+                if should_log:
+                    elapsed = time.time() - local_start_time
+                    steps_per_second = step_count / max(elapsed, 1e-9)
+                    eta_seconds = (steps_target - step_count) / max(steps_per_second, 1e-9)
+                    print(
+                        f"  batch {step_count}/{steps_target} | "
+                        f"total={losses['total'].detach().item():.4f} | "
+                        f"local={losses['local'].detach().item():.4f} | "
+                        f"align={losses['align'].detach().item():.4f} | "
+                        f"eta={format_duration(eta_seconds)}"
+                    )
+
+        if warmup:
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                "warmup": warmup,
+                "total": global_value,
+                "local": 0.0,
+                "global": global_value,
+                "global_df": global_df_value,
+                "global_cl": global_cl_value,
+                "align": 0.0,
+                "local_steps": 0,
+            }
+        else:
+            step_count = max(step_count, 1)
+            local_total_avg = local_total_sum / step_count
+            local_avg = local_loss_sum / step_count
+            align_avg = align_loss_sum / step_count
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                "warmup": warmup,
+                "total": local_total_avg + args.w_global * global_value,
+                "local": local_avg,
+                "global": global_value,
+                "global_df": global_df_value,
+                "global_cl": global_cl_value,
+                "align": align_avg,
+                "local_steps": step_count,
+            }
+
         history.append(epoch_metrics)
+
+        epoch_elapsed = time.time() - epoch_start_time
 
         print(
             f"Epoch {epoch + 1:03d}/{args.epochs:03d} | "
@@ -324,7 +488,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             f"total={epoch_metrics['total']:.4f} | "
             f"local={epoch_metrics['local']:.4f} | "
             f"global={epoch_metrics['global']:.4f} | "
-            f"align={epoch_metrics['align']:.4f}"
+            f"align={epoch_metrics['align']:.4f} | "
+            f"local_steps={epoch_metrics['local_steps']} | "
+            f"time={format_duration(epoch_elapsed)}"
         )
 
         if epoch_metrics["total"] < best_total:
