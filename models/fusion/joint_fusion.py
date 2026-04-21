@@ -439,6 +439,7 @@ class CREATEPlusPlusModel(nn.Module):
 
         # 2. Dual-Feedback Loss (Positive/Negative BPR)
         # Learns separately from positive and negative interactions
+        # Note: pos_emb/neg_emb here are the full embeddings (users + items)
         pos_bpr_loss, neg_bpr_loss = self.dual_feedback_loss(
             users=users,
             pos_items=labels,
