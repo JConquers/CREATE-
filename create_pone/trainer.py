@@ -117,6 +117,147 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def build_eval_examples(
+    bundle,
+    split: str,
+    max_sequence_length: int,
+    max_users: int,
+) -> list[tuple[int, list[int], int]]:
+    eval_df = bundle.val_df if split == "val" else bundle.test_df
+    if eval_df is None or eval_df.empty:
+        return []
+
+    ordered_df = eval_df
+    if "timestamp" in eval_df.columns:
+        ordered_df = eval_df.sort_values(["user_id", "timestamp"])
+
+    target_df = ordered_df.groupby("user_id", as_index=False).tail(1)
+
+    examples: list[tuple[int, list[int], int]] = []
+    for row in target_df.itertuples(index=False):
+        user_id = int(getattr(row, "user_id"))
+        target_item_id = int(getattr(row, "item_id"))
+
+        context = bundle.user_sequences.get(user_id)
+        if not context:
+            continue
+
+        trimmed_context = context[-max_sequence_length:]
+        if not trimmed_context:
+            continue
+
+        examples.append((user_id, trimmed_context, target_item_id))
+
+    if max_users > 0 and len(examples) > max_users:
+        examples = examples[:max_users]
+
+    return examples
+
+
+@torch.no_grad()
+def evaluate_ranking(
+    model: CreatePoneModel,
+    signed_graph,
+    eval_examples: list[tuple[int, list[int], int]],
+    pad_id: int,
+    device: torch.device,
+    topk: int,
+    batch_size: int,
+    split: str,
+) -> dict:
+    if not eval_examples:
+        return {
+            "split": split,
+            "users": 0,
+            "topk": max(1, topk),
+            "hr": 0.0,
+            "ndcg": 0.0,
+        }
+
+    model.eval()
+
+    graph_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+    interest_item_embeddings = graph_outputs["interest_item_embeddings"]
+
+    eval_topk = min(max(1, topk), interest_item_embeddings.size(0))
+
+    pad_row = torch.zeros(
+        1,
+        interest_item_embeddings.size(1),
+        dtype=interest_item_embeddings.dtype,
+        device=interest_item_embeddings.device,
+    )
+    sequence_item_table = torch.cat([interest_item_embeddings, pad_row], dim=0)
+
+    hits_total = 0.0
+    ndcg_total = 0.0
+    user_count = len(eval_examples)
+
+    rank_positions = torch.arange(eval_topk, device=device, dtype=torch.long)
+
+    for start_idx in range(0, user_count, max(1, batch_size)):
+        batch_examples = eval_examples[start_idx:start_idx + max(1, batch_size)]
+        batch_len = len(batch_examples)
+        max_len = max(len(example[1]) for example in batch_examples)
+
+        input_ids = torch.full(
+            (batch_len, max_len),
+            fill_value=pad_id,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros((batch_len, max_len), dtype=torch.bool, device=device)
+        target_ids = torch.empty((batch_len,), dtype=torch.long, device=device)
+
+        for row_idx, (_, context, target_item_id) in enumerate(batch_examples):
+            context_tensor = torch.tensor(context, dtype=torch.long, device=device)
+            seq_len = context_tensor.numel()
+            input_ids[row_idx, :seq_len] = context_tensor
+            attention_mask[row_idx, :seq_len] = True
+            target_ids[row_idx] = int(target_item_id)
+
+        input_item_embeddings = sequence_item_table[input_ids]
+        encoded_sequence = model.sequence_encoder(
+            item_embeddings=input_item_embeddings,
+            attention_mask=attention_mask,
+        )
+        last_hidden = model.sequence_encoder.get_last_hidden(
+            encoded=encoded_sequence,
+            attention_mask=attention_mask,
+        )
+
+        scores = last_hidden @ interest_item_embeddings.t()
+        _, topk_indices = torch.topk(scores, k=eval_topk, dim=1)
+
+        matches = topk_indices.eq(target_ids.unsqueeze(1))
+        hit_mask = matches.any(dim=1)
+        hits_total += float(hit_mask.float().sum().item())
+
+        fallback_positions = torch.full_like(topk_indices, eval_topk)
+        hit_positions = torch.where(
+            matches,
+            rank_positions.unsqueeze(0).expand_as(topk_indices),
+            fallback_positions,
+        ).min(dim=1).values
+
+        ndcg = torch.where(
+            hit_mask,
+            1.0 / torch.log2(hit_positions.float() + 2.0),
+            torch.zeros_like(hit_positions, dtype=torch.float32),
+        )
+        ndcg_total += float(ndcg.sum().item())
+
+    model.train()
+
+    return {
+        "split": split,
+        "users": user_count,
+        "topk": eval_topk,
+        "hr": hits_total / max(1, user_count),
+        "ndcg": ndcg_total / max(1, user_count),
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train CREATE-Pone (CREATE++ signed variant)")
 
@@ -181,6 +322,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Limit joint-epoch mini-batches (0 means full epoch).",
+    )
+    parser.add_argument(
+        "--warmup-global-steps",
+        type=int,
+        default=200,
+        help="Number of global signed-graph optimizer steps per warmup epoch.",
+    )
+    parser.add_argument(
+        "--global-steps-per-epoch",
+        type=int,
+        default=1,
+        help="Number of global signed-graph optimizer steps per non-warmup epoch.",
+    )
+    parser.add_argument(
+        "--joint-refresh-every",
+        type=int,
+        default=200,
+        help="Run a full graph+sequence joint step every N local batches (<=0 disables).",
+    )
+    parser.add_argument(
+        "--eval-split",
+        choices=["val", "test"],
+        default="val",
+        help="Dataset split used for checkpoint-time ranking evaluation.",
+    )
+    parser.add_argument(
+        "--eval-topk",
+        type=int,
+        default=10,
+        help="Top-K cutoff used for HR/NDCG evaluation at checkpoints.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=256,
+        help="Batch size used for checkpoint-time ranking evaluation.",
+    )
+    parser.add_argument(
+        "--eval-max-users",
+        type=int,
+        default=5000,
+        help="Maximum users evaluated per checkpoint (<=0 means all).",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="Run standalone evaluation every N epochs (checkpoint-triggered eval still runs).",
     )
 
     parser.add_argument("--device", type=str, default="auto")
@@ -308,6 +497,14 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     best_checkpoint_path = output_dir / f"{run_prefix}_best.pt"
     best_total = float("inf")
 
+    eval_examples = build_eval_examples(
+        bundle=bundle,
+        split=args.eval_split,
+        max_sequence_length=args.max_seq_len,
+        max_users=args.eval_max_users,
+    )
+    last_eval_metrics = None
+
     print(
         "Loaded dataset:",
         f"users={bundle.num_users}",
@@ -316,6 +513,12 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"train_sequences={len(train_dataset)}",
         f"batch_size={effective_batch_size}",
         f"steps_per_epoch={len(train_loader)}",
+        f"warmup_global_steps={max(1, args.warmup_global_steps)}",
+        f"global_steps={max(1, args.global_steps_per_epoch)}",
+        f"joint_refresh_every={args.joint_refresh_every}",
+        f"eval_split={args.eval_split}",
+        f"eval_users={len(eval_examples)}",
+        f"eval_topk={args.eval_topk}",
     )
 
     empty_triplets = build_empty_triplets(device)
@@ -325,38 +528,50 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         warmup = epoch < args.warmup_epochs
         model.train()
 
-        sampled_user_ids = sample_global_user_ids(
-            num_users=bundle.num_users,
-            sample_size=args.global_user_sample,
-        )
-        global_triplets = triplet_sampler.sample(sampled_user_ids, device=device)
+        global_steps = max(1, args.warmup_global_steps if warmup else args.global_steps_per_epoch)
+        global_value_sum = 0.0
+        global_df_sum = 0.0
+        global_cl_sum = 0.0
 
-        global_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
-        global_losses = criterion(
-            outputs=global_outputs,
-            batch={},
-            triplets=global_triplets,
-            warmup=True,
-        )
+        for _ in range(global_steps):
+            sampled_user_ids = sample_global_user_ids(
+                num_users=bundle.num_users,
+                sample_size=args.global_user_sample,
+            )
+            global_triplets = triplet_sampler.sample(sampled_user_ids, device=device)
 
-        global_step_loss = (
-            global_losses["global"] if warmup else args.w_global * global_losses["global"]
-        )
+            global_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+            global_losses = criterion(
+                outputs=global_outputs,
+                batch={},
+                triplets=global_triplets,
+                warmup=True,
+            )
 
-        optimizer.zero_grad(set_to_none=True)
-        global_step_loss.backward()
-        if args.grad_clip > 0:
-            clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-        optimizer.step()
+            global_step_loss = (
+                global_losses["global"] if warmup else args.w_global * global_losses["global"]
+            )
 
-        global_value = float(global_losses["global"].detach().item())
-        global_df_value = float(global_losses["global_df"].detach().item())
-        global_cl_value = float(global_losses["global_cl"].detach().item())
+            optimizer.zero_grad(set_to_none=True)
+            global_step_loss.backward()
+            if args.grad_clip > 0:
+                clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+
+            global_value_sum += float(global_losses["global"].detach().item())
+            global_df_sum += float(global_losses["global_df"].detach().item())
+            global_cl_sum += float(global_losses["global_cl"].detach().item())
+
+        global_value = global_value_sum / global_steps
+        global_df_value = global_df_sum / global_steps
+        global_cl_value = global_cl_sum / global_steps
 
         local_total_sum = 0.0
         local_loss_sum = 0.0
         align_loss_sum = 0.0
         step_count = 0
+
+        joint_refresh_steps = 0
 
         if not warmup:
             model.eval()
@@ -389,40 +604,74 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
 
                 batch = move_batch_to_device(batch, device)
 
-                input_item_embeddings = sequence_item_table[batch["input_ids"]]
-                encoded_sequence = model.sequence_encoder(
-                    item_embeddings=input_item_embeddings,
-                    attention_mask=batch["attention_mask"],
+                run_full_joint = (
+                    args.joint_refresh_every > 0
+                    and (batch_idx % args.joint_refresh_every == 0)
                 )
 
-                logits = encoded_sequence @ interest_item_embeddings.t()
-                last_hidden = model.sequence_encoder.get_last_hidden(
-                    encoded=encoded_sequence,
-                    attention_mask=batch["attention_mask"],
-                )
+                if run_full_joint:
+                    outputs = model(batch=batch, signed_graph=signed_graph, run_sequence=True)
+                    losses = criterion(
+                        outputs=outputs,
+                        batch=batch,
+                        triplets=empty_triplets,
+                        warmup=False,
+                    )
+                    joint_refresh_steps += 1
+                else:
+                    input_item_embeddings = sequence_item_table[batch["input_ids"]]
+                    encoded_sequence = model.sequence_encoder(
+                        item_embeddings=input_item_embeddings,
+                        attention_mask=batch["attention_mask"],
+                    )
 
-                outputs = {
-                    "interest_user_embeddings": interest_user_embeddings,
-                    "disinterest_user_embeddings": disinterest_user_embeddings,
-                    "interest_item_embeddings": interest_item_embeddings,
-                    "disinterest_item_embeddings": disinterest_item_embeddings,
-                    "sequence_hidden": encoded_sequence,
-                    "sequence_logits": logits,
-                    "sequence_user_embedding": last_hidden,
-                }
+                    logits = encoded_sequence @ interest_item_embeddings.t()
+                    last_hidden = model.sequence_encoder.get_last_hidden(
+                        encoded=encoded_sequence,
+                        attention_mask=batch["attention_mask"],
+                    )
 
-                losses = criterion(
-                    outputs=outputs,
-                    batch=batch,
-                    triplets=empty_triplets,
-                    warmup=False,
-                )
+                    outputs = {
+                        "interest_user_embeddings": interest_user_embeddings,
+                        "disinterest_user_embeddings": disinterest_user_embeddings,
+                        "interest_item_embeddings": interest_item_embeddings,
+                        "disinterest_item_embeddings": disinterest_item_embeddings,
+                        "sequence_hidden": encoded_sequence,
+                        "sequence_logits": logits,
+                        "sequence_user_embedding": last_hidden,
+                    }
+
+                    losses = criterion(
+                        outputs=outputs,
+                        batch=batch,
+                        triplets=empty_triplets,
+                        warmup=False,
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 losses["total"].backward()
                 if args.grad_clip > 0:
                     clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
                 optimizer.step()
+
+                if run_full_joint:
+                    model.eval()
+                    with torch.no_grad():
+                        cached_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+                    model.train()
+
+                    interest_user_embeddings = cached_outputs["interest_user_embeddings"]
+                    disinterest_user_embeddings = cached_outputs["disinterest_user_embeddings"]
+                    interest_item_embeddings = cached_outputs["interest_item_embeddings"]
+                    disinterest_item_embeddings = cached_outputs["disinterest_item_embeddings"]
+
+                    pad_row = torch.zeros(
+                        1,
+                        interest_item_embeddings.size(1),
+                        dtype=interest_item_embeddings.dtype,
+                        device=interest_item_embeddings.device,
+                    )
+                    sequence_item_table = torch.cat([interest_item_embeddings, pad_row], dim=0)
 
                 local_total_sum += float(losses["total"].detach().item())
                 local_loss_sum += float(losses["local"].detach().item())
@@ -446,6 +695,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         f"total={losses['total'].detach().item():.4f} | "
                         f"local={losses['local'].detach().item():.4f} | "
                         f"align={losses['align'].detach().item():.4f} | "
+                        f"refresh_steps={joint_refresh_steps} | "
                         f"eta={format_duration(eta_seconds)}"
                     )
 
@@ -460,6 +710,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "global_cl": global_cl_value,
                 "align": 0.0,
                 "local_steps": 0,
+                "joint_refresh_steps": 0,
             }
         else:
             step_count = max(step_count, 1)
@@ -476,7 +727,48 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "global_cl": global_cl_value,
                 "align": align_avg,
                 "local_steps": step_count,
+                "joint_refresh_steps": joint_refresh_steps,
             }
+
+        should_save_best = epoch_metrics["total"] < best_total
+        should_save_periodic = (
+            args.checkpoint_every > 0
+            and ((epoch + 1) % args.checkpoint_every == 0)
+        )
+        should_eval_standalone = (
+            args.eval_every > 0
+            and ((epoch + 1) % args.eval_every == 0)
+        )
+        needs_eval_for_checkpoint = should_save_best or should_save_periodic
+
+        eval_metrics = None
+        if eval_examples and (should_eval_standalone or needs_eval_for_checkpoint):
+            eval_start_time = time.time()
+            eval_metrics = evaluate_ranking(
+                model=model,
+                signed_graph=signed_graph,
+                eval_examples=eval_examples,
+                pad_id=bundle.num_items,
+                device=device,
+                topk=args.eval_topk,
+                batch_size=args.eval_batch_size,
+                split=args.eval_split,
+            )
+            eval_elapsed = time.time() - eval_start_time
+            print(
+                f"Eval {eval_metrics['split']}@{eval_metrics['topk']} | "
+                f"users={eval_metrics['users']} | "
+                f"HR={eval_metrics['hr']:.4f} | "
+                f"NDCG={eval_metrics['ndcg']:.4f} | "
+                f"time={format_duration(eval_elapsed)}"
+            )
+            last_eval_metrics = eval_metrics
+
+        checkpoint_eval_metrics = eval_metrics
+        if checkpoint_eval_metrics is None and needs_eval_for_checkpoint:
+            checkpoint_eval_metrics = last_eval_metrics
+
+        epoch_metrics["eval"] = eval_metrics
 
         history.append(epoch_metrics)
 
@@ -490,10 +782,11 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             f"global={epoch_metrics['global']:.4f} | "
             f"align={epoch_metrics['align']:.4f} | "
             f"local_steps={epoch_metrics['local_steps']} | "
+            f"refresh_steps={epoch_metrics['joint_refresh_steps']} | "
             f"time={format_duration(epoch_elapsed)}"
         )
 
-        if epoch_metrics["total"] < best_total:
+        if should_save_best:
             best_total = epoch_metrics["total"]
             torch.save(
                 {
@@ -505,12 +798,13 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                     "num_users": bundle.num_users,
                     "num_items": bundle.num_items,
                     "pad_id": bundle.num_items,
+                    "eval_metrics": checkpoint_eval_metrics,
                 },
                 best_checkpoint_path,
             )
             print(f"Saved best checkpoint to: {best_checkpoint_path}")
 
-        if args.checkpoint_every > 0 and ((epoch + 1) % args.checkpoint_every == 0):
+        if should_save_periodic:
             epoch_checkpoint_path = checkpoint_dir / f"{run_prefix}_epoch_{epoch + 1:03d}.pt"
             torch.save(
                 {
@@ -521,6 +815,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                     "num_users": bundle.num_users,
                     "num_items": bundle.num_items,
                     "pad_id": bundle.num_items,
+                    "eval_metrics": checkpoint_eval_metrics,
                 },
                 epoch_checkpoint_path,
             )
@@ -540,6 +835,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             "num_users": bundle.num_users,
             "num_items": bundle.num_items,
             "pad_id": bundle.num_items,
+            "eval_metrics": last_eval_metrics,
         },
         checkpoint_path,
     )
