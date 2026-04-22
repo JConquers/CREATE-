@@ -64,15 +64,18 @@ class UniGNNEncoder(nn.Module):
         for i in range(n_layers):
             in_dim = embedding_dim if i == 0 else embedding_dim * heads
             out_dim = embedding_dim
-            conv = ConvClass(
-                in_channels=in_dim,
-                out_channels=out_dim,
-                heads=heads if conv_type == "UniGAT" else 1,
-                dropout=dropout,
-                first_aggregate=first_aggregate,
-                second_aggregate=second_aggregate,
-                use_norm=use_norm,
-            )
+            kwargs = {
+                "in_channels": in_dim,
+                "out_channels": out_dim,
+                "heads": heads if conv_type == "UniGAT" else 1,
+                "dropout": dropout,
+                "first_aggregate": first_aggregate,
+                "use_norm": use_norm,
+            }
+            if conv_type == "UniSAGE":
+                kwargs["second_aggregate"] = second_aggregate
+                
+            conv = ConvClass(**kwargs)
             self.convs.append(conv)
 
         self.dropout = nn.Dropout(dropout)
