@@ -1,0 +1,1029 @@
+CREATE++: Extending Cross-Representation
+Alignment with Signed and Higher-Order Signals
+Sarvesh Kumar
+
+Jinesh Pagaria
+
+Dhruv Kothari
+
+IMT2022521
+
+IMT2022044
+
+IMT2022114
+
+Abstract—Transformer architectures have become the dominant approach in sequential recommender systems due to their
+ability to capture dependencies within user interaction histories.
+However, these models often consider sequence elements in
+isolation, failing to fully leverage the global collaborative context
+inherent in user–item relationships. While recent frameworks like
+CREATE [1] address this by aligning sequential encoders with
+graph neural networks (GNNs), they remain largely limited to
+unsigned bipartite graphs that cannot model explicit negative
+feedback or higher-order multi-way relationships. To fill this
+gap, we propose two architectural extensions: CREATE-Pone and
+CREATE-Uni. By integrating signed graph modeling inspired
+by Pone-GNN [2] to disentangle interest from disinterest and
+hypergraph structures via the UniGNN [3] framework to capture
+complex higher-order correlations, our framework provides a
+more expressive and nuanced grounding for sequential models. This dual approach significantly enriches the structural
+knowledge transferred to the transformer while preserving the
+efficient asymmetric inference protocol required for productionscale recommendation.
+Index Terms—Recommender Systems, Sequential Recommendation, Signed Graphs, Hypergraphs
+
+I. I NTRODUCTION
+Modern recommender systems must reconcile two distinct
+perspectives of user behavior: short-range sequential dynamics
+and long-range collaborative structures. While Graph Neural
+Networks (GNNs) have emerged as the state-of-the-art for capturing global collaborative signals through recursive neighborhood aggregation, they are often less effective at modeling the
+strictly ordered, temporal dependencies inherent in user interaction histories. Conversely, Transformer-based architectures
+excel at capturing these fine-grained sequential patterns but
+struggle to encode the broader structural context of the global
+user–item interaction graph. To bridge this gap, the recently
+proposed CREATE framework [1] introduces a paradigm of
+cross-representation knowledge transfer. By using a GNN as
+a global structural grounding to enrich a transformer-based
+sequential encoder during training, CREATE achieves superior
+performance by combining the strengths of both architectures.
+This alignment allows the model to inherit global collaborative
+wisdom while maintaining an efficient asymmetric inference
+protocol that utilizes only the sequential encoder at test time.
+Despite its effectiveness, the original CREATE framework
+relies on unsigned bipartite graphs, which introduce two
+significant structural bottlenecks. First, it suffers from polarity
+blindness; by treating all observed interactions as positive, it
+ignores explicit negative feedback (e.g., low ratings or skips),
+
+leading to label noise and an inability to model user aversion.
+Second, it is limited by pairwise collapse, where higherorder multi-way relationships—such as a user’s entire session
+history or co-purchase groups—are reduced to isolated binary
+links. This simplification results in a loss of complex collaborative context that pairwise edges cannot distinguish. Third,
+the framework is hindered by exposure bias. Because unsigned
+bipartite GNNs typically treat all unobserved interactions as
+negative signals, the model fails to distinguish between items a
+user actively disliked and those they simply never encountered,
+leading to suboptimal generalization.
+In this paper, we propose two extensions to the CREATE
+framework to recover this lost structural information:
+CREATE-Pone (Signed Variant): We replace the unsigned encoder with a signed GNN [2] that learns dual
+interest and disinterest embeddings. The alignment framework is extended to a multi-objective task: the sequential
+user representation is aligned with the global interest view
+to maximize knowledge transfer, while simultaneously
+being constrained to be orthogonal to the disinterest view.
+This allows the transformer to inherit collaborative preferences while explicitly suppressing signals associated with
+user aversion.
+• CREATE-Uni (Hypergraph Variant): We leverage a
+unified hypergraph framework [3] to model user histories as hyperedges. This transition enables the model
+to capture multi-way collaborative signals with 1-GWL
+expressive power, strictly exceeding the topological limits
+of traditional bipartite GNNs like LightGCN.
+•
+
+Our contributions include the formalization of these signed
+and higher-order alignment objectives, a theoretical analysis of
+their expressive advantages, and an extensive empirical evaluation across five benchmark datasets. The remainder of this
+paper is organized as follows: Section II reviews related work,
+Section III presents the methodology, Section IV provides
+theoretical analysis, and Section V describes the experimental
+setup.
+II. R ELATED W ORK
+The evolution of recommendation systems has moved from
+modeling isolated sequences to capturing global structural
+dependencies, and recently, toward the alignment of these two
+distinct paradigms.
+
+A. Sequential Recommendation
+Sequential recommendation focuses on predicting the next
+item based on a user’s chronological interaction history.
+Early models utilized Recurrent Neural Networks (RNNs),
+but the field has been revolutionized by Transformer-based
+architectures. SASRec [4] adopted a self-attention mechanism
+to identify relevant items in a sequence, while BERT4Rec
+[5] introduced bidirectional modeling via masked language
+objectives. To improve robustness, CL4SRec [6] integrated
+contrastive learning to ensure that different augmentations of
+the same sequence yield similar representations. However,
+these models primarily focus on local dependencies and often
+lack a global perspective of item-item collaborative signals.
+B. Graph-based Collaborative Filtering
+Graph Neural Networks (GNNs) explicitly model user–item
+interactions as a bipartite graph to capture long-range collaborative signals. This paradigm involves learning d-dimensional
+node embeddings for both users (eu ) and items (ei ) by
+aggregating information from their respective neighborhoods.
+NGCF [7] first introduced neighborhood aggregation to recommendation, but was later simplified by LightGCN [8], which
+removed non-linear activations and weight matrices to improve
+efficiency and performance:
+X
+1
+(k)
+p
+ei
+(1a)
+e(k+1)
+=
+u
+|N
+(u)||N
+(i)|
+i∈N (u)
+X
+1
+(k+1)
+p
+ei
+=
+e(k)
+(1b)
+u
+|N
+(i)||N
+(u)|
+u∈N (i)
+After K layers of propagation, the final embeddings are
+typically a weighted sum or average of the embeddings
+at each layer. Predicted scores are then computed via the
+inner product between the final user and item embeddings:
+ŷui = e⊤
+u ei .While GNNs are highly effective for capturing
+global structural patterns, they suffer from two primary issues
+in dynamic settings. First, they are inherently limited by the
+1-dimensional Weisfeiler-Leman (1-WL) test, meaning they
+primarily capture pairwise dependencies and fail to recognize
+higher-order multi-way correlations. Second, they face the
+folding-in problem: generating recommendations for a new
+user or a new session at inference time requires re-running
+expensive message-passing operations across the global graph
+or retraining the model entirely. GNNs typically lack the
+flexibility to handle the real-time evolution of user interests
+due to this high computational cost at test time. To avoid this
+bottleneck, modern hybrid systems utilize sequential models
+for inference, relying on the GNN only during the training
+phase to provide an enriched, structural grounding for the
+sequential item embeddings.
+C. Cross-Representation Knowledge Transfer
+The CREATE framework [1] serves as the primary basis
+for this work, bridging the gap between local sequential patterns and global collaborative structures through representation
+alignment. The framework utilizes a dual-encoder architecture:
+
+a sequential encoder (such as SASRec [4] or BERT4Rec [5])
+processes the interaction history to generate a temporal user
+representation hu , while a graph encoder (typically LightGCN
+[8] or UltraGCN) processes the global bipartite graph to
+produce structural user embeddings zu and item embeddings
+zi .The core innovation of CREATE is the use of the Barlow
+Twins objective [9] to align these two distinct views. After
+batch standardization of hu and zu , the model computes a
+cross-correlation matrix C, where the alignment loss Lalign
+forces the sequential representation to inherit structural context
+by driving C toward the identity matrix:
+X
+X
+Lalign =
+(1 − Cii)2 + λ
+Cij 2
+(2)
+i
+
+i̸=j
+
+The first term ensures invariance (alignment), while the second term minimizes redundancy between the dimensions.
+To ensure the sequential encoder effectively learns from the
+structural grounding, the framework adopts a joint training
+objective:
+L = Llocal + ωglobal Lglobal + ωalignLalign
+
+(3)
+
+Here, Llocal represents the next-item prediction loss for the
+sequential model, Lglobal is the recommendation loss for
+the GNN (e.g., BPR), and ω are weighting hyperparameters.
+Predicted scores are then computed via the inner product
+between the sequential user and graph item embeddings:
+ŷui = h⊤
+u zi , thus the model eliminates the need for the
+graph encoder during inference, allowing for efficient realtime recommendation using only the sequential encoder. Our
+work extends this objective by replacing the standard bipartite
+GNN with more expressive signed and hypergraph encoders.
+D. Hypergraph Modeling and UniGNN
+To capture multi-way relationships (e.g., items co-purchased
+in a single session), hypergraph-based models have emerged.
+HGNN [10] and HNHN [11] provide frameworks for highorder correlation modeling. UniGNN [3] generalized these
+approaches into a two-stage message-passing framework:
+
+
+(
+he = ϕ1 {xj }j∈e
+(Node to Hyperedge)
+(4)
+
+x̃i = ϕ2 xi , {he }e∈Ei
+(Hyperedge to Node)
+Furthermore, DHCN [12] demonstrated that modeling sessions
+as hyperedges allows the capture of higher-order signals that
+traditional graphs collapse into pairwise links. Our CREATEUni extension leverages this 1-GWL expressive power to
+enrich sequential grounding.
+E. Signed Graph Learning
+Despite the success of alignment frameworks, most GNNbased recommenders operate on unsigned bipartite graphs,
+treating all observed interactions as positive signals. This
+introduces significant label noise and exposure bias, as the
+model cannot distinguish between items a user actively disliked and those they simply never encountered. To address
+this, Pone-GNN [2] introduces a signed graph framework
+that explicitly models negative feedback by partitioning the
+
+global interaction set E into two disjoint subsets: a positive
+interaction graph Gp = (V, Ep ) and a negative interaction
+graph Gn = (V, En ).The framework employs two independent
+message-passing branches to learn dual representations for
+each node: an interest embedding z ∈ Rd derived from Gp ,
+and a disinterest embedding v ∈ Rd derived from Gn . These
+node embeddings are optimized via a contrastive learning
+loss that ensures the latent spaces are well-separated and
+informative. For the final recommendation task, the model
+utilizes a dual feedback-aware loss LDF to maximize the
+likelihood of observed interactions within their respective
+polarities:
+X
+X
+
+
+LDF = −
+log σ z⊤
+log σ −vu⊤ vj . (5)
+u zi −
+(u,i)∈Ep
+
+(u,j)∈En
+
+Our CREATE-Pone extension integrates this signed modeling
+into the alignment framework, enabling the sequential encoder
+to explicitly suppress aversion signals.
+
+On the positive graph Gp and negative graph Gn , updates
+are
+z(k+1)
+=
+u
+
+A. CREATE-Pone: Signed Graph Variant
+We partition E into positive interactions Ep (ratings ≥ 4
+or explicit likes) and negative interactions En (ratings ≤ 3
+or explicit dislikes), yielding two disjoint graphs. This fixed
+threshold is a practical initialization; recent work such as
+ReFINe and ReFINe++ [13], [14] suggests LLM-assisted
+refinement can reclassify ambiguous low ratings by modeling
+user-specific preference patterns. Exploring these adaptive
+heuristics is a promising future direction:
+Gp = (U, I, Ep ),
+
+Gn = (U, I, En ).
+
+zi
+p
+,
+|N
+(u)|
+|Np (i)|
+p
+i∈N (u)
+
+(7a)
+
+p
+
+(k)
+1 + ϵp (k)
+(k+1)
+zi
+=
+z +
+|Np (i)| i
+
+(k)
+
+zu
+p
+,
+|N
+(i)|
+|Np (u)|
+p
+u∈N (i)
+X
+
+(7b)
+
+p
+
+(k)
+
+1 + ϵn (k)
+vu(k+1) =
+v +
+|Nn (u)| u
+
+(k)
+
+vi
+
+X
+p
+i∈Nn (u)
+
+|Nn (u)| |Nn (i)|
+
+(k)
+
+(k+1)
+
+vi
+
+=
+
+1 + ϵn (k)
+v +
+|Nn (i)| i
+
+, (7c)
+
+(k)
+
+vu
+
+X
+p
+u∈Nn (i)
+
+. (7d)
+
+|Nn (i)| |Nn (u)|
+
+In Eq. (7)a and (7)b are computed on the positive graph Gp ,
+while (7)c and (7)d are computed analogously on the negative
+graph Gn . The final embeddings are layer-averaged:
+K−1
+
+zv =
+
+III. P ROPOSED M ETHODOLOGY
+Let U and I denote the sets of users and items, respectively.
+Each user u ∈ U has a timestamped interaction history
+Hu = (iu1 , . . . , iu|Hu | ). We retain the shared embedding layer,
+the sequential encoder (SASRec with full softmax crossentropy loss Llocal ), and the two-phase training procedure
+(graph/hypergraph warm-up followed by joint optimization)
+from the original CREATE framework.
+
+(k)
+
+(k)
+X
+1 + ϵp (k)
+zu +
+|Np (u)|
+
+1 X (k)
+zv ,
+K
+
+K−1
+
+vv =
+
+k=0
+
+1 X (k)
+vv .
+K
+
+(8)
+
+k=0
+
+The global loss is defined as follows.
+• Dual feedback-aware loss LDF :
+X
+LDF = −
+ln σ(ŷu,i − ŷu,j ) −
+(u,i,j)∈Bp
+
+X
+
+ln σ(ŷu,j − ŷu,i ) ,
+
+(u,i,j)∈Bn
+
+(9)
+with
+
+(
+if (u, i, j) ∈ Bp ,
+z⊤
+u zi ,
+ŷu,i =
+⊤
+b · vu vi , if (u, i, j) ∈ Bn ,
+(
+z⊤
+if (u, i, j) ∈ Bp ,
+u zj ,
+ŷu,j =
+⊤
+vu vj , if (u, i, j) ∈ Bn .
+
+(10)
+
+Here, ŷu,i denotes the predicted similarity score between
+user u and item i.
+• Contrastive learning loss LCL :
+LCL = −
+
+1
+N
+
+X
+
+log
+
+(u,i,j)∈Bp
+(u,i′ ,j ′ )∈Bn
+
+exp(z⊤
+u zi /τ )
+.
+exp(z⊤
+z
+/τ
+)
++
+exp(vu⊤ vi′ /τ )
+u i
+(11)
+
+Each node v ∈ U ∪ I is assigned two initial embeddings:
+
+The total global loss is
+
+(0)
+d
+z(0)
+v , vv ∈ R
+
+(interest from Gp , disinterest from Gn ).
+We construct two training sets for mini-batch learning:
+Dp = {(u, i, j) | (u, i) ∈ Ep , j ∈
+/ Np (u), u ∈ U, i, j ∈ I},
+(6a)
+Dn = {(u, i, j) | (u, i) ∈ En , j ∈
+/ Nn (u), u ∈ U, i, j ∈ I}.
+(6b)
+Mini-batches sampled from these sets are denoted by Bp ⊂ Dp
+and Bn ⊂ Dn , respectively.
+For layers k = 0, . . . , K − 1, we perform dual-branch
+propagation on both signed graphs.
+
+Lglobal = LDF + LCL
+
+(12)
+
+For user sequence Su = (i1 , . . . , it ):
+xk = zik + pk ,
+
+hu = Transformer(x1 , . . . , xt )[t],
+
+(13)
+
+where only interest embeddings zik are used as input, and pk
+is the learnable positional embedding for the k-th position in
+the sequence. The transformer loss is the standard full softmax
+cross-entropy:
+Llocal = −
+
+X
+(u,t)
+
+exp(h⊤
+u zit+1 )
+.
+log P
+⊤z )
+exp(h
+u j
+j∈I
+
+Here, j indexes all candidate items in the item set I.
+
+(14)
+
+After batch standardization of h̃u , z̃u , ṽu :
+X
+X
+hz 2
+Lalign =
+(1 − Ciihz )2 + λ
+(Cij
+)
+i
+
+i̸=j
+
+(15)
+
+X
+hv 2
++µ
+(Cij
+) ,
+
+(u,t)
+
+i,j
+
+where C hz and C hv are cross-correlation matrices between
+batch-normalized representations (h̃u , z̃u ) and (h̃u , ṽu ), respectively; the first two terms align hu with interest zu
+(Barlow Twins style), and the third enforces orthogonality to
+disinterest vu .
+The total loss is
+L = Llocal + wglobal Lglobal + walign Lalign .
+
+(16)
+
+Training proceeds in two phases: (1) Warm-up — train only
+Pone-GNN using Lglobal ; (2) Joint — end-to-end optimization
+of L.
+B. CREATE-Uni: Hypergraph Variant
+Let U be the set of users, I the set of items and V = U ∪ I.
+Each observed interaction is a pair (u, i, τ ) where u ∈ U ,
+i ∈ I and τ ∈ R is the interaction timestamp.
+Fix a session length t > 0 (hours). For every user u we
+partition u’s timeline into su contiguous sessions of length t.
+Denote the r-th session time interval for user u by
+(u)
+
+Tu,r = [τ0
+
+(u)
+
++ (r − 1)t, τ0
+
++ rt],
+
+where pk denotes the learnable positional embedding at position k. with loss
+X
+exp(h⊤
+u git+1 )
+.
+(21)
+Llocal = −
+log P
+⊤
+j exp(hu gj )
+
+r = 1, . . . , su
+
+(u)
+
+where τ0 is a chosen reference time for u (e.g. first interaction or a global anchor). The set of items that u interacted
+with during session r is
+Hu,r := { i ∈ I | ∃ τ ∈ Tu,r s.t. (u, i, τ ) observed }.
+Define the session hyperedge (for user u, session r) as
+
+Here, j indexes all candidate items in I.
+Standard Barlow Twins between the sequential state hu and
+hypergraph user embedding gu :
+X
+X hg
+Lalign =
+(1 − Ciihg )2 + λ
+(Cij )2 .
+(22)
+i
+
+Here, C is the cross-correlation matrix between the batchnormalized representations h̃u and g̃u .
+Training follows the same two-phase schedule as CREATEPone.
+At inference, both variants use only the sequential encoder
+with the enriched item embeddings (zi for CREATE-Pone, gi
+for CREATE-Uni). For a user representation hu , prediction
+scores are computed by inner product with enriched item
+embeddings, i.e., ŷu,i = h⊤
+u ei , where ei = zi for CREATEPone and ei = gi for CREATE-Uni.
+IV. T HEORETICAL A NALYSIS
+We organise the analysis into two parts. Section IV-A motivates CREATE-Pone by identifying two concrete deficiencies
+of unsigned LightGCN — exposure bias and polarity blindness
+— and explaining how the signed dual-branch construction and
+orthogonality alignment term each address them. Section IV-B
+justifies CREATE-Uni by invoking the established 1-WL /
+1-GWL expressivity hierarchy [3], [15] and constructing an
+explicit user pair that LightGCN conflates but UniGNN separates.
+A. CREATE-Pone: Signed Modeling Advantages
+1) Setup and Notation: For every user u, the item universe
+I partitions into three disjoint subsets:
+
+eu,r := { u } ∪ Hu,r .
+
+The hypergraph is then
+
+H = (V, E),
+E := eu,r | u ∈ U, r = 1, . . . , su , Hu,r ̸= ∅ .
+We apply the two-stage UniGNN aggregation:
+he = ϕ1 ({xj }j∈e ),
+
+x̃v = ϕ2 (xv , {he }e∈Ev ),
+
+(17)
+
+where ϕ1 is mean aggregation and ϕ2 is instantiated as
+UniGCN, UniGAT, or UniGIN. Final embeddings are layeraveraged:
+K−1
+1 X (l+1)
+xv
+∀v ∈ V.
+(18)
+gv =
+K
+l=0
+
+We adopt pairwise ranking (BPR) on the hypergraph useritem scores:
+X X X
+Lglobal = −
+ln σ(gu⊤ gi − gu⊤ gj ).
+(19)
++
++
+u i∈Hu
+j ∈H
+/ u
+
+For sequence Su = (i1 , . . . , it ):
+xk = gik + pk ,
+
+hu = Transformer(x1 , . . . , xt )[t],
+
+i̸=j
+
+hg
+
+(20)
+
+I =
+
+Ou
+|{z}
+
+observed positives
+
+∪
+
+Du
+|{z}
+
+observed negatives
+
+∪
+
+Su
+|{z}
+
+,
+
+(23)
+
+never observed
+
+where Ou denotes items the user has explicitly liked (e.g.
+ratings ≥ 4), Du denotes items the user has explicitly disliked
+(e.g. ratings ≤ 3), and Su denotes items the user has never
+interacted with at all. All three sets are disjoint by construction.
+2) Limitation 1 — Exposure Bias in Unsigned BPR: Since
+LightGCN folds Du into the positive graph, BPR samples
+negatives exclusively from Su — items the user has simply
+never been exposed to. However, Su contains no genuine
+dislike signal: these are items the user may well enjoy but has
+never encountered. In practice |Su | ≫ |Du | for most users,
+so the model is trained to rank observed items above a vast
+pool of potentially enjoyable unseen items, receiving noisy
+and misleading supervision throughout.
+This is the exposure bias: the true negative evidence in Du
+is never used as such, while Su — which carries no genuine
+negative signal — is treated as the sole source of negative
+supervision.
+
+Resolution in CREATE-Pone. The dual feedback loss LDF
+(Eq. 9) draws negatives exclusively from Du ≡ En — items
+the user has explicitly disliked. Items from Su are never used
+as negative evidence, ensuring that every negative training
+signal is semantically meaningful.
+3) Limitation 2 — Polarity Blindness in LightGCN: Because LightGCN places all edges from Ou ∪ Du into a
+single unsigned graph, it has no awareness that Du represents
+negative feedback. Every item a user has rated — whether
+liked or disliked — is treated as a positive neighbour and
+contributes to the user embedding via message passing in
+exactly the same way.
+This is the polarity blindness of unsigned graphs. The user
+embedding becomes an indiscriminate mixture of interest and
+disinterest signals, with no mechanism to separate them. As a
+result, items in Du actively pull the user representation toward
+themselves during aggregation — the same direction as liked
+items. Any candidate item j similar to a disliked item a ∈ Du
+will therefore receive an inflated recommendation score via
+the inner product ŷuj = e⊤
+u ej , since a’s embedding has been
+folded into eu as if it were a preference. The more disliked
+items a user has interacted with, the more corrupted their
+embedding becomes.
+Resolution in CREATE-Pone. The dual-branch construction
+propagates interest embeddings zu solely on Gp (built from
+Ou ) and disinterest embeddings vu solely on Gn (built from
+Du ). Since Gp and Gn share no edges, the two branches are
+completely isolated — items from Du can never corrupt zu ,
+and the interest signal is preserved cleanly.
+4) Remark — Pull–Push Duality in Alignment: The alignment loss (Eq. 15) plays two complementary roles. The Barlow
+Twins term ∥C hz − I∥2F → 0 acts as a pull, aligning the
+sequential state hu toward the interest subspace of zu , so
+the transformer inherits collaborative signals from Ou . The
+orthogonality term µ∥C hv ∥2F → 0 acts as a push, driving
+the cross-correlation between hu and vu to zero and thereby
+preventing disinterest signals from Du from leaking into
+sequential recommendations.
+No such push exists in the original unsigned CREATE,
+which operates on a single graph over Ou ∪Du and has no loss
+term to stop the sequential encoder from absorbing aversion
+signals. CREATE-Pone’s alignment is therefore strictly richer.
+B. CREATE-Uni: Hypergraph Expressivity
+1) Established Results We Rely On: We use three results
+from the literature without reproving them:
+• GNNs ≤ 1-WL [15]: Any message-passing GNN (including LightGCN) is at most as powerful as the 1dimensional Weisfeiler-Leman (1-WL) graph isomorphism test. Two nodes that 1-WL cannot distinguish will
+receive identical embeddings from any such GNN.
+• UniGNN ≡ 1-GWL [3]: When the aggregation functions
+ϕ1 (node-to-hyperedge) and ϕ2 (hyperedge-to-node) are
+injective on multisets, UniGNN is equivalent in power
+to the 1-dimensional Generalized Weisfeiler-Leman (1GWL) test on hypergraphs.
+
+•
+
+1-GWL ≥ 1-WL [16]: 1-GWL is strictly more powerful
+than 1-WL on structures containing multi-way relationships, such as hyperedges of size ≥ 2, which pairwise
+graphs cannot natively represent.
+
+What remains to be shown is that the specific user-modeling
+scenario in CREATE-Uni actually instantiates the strict gap
+— i.e., that there is a concrete, interpretable user pair that
+LightGCN conflates but UniGNN separates.
+2) Proposition 1 — LightGCN Conflates Users with Identical Item Neighbourhoods: Claim. If two users u1 , u2 have
+N (u1 ) = N (u2 ) (the same set of interacted items) in the
+bipartite graph, LightGCN assigns them identical embeddings
+at every layer.
+Proof. By induction on layer k.
+Base case (k = 0): Users are initialised from the same
+(0)
+(0)
+distribution (standard practice); assume WLOG eu1 = eu2 .
+(k)
+(k)
+Inductive step: Assume eu1 = eu2 and every item i ∈
+(k)
+N (u1 ) = N (u2 ) has the same embedding ei (same item
+node, same embedding). Then
+(k)
+
+ei
+
+X
+
+e(k+1)
+=
+u1
+
+p
+i∈N (u1 )
+
+|N (u1 )||N (i)|
+(k)
+
+ei
+
+X
+
+=
+
+p
+i∈N (u2 )
+
+(24)
+
+|N (u2 )||N (i)|
+
+= e(k+1)
+.
+u2
+The layer-averaged final embeddings are therefore identical.
+Formally, this follows from N (u1 ) = N (u2 ) and the fact that
+1-WL cannot distinguish nodes with identical neighbourhood
+multisets [15].
+3) Proposition 2 — UniGNN Separates Users that Share
+Item Neighbourhoods but Have Different Session Structure:
+Claim. There exist users u1 , u2 with N (u1 ) = N (u2 ) (so
+LightGCN conflates them) whose session structure differs,
+and UniGNN with injective aggregation assigns them distinct
+embeddings.
+Construction. Let I = {a, b, c, d} with distinct initial
+embeddings.
+u1 has one session {a, b, c, d} — a single hyperedge e1 =
+{a, b, c, d}.
+• u2 has two sessions {a, b} and {c, d} — hyperedges e2 =
+{a, b} and e3 = {c, d}.
+•
+
+Both users have the same bipartite neighbourhood N (u1 ) =
+N (u2 ) = {a, b, c, d}.
+LightGCN cannot separate them. By Proposition IV-B2,
+(k)
+(k)
+eu1 = eu2 for all k.
+UniGNN separates them. Using sum aggregation for ϕ1 :
+he1 = ea + eb + ec + ed
+he2 = ea + eb ,
+
+(one hyperedge, size 4),
+
+he3 = ec + ed
+
+(two hyperedges, size 2 each).
+
+Now ϕ2 aggregates the multiset of incident hyperedge embeddings:
+
+
+(0)
+ẽ(1)
+=
+ϕ
+e
+,
+{{h
+}}
+,
+2 u1
+e
+u1
+| {z1 }
+1 element
+
+
+(1)
+(0)
+ẽu2 = ϕ2 eu2 , {{he2 , he3 }} .
+{z
+}
+|
+
+TABLE I: Dataset Statistics
+Dataset
+Amazon Beauty
+Amazon Books
+Yelp
+Yambda-50M
+KuaiRand-1K
+
+#Users
+729.6K
+776.4K
+41K
+8.2K
+1K
+
+#Items
+207.6K
+495.1K
+30K
+181K
+4M
+
+#Interactions
+6.6M
+9.5M
+2.1M
+881K
+11.7M
+
+2 elements
+
+The second arguments are multisets of different cardinality (1
+vs. 2) and different elements. ϕ2 maps distinct multisets to
+distinct outputs:
+(1)
+ẽ(1)
+u1 ̸= ẽu2 .
+UniGNN successfully distinguishes the two users.
+Semantic interpretation. u1 bought {a, b, c, d} together (e.g.,
+a complete skincare routine in one basket) — the co-purchase
+group is a meaningful collaborative signal. u2 bought {a, b}
+and {c, d} on separate occasions — each session carries its
+own coherence signal. LightGCN collapses these into the same
+representation; UniGNN encodes the structural difference,
+yielding richer item embeddings gi for the sequential encoder
+to align with.
+4) Corollary — CREATE-Uni Provides Richer Alignment
+Targets than CREATE: Statement. The Barlow Twins alignment loss Lalign (Eq. 22) conveys strictly more discriminative
+gradient signal to the sequential encoder under CREATE-Uni
+than under the original CREATE.
+Proof sketch. By Proposition IV-B3, u1 and u2 receive
+different hypergraph embeddings: gu1 ̸= gu2 . In a batch
+containing both users, the batch-normalised targets g̃u1 ̸= g̃u2
+contribute different columns to the cross-correlation matrix
+C hg , so the alignment loss generates informative gradients
+that push hu1 and hu2 apart.
+Under LightGCN, zu1 = zu2 (Proposition IV-B2), so
+both users produce identical alignment targets. The sequential encoder receives no gradient from Lalign to differentiate
+hu1 from hu2 , even though their behavioral patterns differ.
+The mutual information transferred via alignment is therefore
+strictly greater in CREATE-Uni.
+V. DATASETS
+We evaluate our method on five widely used recommendation datasets: Amazon Beauty(amazon-reviews-2023), Amazon Books(amazon-reviews-2023), Yelp, Yambda-50M, and
+KuaiRand-1K. All datasets are modeled as bipartite graphs
+G = (U , I, E), where U denotes users, I denotes items, and
+E denotes user–item interactions.
+Amazon Reviews 2023 (Beauty, Books): In these datasets,
+user nodes correspond to Amazon customers and item nodes
+correspond to products (beauty products or books respectively). An edge (u, i) represents a user review or purchase
+interaction with an item. Edge features include the review
+rating and timestamp of the interaction. Item node features
+are derived from product metadata such as category, title, and
+textual description when available. User nodes typically do
+not contain explicit features and are represented via learned
+embeddings.
+
+Yelp: In the Yelp dataset, user nodes represent Yelp users
+and item nodes represent local businesses. Edges correspond
+to user reviews of businesses. Edge attributes include rating
+scores and timestamps. Item node features are constructed
+from business metadata such as categories and attributes, while
+user nodes are represented implicitly through their interaction
+histories.
+Yambda-50M: Yambda-50M is a large-scale implicit feedback dataset derived from Yahoo! music interactions. User
+nodes represent listeners and item nodes correspond to music
+tracks. Edges denote implicit listening events between users
+and tracks. Edge features primarily consist of timestamps
+indicating when the interaction occurred. No explicit user or
+item features are provided; representations are learned directly
+from the interaction graph.
+KuaiRand-1K: KuaiRand-1K is a short-video recommendation dataset collected from the Kuaishou platform. User
+nodes represent viewers and item nodes correspond to short
+videos. Edges denote user exposure and interaction events such
+as clicks or watches. Edge features include timestamps and
+interaction signals (e.g., click or watch behavior). Item node
+features include video metadata such as category and content
+descriptors when available.
+R EFERENCES
+[1] A. Gimranov, T. Matveeva, V. Yusupov, A. Lysenko, E. Frolov,
+E. Sabitov, and R. Israfilov, “Cross-representation knowledge transfer for improved sequential recommendations,” in arXiv preprint
+arXiv:2602.23471, 2026.
+[2] Z. Liu, C. Wang, S. Zheng, C. Wu, K. Zheng, and Y. Song, “Pone-gnn:
+Integrating positive and negative feedback in graph neural networks for
+recommender systems,” ACM Transactions on Recommender Systems,
+vol. 3, no. 2, 2025.
+[3] J. Huang and J. Yang, “Unignn: a unified framework for graph and hypergraph neural networks,” in Proceedings of the Thirtieth International
+Joint Conference on Artificial Intelligence (IJCAI), 2021, pp. 2573–2579.
+[4] W.-C. Kang and J. Leskovec, “Self-attentive sequential recommendation,” in Proceedings of the 2018 IEEE International Conference on
+Data Mining (ICDM), 2018, pp. 197–206.
+[5] F. Sun, J. Liu, J. Wu, H. Pei, W. Lin, W. Ou, and P. Jiang, “Bert4rec:
+Sequential recommendation with bidirectional encoder representations
+from transformer,” in Proceedings of the 28th ACM International Conference on Information and Knowledge Management, 2019, pp. 1441–
+1450.
+[6] X. Xie, F. Zhang, Z. Sun, Y. Liu, S. Cheng, W. Jiao, and M. Onizuka,
+“Contrastive learning for sequential recommendation,” in Proceedings
+of the 45th International ACM SIGIR Conference on Research and
+Development in Information Retrieval, 2022, pp. 1259–1269.
+[7] X. Wang, X. He, M. Wang, F. Feng, and T.-S. Chua, “Neural graph
+collaborative filtering,” in Proceedings of the 42nd International ACM
+SIGIR Conference on Research and Development in Information Retrieval, 2019, pp. 165–174.
+[8] X. He, K. Deng, X. Wang, Y. Li, Y. Zhang, and M. Wang, “Lightgcn:
+Simplifying and powering graph convolution network for recommendation,” in Proceedings of the 43rd International ACM SIGIR Conference
+
+on Research and Development in Information Retrieval, 2020, pp. 639–
+648.
+[9] J. Zbontar, L. Jing, I. Misra, Y. LeCun, and S. Deny, “Barlow twins:
+Self-supervised learning via redundancy reduction,” in International
+Conference on Machine Learning. PMLR, 2021, pp. 12 310–12 320.
+[10] Y. Feng, H. You, Z. Zhang, R. Ji, and Y. Gao, “Hypergraph neural networks,” in Proceedings of the AAAI Conference on Artificial Intelligence,
+vol. 33, no. 01, 2019, pp. 3558–3565.
+[11] Y. Dong, W. Sawin, and Y. Bengio, “Hnhn: Hypergraph networks with
+hyperedge neurons,” arXiv preprint arXiv:2006.12271, 2020.
+[12] X. Xia, H. Yin, J. Yu, Q. Wang, L. Cui, and X. Zhang, “Self-supervised
+hypergraph convolutional networks for session-based recommendation,”
+in Proceedings of the AAAI Conference on Artificial Intelligence, vol. 35,
+no. 5, 2021, pp. 4503–4511.
+[13] C. Jeong, Y. Kang, and Y.-S. Cho, “Leveraging refined negative feedback
+with llm for recommender systems,” in Companion Proceedings of the
+ACM Web Conference 2025, ser. WWW ’25. New York, NY, USA:
+Association for Computing Machinery, 2025, p. 1028–1032. [Online].
+Available: https://doi.org/10.1145/3701716.3715538
+[14] C. Jeong and Y.-S. Cho, “Modeling of negative feedback refined via llm
+in recommender systems,” IEEE Access, vol. 13, pp. 144 160–144 172,
+August 2025.
+[15] K. Xu, W. Hu, J. Leskovec, and S. Jegelka, “How powerful are
+graph neural networks?” in International Conference on Learning
+Representations (ICLR), 2019. [Online]. Available: https://openreview.
+net/forum?id=ryGs6iA5Km
+[16] S. Zhang, C. Xin, and T. K. Dey, “Expressive higher-order link
+prediction through hypergraph symmetry breaking,” 2024. [Online].
+Available: https://arxiv.org/abs/2402.11339
+
+

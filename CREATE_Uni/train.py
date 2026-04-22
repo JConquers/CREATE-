@@ -147,6 +147,12 @@ def parse_args():
         dest="use_sequence",
         help="Disable sequence encoder",
     )
+    parser.add_argument(
+        "--session_length",
+        type=int,
+        default=86400,
+        help="Session length in seconds for hypergraph construction",
+    )
 
     # Training arguments
     parser.add_argument(
@@ -337,14 +343,17 @@ def main():
         train_df = pd.DataFrame({
             "user_id": data["train_user"].cpu().numpy(),
             "item_id": data["train_item"].cpu().numpy(),
+            "timestamp": data["train_time"].cpu().numpy() if "train_time" in data else None,
         })
         val_df = pd.DataFrame({
             "user_id": data["val_user"].cpu().numpy(),
             "item_id": data["val_item"].cpu().numpy(),
+            "timestamp": data["val_time"].cpu().numpy() if "val_time" in data else None,
         })
         test_df = pd.DataFrame({
             "user_id": data["test_user"].cpu().numpy(),
             "item_id": data["test_item"].cpu().numpy(),
+            "timestamp": data["test_time"].cpu().numpy() if "test_time" in data else None,
         })
 
         temp_dir = output_dir / "temp_data"
@@ -415,9 +424,11 @@ def main():
         vertex, edges, degV, degE = get_graph_structure(
             user_ids=data["train_user"],
             item_ids=data["train_item"],
+            timestamps=data.get("train_time", None),
             num_users=num_users,
             num_items=num_items,
             device=device,
+            session_length=args.session_length,
         )
         model.set_graph_structure(vertex, edges, degV, degE)
         logger.info(f"Graph structure: {len(vertex)} nodes in incidence matrix, {edges.max().item() + 1} edges")

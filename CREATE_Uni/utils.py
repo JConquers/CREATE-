@@ -435,9 +435,11 @@ def get_graph_structure(
     num_users: int,
     num_items: int,
     device: torch.device,
+    timestamps: Optional[torch.Tensor] = None,
+    session_length: int = 86400,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Prepare graph structure for UniGNN message passing.
+    Prepare graph structure for UniGNN message passing using session hyperedges.
 
     Args:
         user_ids: User IDs tensor (num_interactions,)
@@ -445,6 +447,8 @@ def get_graph_structure(
         num_users: Number of users
         num_items: Number of items
         device: Device to place tensors on
+        timestamps: timestamps of interactions (Optional)
+        session_length: Maximum temporal length to bound a user's isolated session.
 
     Returns:
         vertex: Row indices of incidence matrix (2*num_interactions,)
@@ -465,15 +469,58 @@ def get_graph_structure(
     items_shifted = item_ids + num_users
 
     # For UniGNN hypergraph representation:
-    # Each interaction is a hyperedge connecting exactly 2 nodes (user and item)
+    # A Session hyperedge connects the user and all items interacted with in that session window.
     vertex_list = []
     edges_list = []
 
-    for e_idx in range(num_interactions):
-        u = user_ids[e_idx].item()
-        i = items_shifted[e_idx].item()
-        vertex_list.extend([u, i])
-        edges_list.extend([e_idx, e_idx])
+    if timestamps is not None:
+        from collections import defaultdict
+        user_interactions = defaultdict(list)
+        for i in range(len(user_ids)):
+            u = user_ids[i].item()
+            it = items_shifted[i].item()
+            t = timestamps[i].item()
+            user_interactions[u].append((it, t))
+            
+        edge_idx_counter = 0
+        for u, history in user_interactions.items():
+            history.sort(key=lambda x: x[1])
+            if not history: continue
+            
+            curr_start = history[0][1]
+            curr_items = []
+            
+            for it, t in history:
+                if t - curr_start >= session_length:
+                    # Push hyperedge
+                    vertex_list.append(u)
+                    edges_list.append(edge_idx_counter)
+                    for c_it in curr_items:
+                        vertex_list.append(c_it)
+                        edges_list.append(edge_idx_counter)
+                    edge_idx_counter += 1
+                    
+                    curr_start = t
+                    curr_items = [it]
+                else:
+                    curr_items.append(it)
+                    
+            if curr_items:
+                vertex_list.append(u)
+                edges_list.append(edge_idx_counter)
+                for c_it in curr_items:
+                    vertex_list.append(c_it)
+                    edges_list.append(edge_idx_counter)
+                edge_idx_counter += 1
+        num_hyperedges = edge_idx_counter
+    else:
+        # Fallback if timestamps are missing
+        for e_idx in range(num_interactions):
+            u = user_ids[e_idx].item()
+            i = items_shifted[e_idx].item()
+            vertex_list.extend([u, i])
+            edges_list.extend([e_idx, e_idx])
+        num_hyperedges = num_interactions
 
     vertex = torch.tensor(vertex_list, dtype=torch.long, device=device)
     edges = torch.tensor(edges_list, dtype=torch.long, device=device)
@@ -482,11 +529,11 @@ def get_graph_structure(
     row = vertex.cpu().numpy()
     col = edges.cpu().numpy()
     data = np.ones(len(row))
-    H = sp.csr_matrix((data, (row, col)), shape=(total_nodes, num_interactions))
+    H = sp.csr_matrix((data, (row, col)), shape=(total_nodes, num_hyperedges))
 
     # Compute degrees
     degV_raw = np.array(H.sum(1)).flatten()  # Node degrees
-    degE_raw = np.array(H.sum(0)).flatten()  # Edge degrees (always 2 in bipartite)
+    degE_raw = np.array(H.sum(0)).flatten()  # Edge degrees (size of each session hyperedge)
 
     degV = torch.from_numpy(degV_raw).float().to(device)
     degE = torch.from_numpy(degE_raw).float().to(device)

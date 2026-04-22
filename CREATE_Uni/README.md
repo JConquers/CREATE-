@@ -308,6 +308,7 @@ The following fixes have been applied to the initial implementation:
 2. **TQDM Imports and Progress Descriptions**: Corrected the module import to `from tqdm import tqdm, trange`. Added specific descriptions to differentiate between "Warmup" and "Joint" training epochs.
 3. **Model Checkpointing**: Added model checkpointing `latest_checkpoint.pt` for all epochs as per requirement, instead of just tracking the best performing epoch conditionally. 
 4. **Warmup Epochs Command Line Interface**: Added missing `--warmup_epochs` argument inside `train.py` argument parser for fully customizable Warmup phases via CLI.
+5. **True Session Hypergraph Reconstruction**: Rewrote `get_graph_structure()` to properly generate session-based hyperedges spanning timestamp clusters (configured via `--session_length`) instead of blindly reducing every implicit transaction into an isolated 2-node bipartite subset. This unlocks the true 1-GWL expressiveness of UniGNN required by the CREATE++ formulation over standard frameworks like LightGCN.
 
 ## References
 
