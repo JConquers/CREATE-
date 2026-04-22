@@ -4,10 +4,8 @@ Loss functions for CREATE-Uni.
 Implements multiple objectives:
 1. LocalObjective: Standard cross-entropy for next-item prediction
 2. GlobalObjective: BPR-style ranking loss for collaborative filtering
-3. FusionObjective: Fusion task loss
-4. ContrastiveObjective: InfoNCE contrastive loss
-5. BarlowTwinsObjective: Redundancy reduction loss
-6. Combined losses for different model variants
+3. BarlowTwinsObjective: Redundancy reduction loss
+4. Combined losses for different model variants
 """
 
 import torch
@@ -80,108 +78,6 @@ class GlobalObjective(nn.Module):
         # BPR loss: -log(sigmoid(pos - neg))
         diff = positive_scores - negative_scores
         loss = -F.logsigmoid(diff + self.margin).mean()
-        return loss
-
-
-class FusionObjective(nn.Module):
-    """
-    Fusion objective: Additional ranking loss for fused representations.
-    """
-
-    def __init__(self, margin: float = 0.0):
-        super().__init__()
-        self.margin = margin
-
-    def forward(
-        self,
-        fusion_positive: torch.Tensor,
-        fusion_negative: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute fusion objective loss.
-
-        Args:
-            fusion_positive: Scores for positive items from fusion
-            fusion_negative: Scores for negative items from fusion
-
-        Returns:
-            loss: Scalar tensor
-        """
-        diff = fusion_positive - fusion_negative
-        loss = -F.logsigmoid(diff + self.margin).mean()
-        return loss
-
-
-class ContrastiveObjective(nn.Module):
-    """
-    Contrastive objective: InfoNCE loss for contrastive learning.
-
-    Encourages agreement between graph and sequence representations
-    of the same user/session.
-    """
-
-    def __init__(
-        self,
-        temperature: float = 1.0,
-        normalize_embeddings: bool = True,
-        reduction: str = "mean",
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.normalize_embeddings = normalize_embeddings
-        self.reduction = reduction
-        self.loss_fn = nn.CrossEntropyLoss(reduction=reduction)
-
-    def forward(
-        self,
-        fst_embeddings: torch.Tensor,
-        snd_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute contrastive objective loss.
-
-        Args:
-            fst_embeddings: First view embeddings (batch_size, dim)
-            snd_embeddings: Second view embeddings (batch_size, dim)
-
-        Returns:
-            loss: Scalar tensor
-        """
-        batch_size = fst_embeddings.shape[0]
-        assert batch_size == snd_embeddings.shape[0]
-
-        # Concatenate embeddings
-        combined = torch.cat([fst_embeddings, snd_embeddings], dim=0)
-
-        if self.normalize_embeddings:
-            combined = F.normalize(combined, p=2, dim=-1)
-
-        # Compute similarity matrix
-        similarity = combined @ combined.T / self.temperature
-
-        # Positive pairs are diagonal offsets by batch_size
-        positives = torch.cat(
-            [
-                torch.diagonal(similarity, offset=batch_size),
-                torch.diagonal(similarity, offset=-batch_size),
-            ]
-        ).reshape(2 * batch_size, 1)
-
-        # Create mask to exclude positives and self-similarity
-        mask = torch.ones(2 * batch_size, 2 * batch_size, dtype=torch.bool)
-        mask = mask.fill_diagonal_(False)
-        for i in range(batch_size):
-            mask[i, batch_size + i] = False
-            mask[batch_size + i, i] = False
-
-        # Get negative samples
-        negatives = similarity[mask].reshape(2 * batch_size, -1)
-
-        # Combine positives and negatives
-        logits = torch.cat([positives, negatives], dim=1)
-        labels = torch.zeros(2 * batch_size, dtype=torch.long, device=logits.device)
-
-        loss = self.loss_fn(logits, labels) / 2
         return loss
 
 
@@ -347,68 +243,18 @@ class CREATEUniLoss(nn.Module):
             )
             total_loss += self.global_coef * global_loss
 
-        # Barlow Twins objective (if configured)
-        if (
-            self.barlow_twins_coef > 0
-            and self.barlow_twins_objective is not None
-            and "contrastive_fst_embeddings" in model_outputs
-            and "contrastive_snd_embeddings" in model_outputs
-        ):
-            barlow_loss = self.barlow_twins_objective(
-                model_outputs["contrastive_fst_embeddings"],
-                model_outputs["contrastive_snd_embeddings"],
-            )
-            total_loss += self.barlow_twins_coef * barlow_loss
+        # Barlow Twins objective: only apply after warmup epochs
+        if epoch_num >= warmup:
+            if (
+                self.barlow_twins_coef > 0
+                and self.barlow_twins_objective is not None
+                and "alignment_fst_embeddings" in model_outputs
+                and "alignment_snd_embeddings" in model_outputs
+            ):
+                barlow_loss = self.barlow_twins_objective(
+                    model_outputs["alignment_fst_embeddings"],
+                    model_outputs["alignment_snd_embeddings"],
+                )
+                total_loss += self.barlow_twins_coef * barlow_loss
 
         return total_loss
-
-
-class MRGSRecLoss(nn.Module):
-    """
-    Loss function from MRGSRec/UnderDog models.
-    Included for compatibility with CREATE baseline.
-    """
-
-    def __init__(
-        self,
-        local_coef: float = 1.0,
-        global_coef: float = 0.1,
-        fusion_coef: float = 0.1,
-        contrastive_coef: float = 0.01,
-        contrastive_tau: float = 1.0,
-    ):
-        super().__init__()
-        self.local_coef = local_coef
-        self.global_coef = global_coef
-        self.fusion_coef = fusion_coef
-        self.contrastive_coef = contrastive_coef
-
-        self.local_objective = LocalObjective()
-        self.global_objective = GlobalObjective()
-        self.fusion_objective = FusionObjective()
-        self.contrastive_objective = ContrastiveObjective(temperature=contrastive_tau)
-
-    def forward(
-        self,
-        batch: dict,
-        model_outputs: dict,
-    ) -> torch.Tensor:
-        loss = (
-            self.local_coef * self.local_objective(
-                model_outputs["local_prediction"],
-                batch["labels.ids"],
-            )
-            + self.global_coef * self.global_objective(
-                model_outputs["global_positive"],
-                model_outputs["global_negative"],
-            )
-            + self.fusion_coef * self.fusion_objective(
-                model_outputs["fusion_positive"],
-                model_outputs["fusion_negative"],
-            )
-            + self.contrastive_coef * self.contrastive_objective(
-                model_outputs["contrastive_fst_embeddings"],
-                model_outputs["contrastive_snd_embeddings"],
-            )
-        )
-        return loss

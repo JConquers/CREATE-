@@ -294,7 +294,7 @@ class CREATEUni(nn.Module):
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
-        return_contrastive: bool = False,
+        return_alignment: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through CREATE-Uni.
@@ -307,13 +307,13 @@ class CREATEUni(nn.Module):
                 - mask: Attention mask (batch_size, seq_len)
                 - labels.ids: Target items (batch_size,) or (num_masked,)
                 - mlm_mask: MLM positions for BERT4Rec (optional)
-            return_contrastive: Whether to return contrastive embeddings
+            return_alignment: Whether to return alignment embeddings
 
         Returns:
             outputs: Dictionary with:
                 - local_prediction: Item scores (batch_size, num_items) or (num_masked, num_items)
-                - contrastive_fst_embeddings: Graph projections (for contrastive loss)
-                - contrastive_snd_embeddings: Sequence projections (for contrastive loss)
+                - alignment_fst_embeddings: Graph projections (for alignment loss)
+                - alignment_snd_embeddings: Sequence projections (for alignment loss)
         """
         outputs = {}
 
@@ -366,8 +366,8 @@ class CREATEUni(nn.Module):
             scores = fused @ all_item_emb.T
             outputs["local_prediction"] = scores
 
-            # Contrastive learning embeddings
-            if return_contrastive:
+            # Alignment learning embeddings
+            if return_alignment:
                 if self.seq_encoder_type == "bert4rec" and mlm_mask is not None:
                     # For BERT4Rec, average sequence embeddings per user
                     seq_emb_per_user = torch.zeros_like(graph_user_emb)
@@ -380,8 +380,8 @@ class CREATEUni(nn.Module):
                 else:
                     graph_proj = self.graph_projector(graph_user_emb)
                     seq_proj = self.seq_projector(seq_emb)
-                outputs["contrastive_fst_embeddings"] = graph_proj
-                outputs["contrastive_snd_embeddings"] = seq_proj
+                outputs["alignment_fst_embeddings"] = graph_proj
+                outputs["alignment_snd_embeddings"] = seq_proj
 
         elif self.use_graph:
             # Graph-only mode

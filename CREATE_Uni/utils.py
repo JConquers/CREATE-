@@ -122,7 +122,7 @@ def inference(
     with torch.no_grad():
         for batch in dataloader:
             move_batch(batch, device)
-            outputs = model(batch, return_contrastive=False)
+            outputs = model(batch, return_alignment=False)
 
             # Compute loss if provided
             if loss_fn is not None:
@@ -192,7 +192,7 @@ def train(
         early_stopping_rounds: Patience for early stopping
         scheduler: Optional learning rate scheduler
         log_interval: Log every N epochs
-        warmup_epochs: Number of warmup epochs (only contrastive + global loss)
+        warmup_epochs: Number of warmup epochs (only global loss)
         output_dir: Directory to save model checkpoints
 
     Returns:
@@ -202,7 +202,7 @@ def train(
     logger = create_logger("train", level=logging.INFO)
     logger.info(f"Starting training for {num_epochs} epochs on device: {device}")
     if warmup_epochs > 0:
-        logger.info(f"Warmup epochs: {warmup_epochs} (contrastive + global loss only)")
+        logger.info(f"Warmup epochs: {warmup_epochs} (global loss only)")
 
     train_start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
     train_end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
@@ -227,7 +227,7 @@ def train(
         pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=desc)
         for step, batch in pbar:
             move_batch(batch, device)
-            outputs = model(batch, return_contrastive=(loss_fn.contrastive_coef > 0))
+            outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0))
 
             loss = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
 
