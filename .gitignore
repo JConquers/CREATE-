@@ -1,0 +1,11 @@
+dataset/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+CREATE
+Pone-GNN
+UniGNN
+.claude
