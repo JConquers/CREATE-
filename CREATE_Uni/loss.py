@@ -260,7 +260,7 @@ class CREATEUniLoss(nn.Module):
     """
     Combined loss for CREATE-Uni model.
 
-    Combines local, global, fusion, and contrastive objectives
+    Combines local, global, and barlow-twins/alignment objectives
     with configurable weights. Supports warmup epochs (CREATE-style)
     where local loss is not applied.
     """
@@ -269,15 +269,11 @@ class CREATEUniLoss(nn.Module):
         self,
         local_coef: float = 1.0,
         global_coef: float = 0.1,
-        fusion_coef: float = 0.1,
-        contrastive_coef: float = 0.01,
-        barlow_twins_coef: float = 0.0,
+        barlow_twins_coef: float = 0.01,
         # Local objective params
         label_smoothing: float = 0.0,
         # Global objective params
         global_margin: float = 0.0,
-        # Contrastive objective params
-        contrastive_temperature: float = 1.0,
         # Barlow Twins params
         barlow_lambda: float = 0.1,
         proj_dim: int = 64,
@@ -288,18 +284,12 @@ class CREATEUniLoss(nn.Module):
         super().__init__()
         self.local_coef = local_coef
         self.global_coef = global_coef
-        self.fusion_coef = fusion_coef
-        self.contrastive_coef = contrastive_coef
         self.barlow_twins_coef = barlow_twins_coef
         self.warmup_epochs = warmup_epochs
 
         # Initialize objectives
         self.local_objective = LocalObjective(label_smoothing=label_smoothing)
         self.global_objective = GlobalObjective(margin=global_margin)
-        self.fusion_objective = FusionObjective(margin=global_margin)
-        self.contrastive_objective = ContrastiveObjective(
-            temperature=contrastive_temperature
-        )
 
         if barlow_twins_coef > 0:
             projector = nn.Sequential(
@@ -356,30 +346,6 @@ class CREATEUniLoss(nn.Module):
                 model_outputs["global_negative"],
             )
             total_loss += self.global_coef * global_loss
-
-        # Fusion objective (if available)
-        if (
-            self.fusion_coef > 0
-            and "fusion_positive" in model_outputs
-            and "fusion_negative" in model_outputs
-        ):
-            fusion_loss = self.fusion_objective(
-                model_outputs["fusion_positive"],
-                model_outputs["fusion_negative"],
-            )
-            total_loss += self.fusion_coef * fusion_loss
-
-        # Contrastive objective (if embeddings provided)
-        if (
-            self.contrastive_coef > 0
-            and "contrastive_fst_embeddings" in model_outputs
-            and "contrastive_snd_embeddings" in model_outputs
-        ):
-            contrastive_loss = self.contrastive_objective(
-                model_outputs["contrastive_fst_embeddings"],
-                model_outputs["contrastive_snd_embeddings"],
-            )
-            total_loss += self.contrastive_coef * contrastive_loss
 
         # Barlow Twins objective (if configured)
         if (

@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument(
         "--graph_conv_type",
         type=str,
-        default="UniSAGE",
+        default="UniGCN",
         choices=["UniGCN", "UniGIN", "UniSAGE", "UniGAT"],
         help="Graph convolution type",
     )
@@ -212,16 +212,16 @@ def parse_args():
         help="Global objective weight",
     )
     parser.add_argument(
-        "--contrastive_coef",
+        "--barlow_twins_coef",
         type=float,
         default=0.01,
-        help="Contrastive objective weight",
+        help="Barlow twins alignment objective weight",
     )
     parser.add_argument(
-        "--contrastive_temperature",
+        "--barlow_lambda",
         type=float,
-        default=1.0,
-        help="Contrastive loss temperature",
+        default=0.1,
+        help="Barlow Twins lambda parameter",
     )
 
     # Other arguments
@@ -442,8 +442,8 @@ def main():
     loss_fn = CREATEUniLoss(
         local_coef=args.local_coef,
         global_coef=args.global_coef,
-        contrastive_coef=args.contrastive_coef,
-        contrastive_temperature=args.contrastive_temperature,
+        barlow_twins_coef=args.barlow_twins_coef,
+        barlow_lambda=args.barlow_lambda,
         embedding_dim=args.embedding_dim,
     )
 

@@ -28,7 +28,7 @@ class UniGNNEncoder(nn.Module):
         num_items: int,
         embedding_dim: int,
         n_layers: int = 2,
-        conv_type: str = "UniSAGE",
+        conv_type: str = "UniGCN",
         heads: int = 8,
         dropout: float = 0.1,
         use_norm: bool = True,
@@ -57,7 +57,7 @@ class UniGNNEncoder(nn.Module):
             "UniSAGE": UniSAGEConv,
             "UniGAT": UniGATConv,
         }
-        ConvClass = conv_map.get(conv_type, UniSAGEConv)
+        ConvClass = conv_map.get(conv_type, UniGCNConv)
 
         # Build convolution layers
         self.convs = nn.ModuleList()

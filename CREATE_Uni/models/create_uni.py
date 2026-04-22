@@ -82,7 +82,7 @@ class CREATEUni(nn.Module):
         embedding_dim: int = 64,
         # Graph encoder params
         graph_n_layers: int = 2,
-        graph_conv_type: str = "UniSAGE",
+        graph_conv_type: str = "UniGCN",
         graph_heads: int = 8,
         graph_dropout: float = 0.1,
         graph_use_norm: bool = True,
