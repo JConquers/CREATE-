@@ -7,7 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter
+from torch_geometric.utils import scatter
 
 
 def glorot(tensor: torch.Tensor):
