@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
-from tqdm import trange
+from tqdm import tqdm, trange
 
 # Set seaborn style for plots
 try:
@@ -173,6 +173,8 @@ def train(
     early_stopping_rounds: int = 10,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     log_interval: int = 1,
+    warmup_epochs: int = 0,
+    output_dir: Optional[str] = None,
 ) -> Tuple[List[Dict], Dict]:
     """
     Training loop for CREATE-Uni.
@@ -190,6 +192,8 @@ def train(
         early_stopping_rounds: Patience for early stopping
         scheduler: Optional learning rate scheduler
         log_interval: Log every N epochs
+        warmup_epochs: Number of warmup epochs (only contrastive + global loss)
+        output_dir: Directory to save model checkpoints
 
     Returns:
         history: List of per-epoch metrics
@@ -197,6 +201,8 @@ def train(
     """
     logger = create_logger("train", level=logging.INFO)
     logger.info(f"Starting training for {num_epochs} epochs on device: {device}")
+    if warmup_epochs > 0:
+        logger.info(f"Warmup epochs: {warmup_epochs} (contrastive + global loss only)")
 
     train_start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
     train_end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
@@ -215,11 +221,15 @@ def train(
         total_loss = 0.0
         num_batches = 0
 
-        for batch in train_dataloader:
+        # Use tqdm for batch-level progress
+        phase = "Warmup" if epoch < warmup_epochs else "Joint"
+        desc = f"Epoch {epoch + 1}/{num_epochs} ({phase})"
+        pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=desc)
+        for step, batch in pbar:
             move_batch(batch, device)
             outputs = model(batch, return_contrastive=(loss_fn.contrastive_coef > 0))
 
-            loss = loss_fn(batch, outputs, epoch_num=epoch)
+            loss = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
 
             optimizer.zero_grad()
             loss.backward()
@@ -227,6 +237,9 @@ def train(
 
             total_loss += loss.item()
             num_batches += 1
+
+            # Update progress bar with current loss
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
 
@@ -256,6 +269,28 @@ def train(
             best_epoch = epoch
             best_metrics = epoch_metrics.copy()
 
+            # Save best model checkpoint
+            if output_dir:
+                checkpoint_path = Path(output_dir) / "best_model.pt"
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_ndcg@10": val_ndcg,
+                    "best_metrics": best_metrics,
+                }, checkpoint_path)
+                logger.info(f"Saved best model checkpoint to {checkpoint_path}")
+
+        # Save checkpoint for all epochs (latest model tracking)
+        if output_dir:
+            latest_path = Path(output_dir) / "latest_checkpoint.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "metrics": epoch_metrics,
+            }, latest_path)
+
         # Learning rate scheduling
         if scheduler is not None:
             scheduler.step()
@@ -273,6 +308,18 @@ def train(
         if epoch - best_epoch >= early_stopping_rounds:
             logger.info(f"Early stopping at epoch {epoch} (no improvement for {early_stopping_rounds} epochs)")
             break
+
+    # Save final model checkpoint
+    if output_dir:
+        final_checkpoint_path = Path(output_dir) / "final_model.pt"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_ndcg@10": val_ndcg,
+            "best_metrics": best_metrics,
+        }, final_checkpoint_path)
+        logger.info(f"Saved final model checkpoint to {final_checkpoint_path}")
 
     if train_start:
         train_end.record()

@@ -261,7 +261,8 @@ class CREATEUniLoss(nn.Module):
     Combined loss for CREATE-Uni model.
 
     Combines local, global, fusion, and contrastive objectives
-    with configurable weights.
+    with configurable weights. Supports warmup epochs (CREATE-style)
+    where local loss is not applied.
     """
 
     def __init__(
@@ -281,6 +282,8 @@ class CREATEUniLoss(nn.Module):
         barlow_lambda: float = 0.1,
         proj_dim: int = 64,
         embedding_dim: int = 64,
+        # Warmup params (CREATE-style)
+        warmup_epochs: int = 0,
     ):
         super().__init__()
         self.local_coef = local_coef
@@ -288,6 +291,7 @@ class CREATEUniLoss(nn.Module):
         self.fusion_coef = fusion_coef
         self.contrastive_coef = contrastive_coef
         self.barlow_twins_coef = barlow_twins_coef
+        self.warmup_epochs = warmup_epochs
 
         # Initialize objectives
         self.local_objective = LocalObjective(label_smoothing=label_smoothing)
@@ -315,6 +319,7 @@ class CREATEUniLoss(nn.Module):
         batch: dict,
         model_outputs: dict,
         epoch_num: int = 0,
+        warmup_epochs: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute combined loss.
@@ -322,20 +327,23 @@ class CREATEUniLoss(nn.Module):
         Args:
             batch: Input batch with labels
             model_outputs: Model outputs with predictions and embeddings
-            epoch_num: Current epoch (for warmup)
+            epoch_num: Current epoch
+            warmup_epochs: Number of warmup epochs (if None, uses self.warmup_epochs)
 
         Returns:
             total_loss: Combined loss scalar
         """
+        warmup = warmup_epochs if warmup_epochs is not None else self.warmup_epochs
         total_loss = 0.0
 
-        # Local objective (always)
-        if "local_prediction" in model_outputs and "labels.ids" in batch:
-            local_loss = self.local_objective(
-                model_outputs["local_prediction"],
-                batch["labels.ids"],
-            )
-            total_loss += self.local_coef * local_loss
+        # Local objective: only apply after warmup epochs (CREATE-style)
+        if epoch_num >= warmup:
+            if "local_prediction" in model_outputs and "labels.ids" in batch:
+                local_loss = self.local_objective(
+                    model_outputs["local_prediction"],
+                    batch["labels.ids"],
+                )
+                total_loss += self.local_coef * local_loss
 
         # Global objective (if available)
         if (

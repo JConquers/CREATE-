@@ -300,6 +300,15 @@ Standard sequential recommendation metrics:
 - **Recall@K**: Recall at K
 - **MAP@K**: Mean Average Precision at K
 
+## Implementation Fixes
+
+The following fixes have been applied to the initial implementation:
+
+1. **Shape Mismatch Fix**: Fixed `unsqueeze(0).expand` issue in `models/create_uni.py` while using BERT4Rec by implementing proper sequence alignment with `repeat_interleave` utilizing MLM mask limits.
+2. **TQDM Imports and Progress Descriptions**: Corrected the module import to `from tqdm import tqdm, trange`. Added specific descriptions to differentiate between "Warmup" and "Joint" training epochs.
+3. **Model Checkpointing**: Added model checkpointing `latest_checkpoint.pt` for all epochs as per requirement, instead of just tracking the best performing epoch conditionally. 
+4. **Warmup Epochs Command Line Interface**: Added missing `--warmup_epochs` argument inside `train.py` argument parser for fully customizable Warmup phases via CLI.
+
 ## References
 
 ### Papers

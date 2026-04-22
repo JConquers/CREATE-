@@ -180,6 +180,12 @@ def parse_args():
         help="Early stopping patience",
     )
     parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=5,
+        help="Number of warmup epochs",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -454,6 +460,8 @@ def main():
         num_epochs=args.num_epochs,
         early_stopping_rounds=args.early_stopping_rounds,
         log_interval=args.log_interval,
+        warmup_epochs=args.warmup_epochs,
+        output_dir=str(output_dir),
     )
 
     # Save results

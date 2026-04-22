@@ -351,8 +351,8 @@ class CREATEUni(nn.Module):
                 # Need to expand graph_user_emb to match
                 if mlm_mask is not None:
                     # Expand user embedding for each masked position
-                    num_masked = seq_emb.shape[0]
-                    graph_user_expanded = graph_user_emb.unsqueeze(0).expand(num_masked, -1)
+                    counts = mlm_mask.sum(dim=1).to(torch.int64)
+                    graph_user_expanded = graph_user_emb.repeat_interleave(counts, dim=0)
                     fused = self.fuse_representations(graph_user_expanded, seq_emb)
                 else:
                     fused = seq_emb
