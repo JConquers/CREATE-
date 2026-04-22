@@ -50,12 +50,14 @@ class Projector(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, (nn.Linear, nn.Embedding)):
-                torch.nn.init.xavier_uniform_(module.weight.data)
+                if hasattr(module, 'weight') and module.weight is not None:
+                    torch.nn.init.xavier_uniform_(module.weight.data)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    module.bias.data.zero_()
             elif isinstance(module, nn.BatchNorm1d):
-                module.bias.data.zero_()
-                module.weight.data.fill_(1.0)
-            elif isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+                if module.affine:
+                    module.bias.data.zero_()
+                    module.weight.data.fill_(1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.projector(x)
