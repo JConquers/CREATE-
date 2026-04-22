@@ -334,6 +334,9 @@ def evaluate_ranking(
     amp_dtype: torch.dtype,
     filter_seen: bool,
     seen_items_lookup: dict[int, list[int]] | None,
+    neg_penalty_weight: float,
+    neg_filter_threshold: float,
+    neg_chunk_size: int,
 ) -> dict:
     if not eval_examples:
         return {
@@ -351,6 +354,8 @@ def evaluate_ranking(
 
     graph_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
     interest_item_embeddings = graph_outputs["interest_item_embeddings"]
+    disinterest_user_embeddings = graph_outputs["disinterest_user_embeddings"]
+    disinterest_item_embeddings = graph_outputs["disinterest_item_embeddings"]
 
     eval_topk = min(max(1, topk), interest_item_embeddings.size(0))
 
@@ -381,12 +386,14 @@ def evaluate_ranking(
             device=device,
         )
         attention_mask = torch.zeros((batch_len, max_len), dtype=torch.bool, device=device)
+        batch_user_ids = torch.empty((batch_len,), dtype=torch.long, device=device)
 
-        for row_idx, (_, context, _) in enumerate(batch_examples):
+        for row_idx, (user_id, context, _) in enumerate(batch_examples):
             context_tensor = torch.tensor(context, dtype=torch.long, device=device)
             seq_len = context_tensor.numel()
             input_ids[row_idx, :seq_len] = context_tensor
             attention_mask[row_idx, :seq_len] = True
+            batch_user_ids[row_idx] = int(user_id)
 
         autocast_ctx = amp_autocast_context(
             use_amp=use_amp,
@@ -404,6 +411,20 @@ def evaluate_ranking(
                 attention_mask=attention_mask,
             )
             scores = last_hidden @ interest_item_embeddings.t()
+
+            if neg_penalty_weight > 0 or neg_filter_threshold > -1e8:
+                disinterest_users = disinterest_user_embeddings[batch_user_ids]
+                chunk_size = max(1, int(neg_chunk_size))
+                for start in range(0, disinterest_item_embeddings.size(0), chunk_size):
+                    end = min(start + chunk_size, disinterest_item_embeddings.size(0))
+                    neg_chunk = disinterest_users @ disinterest_item_embeddings[start:end].t()
+                    if neg_penalty_weight > 0:
+                        scores[:, start:end] = scores[:, start:end] - neg_penalty_weight * neg_chunk
+                    if neg_filter_threshold > -1e8:
+                        scores[:, start:end] = scores[:, start:end].masked_fill(
+                            neg_chunk > neg_filter_threshold,
+                            float("-inf"),
+                        )
 
         if filter_seen:
             # Match common recommendation protocol: remove seen context items from candidates.
@@ -582,6 +603,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="When evaluating on test split, include validation interactions in user context.",
+    )
+    parser.add_argument(
+        "--eval-neg-penalty-weight",
+        type=float,
+        default=0.25,
+        help="Subtract weight * disinterest score from ranking scores during evaluation.",
+    )
+    parser.add_argument(
+        "--eval-neg-filter-threshold",
+        type=float,
+        default=1e9,
+        help="Mask items with disinterest score above this threshold during evaluation.",
+    )
+    parser.add_argument(
+        "--eval-neg-chunk-size",
+        type=int,
+        default=16384,
+        help="Item chunk size for disinterest-aware eval scoring to limit memory.",
     )
     parser.add_argument(
         "--eval-every",
@@ -818,6 +857,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         f"eval_topk={args.eval_topk}",
         f"eval_min_rating={args.eval_min_rating}",
         f"eval_include_val_context={args.eval_include_val_context}",
+        f"eval_neg_penalty_weight={args.eval_neg_penalty_weight}",
+        f"eval_neg_filter_threshold={args.eval_neg_filter_threshold}",
+        f"eval_neg_chunk_size={args.eval_neg_chunk_size}",
         f"eval_filter_seen={args.eval_filter_seen}",
         f"eval_filter_seen_users={0 if eval_seen_items is None else len(eval_seen_items)}",
         f"mixed_precision={use_amp}",
@@ -968,6 +1010,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         skipped_refresh_low_mem += 1
 
                 if run_full_joint:
+                    joint_triplets = triplet_sampler.sample(batch["user_ids"], device=device)
+
                     # Keep signed sparse propagation in fp32; sparse CUDA matmul does not support fp16.
                     autocast_ctx = nullcontext()
                     with autocast_ctx:
@@ -980,7 +1024,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         losses = criterion(
                             outputs=outputs,
                             batch=batch,
-                            triplets=empty_triplets,
+                            triplets=joint_triplets,
                             warmup=False,
                         )
                 else:
@@ -1215,6 +1259,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 amp_dtype=amp_dtype,
                 filter_seen=args.eval_filter_seen,
                 seen_items_lookup=eval_seen_items,
+                neg_penalty_weight=args.eval_neg_penalty_weight,
+                neg_filter_threshold=args.eval_neg_filter_threshold,
+                neg_chunk_size=args.eval_neg_chunk_size,
             )
             eval_elapsed = time.time() - eval_start_time
             print(
