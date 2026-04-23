@@ -352,15 +352,18 @@ class CREATEUni(nn.Module):
             scores = seq_emb @ all_item_emb.T
             outputs["local_prediction"] = scores
 
-            # Global objective (BPR): positive/negative scores from graph embeddings
+            # Global objective (BPR, Eq. 19): g_u^T * g_i_pos vs g_u^T * g_i_neg
             # Used during warmup epochs to pre-condition the graph encoder
-            if user_ids is not None and self.use_graph:
-                # Sample negative items for BPR loss
+            if user_ids is not None and labels is not None and self.use_graph:
+                # Positive items: the actual target items from the batch
+                pos_item_emb = all_item_emb[labels]  # (batch_size, D)
+                # Negative items: randomly sampled items
                 neg_item_ids = torch.randint(
-                    1, self.num_items + 1, (batch_size,), device=user_ids.device
+                    0, all_item_emb.shape[0], (batch_size,), device=device
                 )
-                pos_scores = (graph_user_emb * all_item_emb[user_ids]).sum(dim=1, keepdim=True)
-                neg_scores = (graph_user_emb * all_item_emb[neg_item_ids]).sum(dim=1, keepdim=True)
+                neg_item_emb = all_item_emb[neg_item_ids]  # (batch_size, D)
+                pos_scores = (graph_user_emb * pos_item_emb).sum(dim=1)
+                neg_scores = (graph_user_emb * neg_item_emb).sum(dim=1)
                 outputs["global_positive"] = pos_scores
                 outputs["global_negative"] = neg_scores
 
