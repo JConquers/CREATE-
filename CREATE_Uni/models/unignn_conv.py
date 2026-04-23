@@ -66,11 +66,11 @@ class UniGCNConv(nn.Module):
         X = self.W(X)
         Xve = X[vertex]
         Xe = scatter(Xve, edges, dim=0, reduce=self.first_aggregate)
-        Xe = Xe * degE
+        Xe = Xe * degE.unsqueeze(-1)  # (E,) -> (E,1) for broadcasting with (E,D)
 
         Xev = Xe[edges]
         Xv = scatter(Xev, vertex, dim=0, reduce="sum", dim_size=N)
-        Xv = Xv * degV
+        Xv = Xv * degV.unsqueeze(-1)  # (N,) -> (N,1) for broadcasting with (N,D)
 
         X = Xv
 
@@ -112,11 +112,11 @@ class UniGCNIIConv(nn.Module):
 
         Xve = X[vertex]
         Xe = scatter(Xve, edges, dim=0, reduce=self.first_aggregate)
-        Xe = Xe * degE
+        Xe = Xe * degE.unsqueeze(-1)  # (E,) -> (E,1) for broadcasting with (E,D)
 
         Xev = Xe[edges]
         Xv = scatter(Xev, vertex, dim=0, reduce="sum", dim_size=N)
-        Xv = Xv * degV
+        Xv = Xv * degV.unsqueeze(-1)  # (N,) -> (N,1) for broadcasting with (N,D)
 
         X = Xv
 
