@@ -220,17 +220,16 @@ def train(
     best_metrics = {}
     history = []
 
-    for epoch in trange(num_epochs, desc="Training"):
+    for epoch in range(num_epochs):
         # Training
         model.train()
         total_loss = 0.0
         num_batches = 0
 
-        # Use tqdm for batch-level progress
         phase = "Warmup" if epoch < warmup_epochs else "Joint"
-        desc = f"Epoch {epoch + 1}/{num_epochs} ({phase})"
-        pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=desc)
-        for step, batch in pbar:
+        desc = f"[{phase}] Epoch {epoch + 1}/{num_epochs}"
+
+        for batch in tqdm(train_dataloader, desc=desc, mininterval=30, ncols=100):
             move_batch(batch, device)
             outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0))
 
@@ -242,9 +241,6 @@ def train(
 
             total_loss += loss.item()
             num_batches += 1
-
-            # Update progress bar with current loss
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
 
@@ -269,10 +265,12 @@ def train(
 
         # Check for improvement (using NDCG@10 as primary metric)
         val_ndcg = val_metrics.get("ndcg@10", 0.0)
+        improved = ""
         if val_ndcg > best_val_metric:
             best_val_metric = val_ndcg
             best_epoch = epoch
             best_metrics = epoch_metrics.copy()
+            improved = " ★"
 
             # Save best model checkpoint
             if output_dir:
@@ -284,7 +282,6 @@ def train(
                     "val_ndcg@10": val_ndcg,
                     "best_metrics": best_metrics,
                 }, checkpoint_path)
-                logger.info(f"Saved best model checkpoint to {checkpoint_path}")
 
         # Save checkpoint for all epochs (latest model tracking)
         if output_dir:
@@ -300,13 +297,13 @@ def train(
         if scheduler is not None:
             scheduler.step()
 
-        # Logging
+        # Log one clean line per epoch
         if (epoch + 1) % log_interval == 0:
             logger.info(
-                f"Epoch {epoch + 1}/{num_epochs}: "
-                f"train_loss={avg_train_loss:.4f}, "
-                f"val_ndcg@10={val_ndcg:.4f}, "
-                f"test_ndcg@10={test_metrics.get('ndcg@10', 0.0):.4f}"
+                f"[{phase:6s}] Epoch {epoch + 1:3d}/{num_epochs} | "
+                f"loss={avg_train_loss:.4f} | "
+                f"val_ndcg@10={val_ndcg:.4f} | "
+                f"test_ndcg@10={test_metrics.get('ndcg@10', 0.0):.4f}{improved}"
             )
 
         # Early stopping
