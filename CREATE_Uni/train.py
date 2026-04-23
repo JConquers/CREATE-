@@ -339,16 +339,70 @@ def main():
             "item_id": data["train_item"].cpu().numpy(),
             "timestamp": data["train_time"].cpu().numpy() if "train_time" in data else None,
         })
-        val_df = pd.DataFrame({
-            "user_id": data["val_user"].cpu().numpy(),
-            "item_id": data["val_item"].cpu().numpy(),
-            "timestamp": data["val_time"].cpu().numpy() if "val_time" in data else None,
-        })
-        test_df = pd.DataFrame({
-            "user_id": data["test_user"].cpu().numpy(),
-            "item_id": data["test_item"].cpu().numpy(),
-            "timestamp": data["test_time"].cpu().numpy() if "test_time" in data else None,
-        })
+        # Build val/test CSVs with full history context.
+        # SequenceDataset groups by user_id and Collator splits off the last item
+        # as the target, so each user's CSV rows must contain:
+        #   val:  [train_items..., val_target]
+        #   test: [train_items..., val_item, test_target]
+        # The leave-one-out split in BeautyDataset already separated them,
+        # so we reconstitute the full sequences here.
+
+        # Index training interactions per user (sorted by timestamp)
+        train_history = {}  # user_id -> list of (item, timestamp) sorted by time
+        for u, it, t in zip(
+            data["train_user"].cpu().numpy(),
+            data["train_item"].cpu().numpy(),
+            data["train_time"].cpu().numpy() if "train_time" in data else [0] * len(data["train_user"]),
+        ):
+            train_history.setdefault(int(u), []).append((int(it), float(t)))
+        for u in train_history:
+            train_history[u].sort(key=lambda x: x[1])
+
+        # Val: training history + val target
+        val_rows = {"user_id": [], "item_id": [], "timestamp": []}
+        for u, it, t in zip(
+            data["val_user"].cpu().numpy(),
+            data["val_item"].cpu().numpy(),
+            data["val_time"].cpu().numpy() if "val_time" in data else [0] * len(data["val_user"]),
+        ):
+            u = int(u)
+            for hist_item, hist_t in train_history.get(u, []):
+                val_rows["user_id"].append(u)
+                val_rows["item_id"].append(hist_item)
+                val_rows["timestamp"].append(hist_t)
+            val_rows["user_id"].append(u)
+            val_rows["item_id"].append(int(it))
+            val_rows["timestamp"].append(float(t))
+        val_df = pd.DataFrame(val_rows)
+
+        # Test: training history + val item + test target
+        val_lookup = {}  # user_id -> (item, timestamp)
+        for u, it, t in zip(
+            data["val_user"].cpu().numpy(),
+            data["val_item"].cpu().numpy(),
+            data["val_time"].cpu().numpy() if "val_time" in data else [0] * len(data["val_user"]),
+        ):
+            val_lookup[int(u)] = (int(it), float(t))
+
+        test_rows = {"user_id": [], "item_id": [], "timestamp": []}
+        for u, it, t in zip(
+            data["test_user"].cpu().numpy(),
+            data["test_item"].cpu().numpy(),
+            data["test_time"].cpu().numpy() if "test_time" in data else [0] * len(data["test_user"]),
+        ):
+            u = int(u)
+            for hist_item, hist_t in train_history.get(u, []):
+                test_rows["user_id"].append(u)
+                test_rows["item_id"].append(hist_item)
+                test_rows["timestamp"].append(hist_t)
+            if u in val_lookup:
+                test_rows["user_id"].append(u)
+                test_rows["item_id"].append(val_lookup[u][0])
+                test_rows["timestamp"].append(val_lookup[u][1])
+            test_rows["user_id"].append(u)
+            test_rows["item_id"].append(int(it))
+            test_rows["timestamp"].append(float(t))
+        test_df = pd.DataFrame(test_rows)
 
         temp_dir = output_dir / "temp_data"
         temp_dir.mkdir()
