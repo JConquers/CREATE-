@@ -101,6 +101,7 @@ class SequentialEncoder(nn.Module):
         item_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         return_last: bool = True,
+        precomputed_emb: torch.Tensor = None,
     ):
         """
         Forward pass through sequence encoder.
@@ -109,34 +110,28 @@ class SequentialEncoder(nn.Module):
             item_ids: Tensor of shape (batch_size, seq_len) with item indices
             attention_mask: Boolean tensor of shape (batch_size, seq_len), True = real token
             return_last: If True, return only last position embedding; else return all
+            precomputed_emb: Optional precomputed item embeddings (batch_size, seq_len, D).
+                             If provided, bypasses internal embedding lookup (Eq. 20: x_k = g_{i_k} + p_k).
 
         Returns:
             sequence_output: Tensor of shape (batch_size, embedding_dim) if return_last else (batch_size, seq_len, embedding_dim)
         """
         batch_size, seq_len = item_ids.shape
 
-        # Get item embeddings
-        item_emb = self.item_embeddings(item_ids)  # (B, L, D)
-        item_emb *= math.sqrt(self.embedding_dim)
+        # Get item embeddings: use graph-learned if provided, else raw lookup
+        if precomputed_emb is not None:
+            item_emb = precomputed_emb  # (B, L, D) — graph-learned embeddings g_{i_k}
+            # Eq. 20: x_k = g_{i_k} + p_k — no sqrt scaling for graph embeddings
+        else:
+            item_emb = self.item_embeddings(item_ids)  # (B, L, D) — raw lookup fallback
+            item_emb = item_emb * math.sqrt(self.embedding_dim)
 
-        # Position embeddings (reverse order like SASRec)
-        positions = (
-            torch.arange(seq_len - 1, -1, -1, device=item_ids.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        pos_mask = positions < attention_mask.sum(dim=1, keepdim=True)
-        positions = positions[pos_mask]
+        # Position embeddings (Standard causal forward mapping)
+        positions = torch.arange(seq_len, device=item_ids.device).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.position_embeddings(positions)
 
-        # Create masked position embeddings tensor
-        pos_emb_full = torch.zeros(
-            batch_size, seq_len, self.embedding_dim, device=item_ids.device
-        )
-        pos_emb_full[pos_mask] = pos_emb
-
-        # Combine embeddings
-        seq_emb = item_emb + pos_emb_full
+        # Combine embeddings: Eq. 20 x_k = g_{i_k} + p_k
+        seq_emb = item_emb + pos_emb
         seq_emb = self.layer_norm(seq_emb)
         seq_emb = self.dropout(seq_emb)
 
@@ -149,12 +144,10 @@ class SequentialEncoder(nn.Module):
         )
 
         if return_last:
-            # Get last valid position for each sequence
-            lengths = attention_mask.sum(dim=1) - 1  # (B,)
-            last_mask = attention_mask.gather(dim=1, index=lengths.unsqueeze(1))
-            last_emb = seq_emb.gather(
-                dim=1, index=lengths.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.embedding_dim)
-            ).squeeze(1)
+            # Safely fetch the last valid token chronologically (agnostic to left/right sequence padding)
+            last_indices = attention_mask.int().cumsum(dim=1).argmax(dim=1)
+            gather_indices = last_indices.unsqueeze(1).unsqueeze(2).expand(-1, -1, self.embedding_dim)
+            last_emb = seq_emb.gather(dim=1, index=gather_indices).squeeze(1)
             return last_emb
 
         return seq_emb
@@ -246,6 +239,7 @@ class Bert4RecEncoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         mlm_mask: torch.Tensor = None,
+        precomputed_emb: torch.Tensor = None,
     ):
         """
         Forward pass through BERT4Rec encoder.
@@ -254,6 +248,8 @@ class Bert4RecEncoder(nn.Module):
             input_ids: Tensor of shape (batch_size, seq_len) with item indices (may contain MASK tokens)
             attention_mask: Boolean tensor of shape (batch_size, seq_len)
             mlm_mask: Boolean tensor indicating positions to predict (batch_size, seq_len)
+            precomputed_emb: Optional precomputed item embeddings (batch_size, seq_len, D).
+                             If provided, bypasses internal embedding lookup (Eq. 20: x_k = g_{i_k} + p_k).
 
         Returns:
             masked_embeddings: Embeddings at masked positions (num_masked, embedding_dim)
@@ -261,15 +257,19 @@ class Bert4RecEncoder(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
-        # Get embeddings
-        item_emb = self.item_embeddings(input_ids)
-        item_emb *= math.sqrt(self.embedding_dim)
+        # Get embeddings: use graph-learned if provided, else raw lookup
+        if precomputed_emb is not None:
+            item_emb = precomputed_emb  # (B, L, D) — graph-learned embeddings g_{i_k}
+            # Eq. 20: x_k = g_{i_k} + p_k — no sqrt scaling for graph embeddings
+        else:
+            item_emb = self.item_embeddings(input_ids)
+            item_emb = item_emb * math.sqrt(self.embedding_dim)
 
         # Position embeddings
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.position_embeddings(positions)
 
-        # Combine
+        # Combine: Eq. 20 x_k = g_{i_k} + p_k
         seq_emb = item_emb + pos_emb
         seq_emb = self.layer_norm(seq_emb)
         seq_emb = self.dropout(seq_emb)

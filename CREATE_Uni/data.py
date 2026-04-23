@@ -250,13 +250,12 @@ class Collator:
                 processed["item.ids"].extend(context_items)
                 processed["item.length"].append(len(context_items))
             elif self.mode == "train":
-                # SASRec: use all but last for prediction
+                # SASRec: use all but last for prediction (next-item prediction)
                 context_items = sample["item.ids"][:-1] if len(sample["item.ids"]) > 1 else sample["item.ids"]
                 processed["item.ids"].extend(context_items)
                 processed["item.length"].append(len(context_items))
-                # Target is next item
-                if len(sample["item.ids"]) > 1:
-                    processed["labels.ids"].extend(sample["item.ids"][1:])
+                # Target is the last item (next item after sequence)
+                processed["labels.ids"].append(sample["item.ids"][-1])
             else:
                 # Validation/Test: use all but last item
                 context_items = sample["item.ids"][:-1]
@@ -271,23 +270,17 @@ class Collator:
 
         # Pad sequences
         item_sequences = []
-        labels = []
         current_idx = 0
         for i, seq_len in enumerate(processed["item.length"].tolist()):
-            if self.mode == "train" and self.seq_encoder_type != "bert4rec":
-                # SASRec train: labels are interleaved
-                labels.extend(processed["labels.ids"][current_idx : current_idx + seq_len])
             current_idx += seq_len
             item_sequences.append(processed["item.ids"][current_idx - seq_len : current_idx])
 
         padded_items, attention_mask = self._pad_sequence(item_sequences)
-        processed["padded_sequence_ids"] = padded_items
+        processed["item.ids"] = padded_items  # Overwrite flat list with padded tensor (matches model's batch.get("item.ids"))
         processed["mask"] = attention_mask
 
-        if self.mode == "train" and self.seq_encoder_type != "bert4rec":
-            processed["labels.ids"] = torch.tensor(labels, dtype=torch.long)
-        else:
-            processed["labels.ids"] = torch.tensor(processed["labels.ids"], dtype=torch.long)
+        # Labels: one per sample (next-item prediction)
+        processed["labels.ids"] = torch.tensor(processed["labels.ids"], dtype=torch.long)
 
         # Apply MLM masking for BERT4Rec training
         if self.mode == "train" and self.seq_encoder_type == "bert4rec":
@@ -297,11 +290,8 @@ class Collator:
             processed["input_ids"] = masked_ids
             processed["mlm_labels"] = mlm_labels
             processed["mlm_mask"] = mlm_mask
-            # Flatten labels for masked positions
+            # Flatten labels for masked positions (BERT4Rec MLM style)
             processed["labels.ids"] = mlm_labels[mlm_mask]
-
-        # Remove intermediate item.ids list
-        del processed["item.ids"]
 
         return processed
 

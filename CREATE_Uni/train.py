@@ -9,8 +9,7 @@ Usage:
         --output_dir ./outputs \
         --seq_encoder sasrec \
         --embedding_dim 64 \
-        --graph_conv_type UniSAGE \
-        --fusion_type concat
+        --graph_conv_type UniGCN
 """
 
 import argparse
@@ -117,13 +116,7 @@ def parse_args():
         default=50,
         help="Maximum sequence length",
     )
-    parser.add_argument(
-        "--fusion_type",
-        type=str,
-        default="concat",
-        choices=["concat", "sum", "gate"],
-        help="Fusion mechanism for graph and sequence embeddings",
-    )
+
     parser.add_argument(
         "--use_graph",
         action="store_true",
@@ -413,7 +406,7 @@ def main():
         seq_n_layers=args.seq_n_layers,
         seq_heads=args.seq_heads,
         max_sequence_length=args.max_sequence_length,
-        fusion_type=args.fusion_type,
+
         use_graph=args.use_graph,
         use_sequence=args.use_sequence,
         seq_encoder_type=args.seq_encoder,
@@ -445,7 +438,7 @@ def main():
         global_coef=args.global_coef,
         barlow_twins_coef=args.barlow_twins_coef,
         barlow_lambda=args.barlow_lambda,
-        embedding_dim=args.embedding_dim,
+        warmup_epochs=args.warmup_epochs,
     )
 
     # Build optimizer

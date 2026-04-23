@@ -62,19 +62,32 @@ class UniGNNEncoder(nn.Module):
         # Build convolution layers
         self.convs = nn.ModuleList()
         for i in range(n_layers):
-            in_dim = embedding_dim if i == 0 else embedding_dim * heads
-            out_dim = embedding_dim
+            # All layers: embedding_dim -> embedding_dim (heads=1 effectively for non-attention)
+            # For UniGAT: output is heads * out_channels, so we set out_channels = embedding_dim // heads
+            if conv_type == "UniGAT":
+                # For attention, ensure heads divides embedding_dim
+                assert embedding_dim % heads == 0, f"embedding_dim ({embedding_dim}) must be divisible by heads ({heads})"
+                out_channels_per_head = embedding_dim // heads
+                in_dim = embedding_dim if i == 0 else embedding_dim
+                out_dim = embedding_dim
+                layer_heads = heads
+            else:
+                # For non-attention convs, heads is effectively 1
+                in_dim = embedding_dim if i == 0 else embedding_dim
+                out_dim = embedding_dim
+                layer_heads = 1
+
             kwargs = {
                 "in_channels": in_dim,
                 "out_channels": out_dim,
-                "heads": heads if conv_type == "UniGAT" else 1,
+                "heads": layer_heads,
                 "dropout": dropout,
                 "first_aggregate": first_aggregate,
                 "use_norm": use_norm,
             }
             if conv_type == "UniSAGE":
                 kwargs["second_aggregate"] = second_aggregate
-                
+
             conv = ConvClass(**kwargs)
             self.convs.append(conv)
 

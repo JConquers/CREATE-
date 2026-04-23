@@ -87,16 +87,16 @@ class BarlowTwinsObjective(nn.Module):
 
     Encourages invariance between graph and sequence views while
     reducing redundancy between features.
+
+    Expects already-projected embeddings (model handles projection).
     """
 
     def __init__(
         self,
-        projector: nn.Module,
         lambda_param: float = 0.1,
         batch_norm: bool = True,
     ):
         super().__init__()
-        self.projector = projector
         self.lambda_param = lambda_param
         self.batch_norm = batch_norm
 
@@ -116,15 +116,15 @@ class BarlowTwinsObjective(nn.Module):
         Compute Barlow Twins loss.
 
         Args:
-            fst_embeddings: First view embeddings (batch_size, dim)
-            snd_embeddings: Second view embeddings (batch_size, dim)
+            fst_embeddings: First view embeddings (batch_size, dim) - already projected
+            snd_embeddings: Second view embeddings (batch_size, dim) - already projected
 
         Returns:
             loss: Scalar tensor
         """
-        # Project embeddings
-        z_i = self.projector(fst_embeddings)
-        z_j = self.projector(snd_embeddings)
+        # Embeddings are already projected by model's graph_projector/seq_projector
+        z_i = fst_embeddings
+        z_j = snd_embeddings
 
         # L2 normalize
         z_i = F.normalize(z_i, p=2, dim=-1)
@@ -132,10 +132,14 @@ class BarlowTwinsObjective(nn.Module):
 
         batch_size = z_i.shape[0]
 
-        # Batch normalize (standardize)
+        # Batch normalize (standardize) - use larger eps for stability
         if self.batch_norm:
-            z_i_norm = (z_i - z_i.mean(0)) / (z_i.std(0) + 1e-8)
-            z_j_norm = (z_j - z_j.mean(0)) / (z_j.std(0) + 1e-8)
+            z_i_mean = z_i.mean(0)
+            z_i_std = z_i.std(0)
+            z_j_mean = z_j.mean(0)
+            z_j_std = z_j.std(0)
+            z_i_norm = (z_i - z_i_mean) / (z_i_std + 1e-6)
+            z_j_norm = (z_j - z_j_mean) / (z_j_std + 1e-6)
         else:
             z_i_norm = z_i
             z_j_norm = z_j
@@ -188,14 +192,8 @@ class CREATEUniLoss(nn.Module):
         self.global_objective = GlobalObjective(margin=global_margin)
 
         if barlow_twins_coef > 0:
-            projector = nn.Sequential(
-                nn.Linear(embedding_dim, proj_dim),
-                nn.BatchNorm1d(proj_dim, affine=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(proj_dim, proj_dim),
-            )
             self.barlow_twins_objective = BarlowTwinsObjective(
-                projector=projector, lambda_param=barlow_lambda
+                lambda_param=barlow_lambda
             )
         else:
             self.barlow_twins_objective = None

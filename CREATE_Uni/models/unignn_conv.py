@@ -293,8 +293,13 @@ class UniGATConv(nn.Module):
         a_ev = alpha_e[edges]
         alpha = self.leaky_relu(a_ev)
 
-        from torch_geometric.utils import softmax
-        alpha = softmax(alpha, vertex, num_nodes=N)
+        # Softmax over edges grouped by vertex (replacement for torch_geometric.utils.softmax)
+        # Compute exp(alpha - max_per_group) for numerical stability
+        alpha_max = scatter(alpha, vertex, dim=0, dim_size=N, reduce="max")[vertex]
+        alpha_exp = torch.exp(alpha - alpha_max)
+        alpha_sum = scatter(alpha_exp, vertex, dim=0, dim_size=N, reduce="sum")[vertex]
+        alpha = alpha_exp / (alpha_sum + 1e-16)
+
         alpha = self.attn_drop(alpha)
         alpha = alpha.unsqueeze(-1)
 

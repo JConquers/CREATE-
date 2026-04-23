@@ -4,8 +4,13 @@ CREATE-Uni: Unified Graph and Sequence Model for Sequential Recommendation.
 This model combines:
 1. UniGNN-style graph convolutions for capturing collaborative filtering signals
 2. Transformer-based sequence encoding for modeling sequential patterns
-3. Fusion mechanism to combine graph and sequence representations
-4. Multi-task learning with local, global, and contrastive objectives
+3. Multi-task learning with local, global, and Barlow Twins alignment objectives
+
+Per the CREATE++ paper:
+- Eq. 20: Sequence input is enriched with graph item embeddings: x_k = g_{i_k} + p_k
+- Eq. 21: Local loss uses h_u (from transformer) dotted with g_i (from graph)
+- Eq. 22: Alignment loss (Barlow Twins) between h_u and g_u directly (no fusion)
+- Inference: ŷ_{u,i} = h_u^T * g_i
 
 Based on CREATE++ paper ideas, combining UniGNN (2021) and CREATE (2026).
 """
@@ -20,7 +25,7 @@ from .sequence_encoder import SequentialEncoder, Bert4RecEncoder
 
 class Projector(nn.Module):
     """
-    Projection head for contrastive learning.
+    Projection head for alignment learning.
     Maps embeddings to a common projection space.
     """
 
@@ -68,13 +73,14 @@ class CREATEUni(nn.Module):
     CREATE-Uni: Unified Graph and Sequence Model.
 
     Combines graph-based collaborative filtering with sequential pattern learning
-    using a fusion mechanism and multi-task learning objectives.
+    via multi-task learning objectives (no explicit fusion of representations).
 
     Architecture:
-    - Graph branch: UniGNN encodes user-item bipartite graph for CF signals
-    - Sequence branch: Transformer (SASRec/BERT4Rec) encodes item sequences
-    - Fusion: Combines both representations via concat/sum/gating
-    - Prediction: Scores items using fused user representation
+    - Graph branch: UniGNN encodes user-item hypergraph → g_u (user), g_i (item)
+    - Sequence branch: Transformer encodes item sequences using graph-enriched
+      item embeddings (Eq. 20) → h_u (user representation)
+    - Prediction: scores = h_u @ g_i.T (Eq. 21, no fusion)
+    - Alignment: Barlow Twins between h_u and g_u (Eq. 22, no fusion)
     """
 
     def __init__(
@@ -88,8 +94,8 @@ class CREATEUni(nn.Module):
         graph_heads: int = 8,
         graph_dropout: float = 0.1,
         graph_use_norm: bool = True,
-        graph_first_agg: str = "mean",
-        graph_second_agg: str = "sum",
+        graph_first_agg: str = "mean", # edge_embedding from node embeddings 
+        graph_second_agg: str = "sum", # node_embedding from edge embeddings
         # Sequence encoder params
         seq_n_layers: int = 2,
         seq_heads: int = 4,
@@ -97,8 +103,7 @@ class CREATEUni(nn.Module):
         seq_dropout: float = 0.1,
         max_sequence_length: int = 50,
         seq_encoder_type: str = "sasrec",  # "sasrec" or "bert4rec"
-        # Fusion params
-        fusion_type: str = "concat",  # "concat", "sum", "gate"
+        # Projection params
         proj_dim: int = 64,
         # Other
         use_graph: bool = True,
@@ -111,7 +116,7 @@ class CREATEUni(nn.Module):
         self.use_graph = use_graph
         self.use_sequence = use_sequence
         self.seq_encoder_type = seq_encoder_type
-        self.fusion_type = fusion_type
+
 
         # Graph Encoder
         if use_graph:
@@ -154,22 +159,10 @@ class CREATEUni(nn.Module):
                     max_sequence_length=max_sequence_length,
                 )
 
-        # Fusion mechanism
-        fusion_input_dim = embedding_dim
-        if use_graph and use_sequence:
-            if fusion_type == "concat":
-                fusion_input_dim = embedding_dim * 2
-            elif fusion_type == "gate":
-                self.gate = nn.Sequential(
-                    nn.Linear(embedding_dim * 2, embedding_dim),
-                    nn.Sigmoid(),
-                )
+        # No fusion mechanism: per the paper, prediction is h_u @ g_i.T
+        # and alignment is Barlow Twins between h_u and g_u directly.
 
-        # Prediction head - maps fused representation to embedding space
-        self.prediction_head = nn.Linear(fusion_input_dim, embedding_dim)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-
-        # Projectors for contrastive learning
+        # Projectors for Barlow Twins alignment
         if use_graph and use_sequence:
             self.graph_projector = Projector(embedding_dim, proj_dim)
             self.seq_projector = Projector(embedding_dim, proj_dim)
@@ -220,8 +213,8 @@ class CREATEUni(nn.Module):
         """
         vertex = getattr(self, "graph_vertex", None)
         edges = getattr(self, "graph_edges", None)
-        degV = getattr(self, "graph_degV", None)
-        degE = getattr(self, "graph_degE", None)
+        degV = getattr(self, "graph_degV", None)  # Note: stored as graph_degV buffer
+        degE = getattr(self, "graph_degE", None)  # Note: stored as graph_degE buffer
 
         user_emb, item_emb = self.graph_encoder(vertex, edges, degE, degV)
 
@@ -237,64 +230,54 @@ class CREATEUni(nn.Module):
         item_sequence: torch.Tensor,
         attention_mask: torch.Tensor,
         mlm_mask: torch.Tensor = None,
+        graph_item_emb: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Encode using sequence encoder.
+
+        Per Eq. 20 of CREATE++: x_k = g_{i_k} + p_k
+        When graph_item_emb is provided, the transformer receives graph-learned
+        item embeddings instead of raw embedding table lookups.
 
         Args:
             item_sequence: Item IDs (batch_size, seq_len)
             attention_mask: Boolean mask (batch_size, seq_len)
             mlm_mask: MLM positions (optional, for BERT4Rec)
+            graph_item_emb: Graph-learned item embeddings (num_items, D), optional.
+                            If provided, used as transformer input per Eq. 20.
 
         Returns:
             seq_emb: Sequence embeddings (batch_size, D) or (num_masked, D) for BERT4Rec
         """
+        # Build precomputed embeddings from graph if available
+        precomputed = None
+        if graph_item_emb is not None:
+            # graph_item_emb: (num_items, D), indexed 0..num_items-1
+            # item_sequence uses: 0=PAD, 1..num_items=items, num_items+1=MASK
+            # Prepend zero row for PAD, append zero row for MASK
+            pad_row = torch.zeros(1, graph_item_emb.shape[1], device=graph_item_emb.device)
+            padded = torch.cat([pad_row, graph_item_emb, pad_row], dim=0)  # (num_items+2, D)
+            precomputed = padded[item_sequence]  # (B, L, D)
+
         if self.seq_encoder_type == "bert4rec":
             masked_emb, all_emb = self.seq_encoder(
-                item_sequence, attention_mask, mlm_mask
+                item_sequence, attention_mask, mlm_mask,
+                precomputed_emb=precomputed,
             )
             return masked_emb, all_emb
         else:
-            seq_emb = self.seq_encoder(item_sequence, attention_mask, return_last=True)
+            seq_emb = self.seq_encoder(
+                item_sequence, attention_mask, return_last=True,
+                precomputed_emb=precomputed,
+            )
             return seq_emb
 
-    def fuse_representations(
-        self,
-        graph_emb: torch.Tensor,
-        seq_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Fuse graph and sequence representations.
 
-        Args:
-            graph_emb: Graph-based embeddings (batch_size, D)
-            seq_emb: Sequence-based embeddings (batch_size, D)
-
-        Returns:
-            fused_emb: Fused embeddings (batch_size, embedding_dim)
-        """
-        if self.fusion_type == "concat":
-            fused = torch.cat([graph_emb, seq_emb], dim=-1)
-        elif self.fusion_type == "sum":
-            fused = graph_emb + seq_emb
-        elif self.fusion_type == "gate":
-            combined = torch.cat([graph_emb, seq_emb], dim=-1)
-            gate = self.gate(combined)
-            fused = gate * graph_emb + (1 - gate) * seq_emb
-        else:
-            raise ValueError(f"Unknown fusion type: {self.fusion_type}")
-
-        # Apply prediction head and normalization
-        fused = self.prediction_head(fused)
-        fused = self.layer_norm(fused)
-        fused = F.gelu(fused)
-
-        return fused
 
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
-        return_alignment: bool = False,
+        return_alignment: bool = False,  # True only during training Phase 2 to compute Barlow Twins (Eq. 22) projections
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through CREATE-Uni.
@@ -319,81 +302,99 @@ class CREATEUni(nn.Module):
 
         user_ids = batch.get("user.ids")
         item_sequence = batch.get("item.ids")
-        attention_mask = batch.get("mask")
+        attention_mask = batch.get("mask")  # Boolean mask: 1 for valid items, 0 for padded positions (prevents attending to padding)
         labels = batch.get("labels.ids")
-        mlm_mask = batch.get("mlm_mask")
+        mlm_mask = batch.get("mlm_mask")  # Boolean mask: 1 for items masked out for Masked Language Modeling (BERT4Rec target)
 
         batch_size = user_ids.shape[0] if user_ids is not None else item_sequence.shape[0]
         device = item_sequence.device if item_sequence is not None else user_ids.device
 
-        # Graph encoding
+        # === 1. Graph Branch Encoding ===
+        # Process the global hypergraph through the UniGNN encoder to get embeddings 
+        # for ALL users and items that capture collaborative filtering signals.
         graph_user_emb = None
         all_item_emb = None
         if self.use_graph:
             all_user_emb, all_item_emb = self.encode_graph()
             if user_ids is not None:
+                # Extract only the graph embeddings for the specific users in this current batch
                 graph_user_emb = all_user_emb[user_ids]
 
-        # Sequence encoding
+        # === 2. Sequence Branch Encoding ===
+        # Process the chronological sequence of items using Transformer-based models.
         seq_emb = None
         all_seq_emb = None
         if self.use_sequence and item_sequence is not None:
             if self.seq_encoder_type == "bert4rec":
+                # For BERT4Rec (Masked Language Modeling): we extract embeddings only 
+                # at the specifically masked positions to calculate the targeted MLM loss later.
                 mlm_emb, all_seq_emb = self.encode_sequence(
-                    item_sequence, attention_mask, mlm_mask
+                    item_sequence, attention_mask, mlm_mask,
+                    # Pass the graph-learned item embeddings (all_item_emb) to the sequence encoder
+                    # instead of using raw table lookups (Implementation of Eq. 20: x_k = g_{i_k} + p_k)
+                    graph_item_emb=all_item_emb,  
                 )
-                seq_emb = mlm_emb  # (num_masked, D)
+                seq_emb = mlm_emb  # Shape: (total_num_masked_items_in_batch, D)
             else:
-                seq_emb = self.encode_sequence(item_sequence, attention_mask)  # (batch_size, D)
+                # For SASRec (Next-item prediction): we just need the final aggregated 
+                # sequence embedding to predict the next user action.
+                seq_emb = self.encode_sequence(
+                    item_sequence, attention_mask,
+                    graph_item_emb=all_item_emb,  # Eq. 20: x_k = g_{i_k} + p_k
+                )  # Shape: (batch_size, D)
 
-        # Fusion and prediction
+        # === 3. Prediction (No Fusion) ===
+        # Per the paper, there is NO fusion of graph and sequence embeddings.
+        # Prediction: scores = h_u @ g_i.T (Eq. 21)
+        # Alignment:  Barlow Twins between h_u and g_u (Eq. 22)
         if self.use_graph and self.use_sequence:
-            if self.seq_encoder_type == "bert4rec":
-                # BERT4Rec: seq_emb is (num_masked, D)
-                # Need to expand graph_user_emb to match
-                if mlm_mask is not None:
-                    # Expand user embedding for each masked position
-                    counts = mlm_mask.sum(dim=1).to(torch.int64)
-                    graph_user_expanded = graph_user_emb.repeat_interleave(counts, dim=0)
-                    fused = self.fuse_representations(graph_user_expanded, seq_emb)
-                else:
-                    fused = seq_emb
-            else:
-                # SASRec: seq_emb is (batch_size, D), graph_user_emb is (batch_size, D)
-                fused = self.fuse_representations(graph_user_emb, seq_emb)
-
-            # Compute scores against item embeddings
-            scores = fused @ all_item_emb.T
+            # Eq. 21: L_local uses h_u (seq_emb) dotted with g_i (all_item_emb)
+            scores = seq_emb @ all_item_emb.T
             outputs["local_prediction"] = scores
 
-            # Alignment learning embeddings
+            # Global objective (BPR): positive/negative scores from graph embeddings
+            # Used during warmup epochs to pre-condition the graph encoder
+            if user_ids is not None and self.use_graph:
+                # Sample negative items for BPR loss
+                neg_item_ids = torch.randint(
+                    1, self.num_items + 1, (batch_size,), device=user_ids.device
+                )
+                pos_scores = (graph_user_emb * all_item_emb[user_ids]).sum(dim=1, keepdim=True)
+                neg_scores = (graph_user_emb * all_item_emb[neg_item_ids]).sum(dim=1, keepdim=True)
+                outputs["global_positive"] = pos_scores
+                outputs["global_negative"] = neg_scores
+
+            # Eq. 22: Barlow Twins alignment between h_u and g_u (no fusion)
             if return_alignment:
                 if self.seq_encoder_type == "bert4rec" and mlm_mask is not None:
-                    # For BERT4Rec, average sequence embeddings per user
+                    # For BERT4Rec, average the per-position sequence embeddings
+                    # back to one embedding per user for alignment with g_u
+                    # all_seq_emb: (batch_size, seq_len, D)
                     seq_emb_per_user = torch.zeros_like(graph_user_emb)
-                    counts = mlm_mask.sum(dim=1, keepdim=True).clamp(min=1)
                     for i in range(batch_size):
-                        if mlm_mask[i].any():
-                            seq_emb_per_user[i] = all_seq_emb[i][mlm_mask[i]].mean(dim=0)
-                    graph_proj = self.graph_projector(graph_user_emb)
-                    seq_proj = self.seq_projector(seq_emb_per_user)
+                        user_mlm_mask = mlm_mask[i]
+                        if user_mlm_mask.any():
+                            # Average embeddings at masked positions for this user
+                            seq_emb_per_user[i] = all_seq_emb[i][user_mlm_mask].mean(dim=0)
+                        else:
+                            # Fallback: use mean of all positions
+                            seq_emb_per_user[i] = all_seq_emb[i][attention_mask[i]].mean(dim=0) if attention_mask[i].any() else all_seq_emb[i].mean(dim=0)
+                    graph_proj = self.graph_projector(graph_user_emb)   # project g_u
+                    seq_proj = self.seq_projector(seq_emb_per_user)     # project h_u
                 else:
-                    graph_proj = self.graph_projector(graph_user_emb)
-                    seq_proj = self.seq_projector(seq_emb)
+                    graph_proj = self.graph_projector(graph_user_emb)   # project g_u
+                    seq_proj = self.seq_projector(seq_emb)              # project h_u
                 outputs["alignment_fst_embeddings"] = graph_proj
                 outputs["alignment_snd_embeddings"] = seq_proj
 
         elif self.use_graph:
-            # Graph-only mode
+            # Graph-only mode: scores = g_u @ g_i.T
             scores = graph_user_emb @ all_item_emb.T
             outputs["local_prediction"] = scores
 
         elif self.use_sequence:
-            # Sequence-only mode
-            if self.seq_encoder_type == "bert4rec":
-                scores = seq_emb @ self.output_item_embeddings.weight.T
-            else:
-                scores = seq_emb @ self.output_item_embeddings.weight.T
+            # Sequence-only mode: scores = h_u @ item_emb.T
+            scores = seq_emb @ self.output_item_embeddings.weight.T
             outputs["local_prediction"] = scores
 
         return outputs
@@ -429,25 +430,23 @@ class CREATEUni(nn.Module):
                 graph_user_emb = None
                 all_item_emb = None
 
-            # Sequence encoding
+            # Sequence encoding (with graph-learned item embeddings per Eq. 20)
             if self.use_sequence:
-                seq_emb = self.encode_sequence(item_sequence, attention_mask)
+                seq_emb = self.encode_sequence(
+                    item_sequence, attention_mask,
+                    graph_item_emb=all_item_emb,
+                )
             else:
                 seq_emb = None
 
-            # Fusion
+            # No fusion: prediction is h_u @ g_i.T per the paper
             if self.use_graph and self.use_sequence:
-                fused = self.fuse_representations(graph_user_emb, seq_emb)
+                # Eq. 21 / Inference: ŷ_{u,i} = h_u^T * g_i
+                scores = seq_emb @ all_item_emb.T
             elif self.use_graph:
-                fused = graph_user_emb
+                scores = graph_user_emb @ all_item_emb.T
             else:
-                fused = seq_emb
-
-            # Compute scores
-            if self.use_graph:
-                scores = fused @ all_item_emb.T
-            else:
-                scores = fused @ self.output_item_embeddings.weight.T
+                scores = seq_emb @ self.output_item_embeddings.weight.T
 
             # Mask padding and special tokens
             scores[:, 0] = -torch.inf  # PAD

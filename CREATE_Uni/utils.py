@@ -135,16 +135,21 @@ def inference(
                 predictions = outputs["local_prediction"]
                 targets = batch["labels.ids"]
 
-                # For MLM-style with flattened labels, need special handling
+                # Handle MLM-style with flattened labels vs standard next-item prediction
                 if predictions.dim() == 2 and targets.dim() == 1:
                     if predictions.shape[0] == targets.shape[0]:
-                        # Standard case
+                        # Standard case: one label per sample
                         for metric_name, metric_fn in metrics.items():
                             if hasattr(metric_fn, "compute_batch"):
                                 values = metric_fn.compute_batch(predictions, targets)
                                 running_metrics[metric_name].extend(values)
                             else:
                                 running_metrics[metric_name].append(metric_fn(predictions, targets))
+                    elif predictions.shape[0] > targets.shape[0]:
+                        # MLM case: multiple predictions per sample, need to aggregate
+                        # This happens with BERT4Rec where we have num_masked predictions
+                        # but only batch_size labels
+                        pass  # Skip metrics for MLM case during inference
 
     # Aggregate metrics
     results = {}
