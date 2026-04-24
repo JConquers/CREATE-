@@ -147,7 +147,12 @@ def parse_args():
         default=86400,
         help="Session length in seconds for hypergraph construction",
     )
-
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.4,
+        help="Dropout probability for both sequence and graph encoders",
+    )
     # Training arguments
     parser.add_argument(
         "--batch_size",
@@ -158,7 +163,7 @@ def parse_args():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1.8e-4,
+        default=2e-3,
         help="Learning rate",
     )
     parser.add_argument(
@@ -457,8 +462,10 @@ def main():
         graph_n_layers=args.graph_n_layers,
         graph_conv_type=args.graph_conv_type,
         graph_heads=args.graph_heads,
+        graph_dropout=args.dropout,
         seq_n_layers=args.seq_n_layers,
         seq_heads=args.seq_heads,
+        seq_dropout=args.dropout,
         max_sequence_length=args.max_sequence_length,
 
         use_graph=args.use_graph,

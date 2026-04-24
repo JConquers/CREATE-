@@ -99,7 +99,7 @@ class CREATEUni(nn.Module):
         # Sequence encoder params
         seq_n_layers: int = 2,
         seq_heads: int = 4,
-        seq_dim_feedforward: int = 128,
+        seq_dim_feedforward: int = 32,
         seq_dropout: float = 0.1,
         max_sequence_length: int = 50,
         seq_encoder_type: str = "sasrec",  # "sasrec" or "bert4rec"
