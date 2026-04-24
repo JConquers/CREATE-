@@ -269,6 +269,12 @@ def train(
         # Check for improvement (using NDCG@10 as primary metric)
         val_ndcg = val_metrics.get("ndcg@10", 0.0)
         improved = ""
+        
+        # Reset tracking when transitioning from warmup to joint training
+        if epoch == warmup_epochs and warmup_epochs > 0:
+            best_val_metric = -1.0
+            best_epoch = epoch
+
         if val_ndcg > best_val_metric:
             best_val_metric = val_ndcg
             best_epoch = epoch
@@ -309,10 +315,7 @@ def train(
                 f"test_ndcg@10={test_metrics.get('ndcg@10', 0.0):.4f}{improved}"
             )
 
-        # Early stopping
-        if epoch - best_epoch >= early_stopping_rounds:
-            logger.info(f"Early stopping at epoch {epoch} (no improvement for {early_stopping_rounds} epochs)")
-            break
+
 
     # Save final model checkpoint
     if output_dir:

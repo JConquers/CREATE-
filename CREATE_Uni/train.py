@@ -259,9 +259,9 @@ def get_dataset_paths(args) -> tuple:
         if args.dataset == "beauty":
             from dataset_loaders.beauty_dataset import BeautyDataset
             dataset = BeautyDataset(root=str(data_dir))
-        elif args.dataset == "books":
-            from dataset_loaders.books_dataset import BooksDataset
-            dataset = BooksDataset(root=str(data_dir))
+        elif args.dataset == "office_products":
+            from dataset_loaders.office_products_dataset import OfficeProductsDataset
+            dataset = OfficeProductsDataset(root=str(data_dir))
         else:
             raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -467,7 +467,7 @@ def main():
     )
 
     # Set up graph structure if using graph encoder
-    if args.use_graph and data_module_path.exists() and args.dataset in ["beauty", "books"]:
+    if args.use_graph and data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
         logger.info("Setting up graph structure...")
         vertex, edges, degV, degE = get_graph_structure(
             user_ids=data["train_user"],
