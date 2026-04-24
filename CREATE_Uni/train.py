@@ -95,7 +95,7 @@ def parse_args():
     parser.add_argument(
         "--graph_heads",
         type=int,
-        default=8,
+        default=1,
         help="Number of attention heads for UniGAT",
     )
     parser.add_argument(
@@ -158,7 +158,7 @@ def parse_args():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-3,
+        default=1.8e-4,
         help="Learning rate",
     )
     parser.add_argument(
@@ -170,7 +170,7 @@ def parse_args():
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=100,
+        default=200,
         help="Maximum number of epochs",
     )
     parser.add_argument(
@@ -182,7 +182,7 @@ def parse_args():
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=5,
+        default=50,
         help="Number of warmup epochs",
     )
     parser.add_argument(
@@ -202,13 +202,13 @@ def parse_args():
     parser.add_argument(
         "--global_coef",
         type=float,
-        default=0.1,
+        default=0.6,
         help="Global objective weight",
     )
     parser.add_argument(
         "--barlow_twins_coef",
         type=float,
-        default=0.01,
+        default=0.2,
         help="Barlow twins alignment objective weight",
     )
     parser.add_argument(
