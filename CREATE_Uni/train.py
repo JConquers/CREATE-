@@ -49,7 +49,7 @@ def parse_args():
         "--dataset",
         type=str,
         default="beauty",
-        choices=["beauty", "books"],
+        choices=["beauty", "office_products"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -316,14 +316,14 @@ def main():
 
     # Try to use dataset_loaders module
     data_module_path = Path(__file__).parent.parent / "dataset_loaders"
-    if data_module_path.exists() and args.dataset in ["beauty", "books"]:
+    if data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
         sys.path.insert(0, str(data_module_path.parent))
         if args.dataset == "beauty":
             from dataset_loaders.beauty_dataset import BeautyDataset
             dataset = BeautyDataset(root=str(Path(args.data_dir) / args.dataset))
         else:
-            from dataset_loaders.books_dataset import BooksDataset
-            dataset = BooksDataset(root=str(Path(args.data_dir) / args.dataset))
+            from dataset_loaders.office_products_dataset import OfficeProductsDataset
+            dataset = OfficeProductsDataset(root=str(Path(args.data_dir) / args.dataset))
 
         data = dataset.load()
 

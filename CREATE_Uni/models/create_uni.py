@@ -278,6 +278,7 @@ class CREATEUni(nn.Module):
         self,
         batch: Dict[str, torch.Tensor],
         return_alignment: bool = False,  # True only during training Phase 2 to compute Barlow Twins (Eq. 22) projections
+        is_warmup: bool = False,         # True during warmup phase to avoid sequence encoder computation
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through CREATE-Uni.
@@ -324,7 +325,7 @@ class CREATEUni(nn.Module):
         # Process the chronological sequence of items using Transformer-based models.
         seq_emb = None
         all_seq_emb = None
-        if self.use_sequence and item_sequence is not None:
+        if self.use_sequence and item_sequence is not None and not is_warmup:
             if self.seq_encoder_type == "bert4rec":
                 # For BERT4Rec (Masked Language Modeling): we extract embeddings only 
                 # at the specifically masked positions to calculate the targeted MLM loss later.
@@ -348,9 +349,14 @@ class CREATEUni(nn.Module):
         # Prediction: scores = h_u @ g_i.T (Eq. 21)
         # Alignment:  Barlow Twins between h_u and g_u (Eq. 22)
         if self.use_graph and self.use_sequence:
-            # Eq. 21: L_local uses h_u (seq_emb) dotted with g_i (all_item_emb)
-            scores = seq_emb @ all_item_emb.T
-            outputs["local_prediction"] = scores
+            if is_warmup and user_ids is not None:
+                # During warmup, we only test the graph pre-conditioning.
+                scores = graph_user_emb @ all_item_emb.T
+                outputs["graph_prediction"] = scores
+            elif not is_warmup:
+                # Eq. 21: L_local uses h_u (seq_emb) dotted with g_i (all_item_emb)
+                scores = seq_emb @ all_item_emb.T
+                outputs["local_prediction"] = scores
 
             # Global objective (BPR, Eq. 19): g_u^T * g_i_pos vs g_u^T * g_i_neg
             # Used during warmup epochs to pre-condition the graph encoder

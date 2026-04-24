@@ -12,13 +12,13 @@ from pathlib import Path
 class BeautyDataset:
     """Amazon Beauty and Personal Care dataset (5-core)."""
 
-    URL = "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Beauty_and_Personal_Care.csv.gz"
+    URL = "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Beauty_5.json.gz"
 
     def __init__(self, root="data"):
         self.root = Path(root)
         self.raw_dir = self.root / "raw"
         self.processed_dir = self.root / "processed"
-        self.raw_file = self.raw_dir / "Beauty_and_Personal_Care.csv.gz"
+        self.raw_file = self.raw_dir / "reviews_Beauty_5.json.gz"
         self.processed_file = self.processed_dir / "beauty_data.pt"
 
     def download(self):
@@ -32,26 +32,29 @@ class BeautyDataset:
         download_url(self.URL, self.raw_dir)
 
     def process(self):
-        """Process the raw CSV into train/test splits."""
+        """Process the raw JSON into train/test splits."""
         if self.processed_file.exists():
             print(f"Processed data already exists at {self.processed_file}")
             return self._load_processed()
 
         print("Processing dataset...")
 
-        df = pd.read_csv(self.raw_file, compression='gzip')
+        df = pd.read_json(self.raw_file, compression='gzip', lines=True)
         print(f"Columns: {df.columns.tolist()}")
         print(f"Sample rows:\n{df.head()}")
-        df = df.sort_values(['user_id', 'timestamp'])
 
-        user_col = 'user_id'
-        item_col = 'parent_asin' if 'parent_asin' in df.columns else 'asin'
+        user_col = 'reviewerID'
+        item_col = 'asin'
+        time_col = 'unixReviewTime'
+
+        df = df.sort_values([user_col, time_col])
 
         user2idx = {u: i for i, u in enumerate(df[user_col].unique())}
         item2idx = {i: idx for idx, i in enumerate(df[item_col].unique())}
 
         df['user_idx'] = df[user_col].map(user2idx)
         df['item_idx'] = df[item_col].map(item2idx)
+        df['timestamp'] = df[time_col]
 
         n_users = len(user2idx)
         n_items = len(item2idx)

@@ -98,6 +98,7 @@ def inference(
     metrics: Dict[str, any],
     device: torch.device,
     loss_fn: Optional[nn.Module] = None,
+    is_warmup: bool = False,
 ) -> Tuple[Dict[str, float], Optional[float]]:
     """
     Run inference on a dataloader.
@@ -122,7 +123,7 @@ def inference(
     with torch.no_grad():
         for batch in dataloader:
             move_batch(batch, device)
-            outputs = model(batch, return_alignment=False)
+            outputs = model(batch, return_alignment=False, is_warmup=is_warmup)
 
             # Compute loss if provided
             if loss_fn is not None:
@@ -131,8 +132,9 @@ def inference(
                 num_batches += 1
 
             # Compute metrics
-            if "local_prediction" in outputs and "labels.ids" in batch:
-                predictions = outputs["local_prediction"]
+            prediction_key = "graph_prediction" if is_warmup else "local_prediction"
+            if prediction_key in outputs and "labels.ids" in batch:
+                predictions = outputs[prediction_key]
                 targets = batch["labels.ids"]
 
                 # Handle MLM-style with flattened labels vs standard next-item prediction
@@ -231,7 +233,8 @@ def train(
 
         for batch in tqdm(train_dataloader, desc=desc, mininterval=30, ncols=100):
             move_batch(batch, device)
-            outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0))
+            # Pass is_warmup to save sequence encoder computation during warmup training phase
+            outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0), is_warmup=(epoch < warmup_epochs))
 
             loss = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
 
@@ -246,12 +249,12 @@ def train(
 
         # Validation
         val_metrics, val_loss = inference(
-            val_dataloader, model, metrics, device, loss_fn
+            val_dataloader, model, metrics, device, loss_fn, is_warmup=(epoch < warmup_epochs)
         )
 
         # Test
         test_metrics, test_loss = inference(
-            test_dataloader, model, metrics, device, loss_fn
+            test_dataloader, model, metrics, device, loss_fn, is_warmup=(epoch < warmup_epochs)
         )
 
         # Prepare epoch metrics

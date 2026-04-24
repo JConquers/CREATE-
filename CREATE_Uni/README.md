@@ -108,8 +108,8 @@ python -m CREATE_Uni.train \
 # Amazon Beauty
 python -m CREATE_Uni.train --dataset beauty
 
-# Amazon Books
-python -m CREATE_Uni.train --dataset books
+# Amazon Office Products
+python -m CREATE_Uni.train --dataset office_products
 ```
 
 ### Model Configuration
@@ -185,7 +185,7 @@ python -m CREATE_Uni.train --dataset beauty --graph_conv_type UniGAT
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--dataset` | str | beauty | Dataset to use: `beauty`, `books` |
+| `--dataset` | str | beauty | Dataset to use: `beauty`, `office_products` |
 | `--data_dir` | str | ./data | Directory containing dataset CSV files |
 | `--output_dir` | str | ./outputs | Directory for outputs (logs, metrics, plots) |
 
@@ -311,11 +311,11 @@ Unlike models that explicitly fuse graph and sequence representations, CREATE-Un
 
 ## Dataset Format
 
-The dataset loaders expect Amazon Reviews format with columns:
-- `user_id`: User identifier
-- `item_id` or `parent_asin`: Item identifier  
-- `rating`: Interaction rating
-- `timestamp`: Interaction timestamp
+The dataset loaders automatically download Amazon Reviews 2023 5-core JSON Lines data. Expected keys within JSON line:
+- `reviewerID`: User identifier
+- `asin`: Item identifier  
+- `overall`: Interaction rating
+- `unixReviewTime`: Interaction timestamp
 
 The loaders automatically:
 1. Download from Amazon Reviews 2023 (5-core subsets)
