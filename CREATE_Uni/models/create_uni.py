@@ -325,7 +325,9 @@ class CREATEUni(nn.Module):
         # Process the chronological sequence of items using Transformer-based models.
         seq_emb = None
         all_seq_emb = None
-        if self.use_sequence and item_sequence is not None and not is_warmup:
+        # Only skip sequence computation if we are in warmup AND we actually have a graph to warmup
+        skip_sequence = is_warmup and self.use_graph
+        if self.use_sequence and item_sequence is not None and not skip_sequence:
             if self.seq_encoder_type == "bert4rec":
                 # For BERT4Rec (Masked Language Modeling): we extract embeddings only 
                 # at the specifically masked positions to calculate the targeted MLM loss later.
@@ -374,7 +376,7 @@ class CREATEUni(nn.Module):
                 outputs["global_negative"] = neg_scores
 
             # Eq. 22: Barlow Twins alignment between h_u and g_u (no fusion)
-            if return_alignment:
+            if return_alignment and not is_warmup:
                 if self.seq_encoder_type == "bert4rec" and mlm_mask is not None:
                     # For BERT4Rec, average the per-position sequence embeddings
                     # back to one embedding per user for alignment with g_u
