@@ -37,6 +37,11 @@ class PositionalEncoding(nn.Module):
 class SequentialEncoder(nn.Module):
     """
     SASRec-style sequential encoder using transformer encoder with causal masking.
+
+    Key SAS4Rec features (per paper):
+    - Reverse positional embeddings: most recent item gets position 0
+    - Pre-norm architecture: LayerNorm before each sub-layer
+    - √d scaling on item embeddings
     """
 
     def __init__(
@@ -61,11 +66,12 @@ class SequentialEncoder(nn.Module):
         )  # 0=PAD, 1=MASK
 
         # Position embeddings (learned, reverse order like SASRec)
+        # Position 0 = most recent item, position N = oldest item
         self.position_embeddings = nn.Embedding(
             max_sequence_length + 1, embedding_dim
         )
 
-        # Transformer encoder
+        # Transformer encoder with pre-norm (norm_first=True matches SAS4Rec)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=num_heads,
@@ -74,6 +80,7 @@ class SequentialEncoder(nn.Module):
             activation="gelu",
             layer_norm_eps=layer_norm_eps,
             batch_first=True,
+            norm_first=True,  # Pre-norm architecture per SAS4Rec
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
@@ -120,14 +127,15 @@ class SequentialEncoder(nn.Module):
 
         # Get item embeddings: use graph-learned if provided, else raw lookup
         if precomputed_emb is not None:
-            item_emb = precomputed_emb  # (B, L, D) — graph-learned embeddings g_{i_k}
-            # Eq. 20: x_k = g_{i_k} + p_k — no sqrt scaling for graph embeddings
+            item_emb = precomputed_emb * math.sqrt(self.embedding_dim)  # (B, L, D) — graph-learned embeddings g_{i_k}
+            # Eq. 20: x_k = g_{i_k} + p_k — apply √d scaling consistently
         else:
             item_emb = self.item_embeddings(item_ids)  # (B, L, D) — raw lookup fallback
             item_emb = item_emb * math.sqrt(self.embedding_dim)
 
-        # Position embeddings (Standard causal forward mapping)
-        positions = torch.arange(seq_len, device=item_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # SAS4Rec reverse position embeddings (Eq. 2):
+        # Most recent item (last position) gets position 0, oldest gets position seq_len-1
+        positions = torch.arange(seq_len - 1, -1, device=item_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.position_embeddings(positions)
 
         # Combine embeddings: Eq. 20 x_k = g_{i_k} + p_k
@@ -182,6 +190,8 @@ class SequentialEncoder(nn.Module):
 class Bert4RecEncoder(nn.Module):
     """
     BERT4Rec-style bidirectional sequence encoder with MLM objective.
+
+    Uses pre-norm architecture for consistency with SASRec encoder.
     """
 
     def __init__(
@@ -206,12 +216,12 @@ class Bert4RecEncoder(nn.Module):
             num_items + 2, embedding_dim, padding_idx=0
         )  # 0=PAD, 1=MASK
 
-        # Position embeddings
+        # Position embeddings (learned)
         self.position_embeddings = nn.Embedding(
             max_sequence_length + 1, embedding_dim
         )
 
-        # Transformer encoder (bidirectional)
+        # Transformer encoder (bidirectional) with pre-norm
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=num_heads,
@@ -220,6 +230,7 @@ class Bert4RecEncoder(nn.Module):
             activation="gelu",
             layer_norm_eps=layer_norm_eps,
             batch_first=True,
+            norm_first=True,  # Pre-norm architecture
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
@@ -259,14 +270,15 @@ class Bert4RecEncoder(nn.Module):
 
         # Get embeddings: use graph-learned if provided, else raw lookup
         if precomputed_emb is not None:
-            item_emb = precomputed_emb  # (B, L, D) — graph-learned embeddings g_{i_k}
-            # Eq. 20: x_k = g_{i_k} + p_k — no sqrt scaling for graph embeddings
+            item_emb = precomputed_emb * math.sqrt(self.embedding_dim)  # (B, L, D) — graph-learned embeddings g_{i_k}
+            # Eq. 20: x_k = g_{i_k} + p_k — apply √d scaling consistently
         else:
             item_emb = self.item_embeddings(input_ids)
             item_emb = item_emb * math.sqrt(self.embedding_dim)
 
-        # Position embeddings
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # Position embeddings (standard order for BERT4Rec - no reverse needed)
+        # BERT4Rec uses bidirectional attention, so position order is less critical than SASRec
+        positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.position_embeddings(positions)
 
         # Combine: Eq. 20 x_k = g_{i_k} + p_k

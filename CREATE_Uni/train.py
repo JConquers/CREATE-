@@ -150,7 +150,7 @@ def parse_args():
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.4,
+        default=0.1,
         help="Dropout probability for both sequence and graph encoders",
     )
     # Training arguments
