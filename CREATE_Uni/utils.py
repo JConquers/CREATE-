@@ -127,7 +127,7 @@ def inference(
 
             # Compute loss if provided
             if loss_fn is not None:
-                loss = loss_fn(batch, outputs)
+                loss, _ = loss_fn(batch, outputs)
                 total_loss += loss.item()
                 num_batches += 1
 
@@ -226,6 +226,9 @@ def train(
         # Training
         model.train()
         total_loss = 0.0
+        total_local_loss = 0.0
+        total_global_loss = 0.0
+        total_align_loss = 0.0
         num_batches = 0
 
         phase = "Warmup" if epoch < warmup_epochs else "Joint"
@@ -236,16 +239,22 @@ def train(
             # Pass is_warmup to save sequence encoder computation during warmup training phase
             outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0), is_warmup=(epoch < warmup_epochs))
 
-            loss = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
+            loss, loss_dict = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            total_local_loss += loss_dict["local"]
+            total_global_loss += loss_dict["global"]
+            total_align_loss += loss_dict["align"]
             num_batches += 1
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        avg_local_loss = total_local_loss / num_batches if num_batches > 0 else 0
+        avg_global_loss = total_global_loss / num_batches if num_batches > 0 else 0
+        avg_align_loss = total_align_loss / num_batches if num_batches > 0 else 0
 
         # Validation
         val_metrics, val_loss = inference(
@@ -308,9 +317,11 @@ def train(
 
         # Log one clean line per epoch
         if (epoch + 1) % log_interval == 0:
+            loss_str = (f"loss={avg_train_loss:.4f} "
+                        f"(loc:{avg_local_loss:.4f}, glob:{avg_global_loss:.4f}, align:{avg_align_loss:.4f})")
             logger.info(
                 f"[{phase:6s}] Epoch {epoch + 1:3d}/{num_epochs} | "
-                f"loss={avg_train_loss:.4f} | "
+                f"{loss_str} | "
                 f"val_ndcg@10={val_ndcg:.4f} | "
                 f"test_ndcg@10={test_metrics.get('ndcg@10', 0.0):.4f}{improved}"
             )

@@ -204,7 +204,7 @@ class CREATEUniLoss(nn.Module):
         model_outputs: dict,
         epoch_num: int = 0,
         warmup_epochs: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict]:
         """
         Compute combined loss.
 
@@ -219,6 +219,7 @@ class CREATEUniLoss(nn.Module):
         """
         warmup = warmup_epochs if warmup_epochs is not None else self.warmup_epochs
         total_loss = 0.0
+        loss_dict = {"local": 0.0, "global": 0.0, "align": 0.0}
 
         # Local objective: only apply after warmup epochs (CREATE-style)
         if epoch_num >= warmup:
@@ -227,7 +228,9 @@ class CREATEUniLoss(nn.Module):
                     model_outputs["local_prediction"],
                     batch["labels.ids"],
                 )
-                total_loss += self.local_coef * local_loss
+                local_weighted = self.local_coef * local_loss
+                total_loss += local_weighted
+                loss_dict["local"] = local_weighted.item()
 
         # Global objective (if available)
         if (
@@ -239,7 +242,9 @@ class CREATEUniLoss(nn.Module):
                 model_outputs["global_positive"],
                 model_outputs["global_negative"],
             )
-            total_loss += self.global_coef * global_loss
+            global_weighted = self.global_coef * global_loss
+            total_loss += global_weighted
+            loss_dict["global"] = global_weighted.item()
 
         # Barlow Twins objective: only apply after warmup epochs
         if epoch_num >= warmup:
@@ -253,6 +258,8 @@ class CREATEUniLoss(nn.Module):
                     model_outputs["alignment_fst_embeddings"],
                     model_outputs["alignment_snd_embeddings"],
                 )
-                total_loss += self.barlow_twins_coef * barlow_loss
+                barlow_weighted = self.barlow_twins_coef * barlow_loss
+                total_loss += barlow_weighted
+                loss_dict["align"] = barlow_weighted.item()
 
-        return total_loss
+        return total_loss, loss_dict
