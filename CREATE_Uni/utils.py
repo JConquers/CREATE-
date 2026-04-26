@@ -128,7 +128,7 @@ def inference(
             # Compute loss if provided
             if loss_fn is not None:
                 loss, _ = loss_fn(batch, outputs)
-                total_loss += loss.item()
+                total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
                 num_batches += 1
 
             # Compute metrics
