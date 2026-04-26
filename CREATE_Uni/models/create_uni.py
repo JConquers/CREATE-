@@ -360,21 +360,6 @@ class CREATEUni(nn.Module):
                 scores = seq_emb @ all_item_emb.T
                 outputs["local_prediction"] = scores
 
-            # Global objective (BPR, Eq. 19): g_u^T * g_i_pos vs g_u^T * g_i_neg
-            # Used during warmup epochs to pre-condition the graph encoder
-            if user_ids is not None and labels is not None and self.use_graph:
-                # Positive items: the actual target items from the batch
-                pos_item_emb = all_item_emb[labels]  # (batch_size, D)
-                # Negative items: randomly sampled items
-                neg_item_ids = torch.randint(
-                    0, all_item_emb.shape[0], (batch_size,), device=device
-                )
-                neg_item_emb = all_item_emb[neg_item_ids]  # (batch_size, D)
-                pos_scores = (graph_user_emb * pos_item_emb).sum(dim=1)
-                neg_scores = (graph_user_emb * neg_item_emb).sum(dim=1)
-                outputs["global_positive"] = pos_scores
-                outputs["global_negative"] = neg_scores
-
             # Eq. 22: Barlow Twins alignment between h_u and g_u (no fusion)
             if return_alignment and not is_warmup:
                 if self.seq_encoder_type == "bert4rec" and mlm_mask is not None:
@@ -399,7 +384,7 @@ class CREATEUni(nn.Module):
                 outputs["alignment_snd_embeddings"] = seq_proj
 
         elif self.use_graph:
-            # Graph-only mode: scores = g_u @ g_i.T
+            # Graph-only mode: scores = g_u @ g_i.T (for evaluation metrics)
             scores = graph_user_emb @ all_item_emb.T
             outputs["local_prediction"] = scores
 
@@ -407,6 +392,20 @@ class CREATEUni(nn.Module):
             # Sequence-only mode: scores = h_u @ item_emb.T
             scores = seq_emb @ self.output_item_embeddings.weight.T
             outputs["local_prediction"] = scores
+
+        # === 4. Global BPR Objective (Eq. 19) ===
+        # g_u^T * g_i_pos vs g_u^T * g_i_neg
+        # Fires whenever graph encoder is active (joint mode, warmup, or graph-only)
+        if self.use_graph and user_ids is not None and labels is not None:
+            pos_item_emb = all_item_emb[labels]  # (batch_size, D)
+            neg_item_ids = torch.randint(
+                0, all_item_emb.shape[0], (batch_size,), device=device
+            )
+            neg_item_emb = all_item_emb[neg_item_ids]  # (batch_size, D)
+            pos_scores = (graph_user_emb * pos_item_emb).sum(dim=1)
+            neg_scores = (graph_user_emb * neg_item_emb).sum(dim=1)
+            outputs["global_positive"] = pos_scores
+            outputs["global_negative"] = neg_scores
 
         return outputs
 
