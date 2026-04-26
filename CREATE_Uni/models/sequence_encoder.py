@@ -135,7 +135,7 @@ class SequentialEncoder(nn.Module):
 
         # SAS4Rec reverse position embeddings (Eq. 2):
         # Most recent item (last position) gets position 0, oldest gets position seq_len-1
-        positions = torch.arange(seq_len - 1, -1, device=item_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        positions = torch.arange(seq_len - 1, -1, -1, device=item_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.position_embeddings(positions)
 
         # Combine embeddings: Eq. 20 x_k = g_{i_k} + p_k

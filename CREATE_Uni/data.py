@@ -66,7 +66,10 @@ class SequenceDataset(Dataset):
             # Truncate to max length
             item_sequence = item_ids[-self.max_sequence_length :]
 
-            if len(item_sequence) < 1:
+            # For next-item prediction, we need at least 2 items (1 context + 1 target)
+            # For val/test: need at least 2 items
+            # For train: need at least 2 items (context + target)
+            if len(item_sequence) < 2:
                 continue
 
             self._index.append(
@@ -258,7 +261,12 @@ class Collator:
                 processed["labels.ids"].append(sample["item.ids"][-1])
             else:
                 # Validation/Test: use all but last item
-                context_items = sample["item.ids"][:-1]
+                # Ensure at least 1 item in context (handle edge case of single-item sequences)
+                if len(sample["item.ids"]) > 1:
+                    context_items = sample["item.ids"][:-1]
+                else:
+                    # Single-item sequence: use that item as context, no label (will be filtered by mask)
+                    context_items = sample["item.ids"]
                 processed["item.ids"].extend(context_items)
                 processed["item.length"].append(len(context_items))
                 # Target is last item
