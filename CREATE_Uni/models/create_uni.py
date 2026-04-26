@@ -384,9 +384,10 @@ class CREATEUni(nn.Module):
                 outputs["alignment_snd_embeddings"] = seq_proj
 
         elif self.use_graph:
-            # Graph-only mode: scores = g_u @ g_i.T (for evaluation metrics)
+            # Graph-only mode: scores = g_u @ g_i.T (for evaluation metrics only)
+            # Use graph_prediction key so cross-entropy (local) loss does NOT fire
             scores = graph_user_emb @ all_item_emb.T
-            outputs["local_prediction"] = scores
+            outputs["graph_prediction"] = scores
 
         elif self.use_sequence:
             # Sequence-only mode: scores = h_u @ item_emb.T

@@ -132,8 +132,14 @@ def inference(
                 num_batches += 1
 
             # Compute metrics
-            prediction_key = "graph_prediction" if is_warmup else "local_prediction"
-            if prediction_key in outputs and "labels.ids" in batch:
+            # Prefer local_prediction (joint/seq-only); fall back to graph_prediction (warmup/graph-only)
+            if "local_prediction" in outputs:
+                prediction_key = "local_prediction"
+            elif "graph_prediction" in outputs:
+                prediction_key = "graph_prediction"
+            else:
+                prediction_key = None
+            if prediction_key is not None and prediction_key in outputs and "labels.ids" in batch:
                 predictions = outputs[prediction_key]
                 targets = batch["labels.ids"]
 
