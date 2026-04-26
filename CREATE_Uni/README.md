@@ -14,6 +14,70 @@ CREATE-Uni combines two branches with multi-task alignment (no explicit fusion):
 - **Alignment (Eq. 22):** Barlow Twins loss between `h_u` (sequence view) and `g_u` (graph view) directly
 - **Inference:** `ŷ_{u,i} = h_u^T · g_i`
 
+## Implementation Audit and Fixes
+
+The implementation was audited against `CREATE++.pdf`, `2021-UniGNN.pdf`, and the official `CREATE` code. The following issues were fixed:
+
+- Item-token indexing is now consistent: raw item ids remain `0..N-1` for graph scoring and labels, while sequence tokens are shifted to `1..N` so `0` is reserved for PAD and `N+1` for BERT4Rec MASK.
+- SASRec training now follows CREATE's full-softmax supervision pattern: every valid position predicts its next item, instead of supervising only the last event in each sequence.
+- BERT4Rec training now uses masked `input_ids` correctly, with raw item ids as prediction labels and a dedicated evaluation-time last-position mask.
+- The graph BPR branch now consumes explicit flattened positive `(user, item)` pairs from the batch instead of reusing the sequential labels in a shape-inconsistent way.
+- Session hyperedges are now built from fixed-width user-local time bins with unique items per session, matching the set-valued hyperedge definition in CREATE-Uni.
+- The UniGNN encoder now layer-averages graph outputs, matching Eq. (18), and the UniGAT path now preserves the requested embedding dimension across heads.
+
+## Exact Current Formulation
+
+After the fixes, the code is doing the following.
+
+### 1. Hypergraph construction
+
+For each user `u`, interactions are sorted by timestamp and partitioned into fixed-width bins of length `session_length`, anchored at that user's first training interaction. Each non-empty session bin forms one hyperedge:
+
+`e_(u,r) = {u} ∪ H_(u,r)`
+
+where `H_(u,r)` is the set of unique items clicked/purchased in that bin.
+
+### 2. Graph encoder
+
+Let `X^(0)` be the concatenated trainable user/item embeddings. A UniGNN layer computes
+
+- hyperedge states: `h_e = phi_1({x_j : j in e})`
+- node updates: `x_v^(l+1) = phi_2(x_v^(l), {h_e : e in E_v})`
+
+using the selected UniGNN operator (`UniGCN`, `UniGIN`, `UniSAGE`, or `UniGAT`). The final graph embedding is the average over graph layers:
+
+`g_v = (1 / K) * sum_(l=0)^(K-1) x_v^(l+1)`
+
+### 3. Sequence encoder
+
+- SASRec mode: the input sequence uses graph-enriched item tokens `x_k = g_(i_k) + p_k`, causal attention, reverse positional ids, and full-position supervision. During training, every valid position predicts the next raw item id. During evaluation, only the final valid state is used.
+- BERT4Rec mode: the input sequence uses graph-enriched item tokens with MLM masking. During training, only masked positions are scored against the raw item vocabulary. During evaluation, a final MASK token is appended and only that position is scored.
+
+### 4. Prediction and losses
+
+- Local loss:
+  - SASRec train: `L_local = CE(H_flat G^T, y_next_flat)`
+  - SASRec eval: `scores = h_last G^T`
+  - BERT4Rec train: `L_local = CE(H_masked G^T, y_masked)`
+  - BERT4Rec eval: `scores = h_mask_last G^T`
+- Global loss:
+  - For every positive pair `(u, i)` emitted by the collator, sample one random negative `j != i`
+  - Optimize `L_global = - mean log sigma(g_u^T g_i - g_u^T g_j)`
+- Alignment loss:
+  - Project graph-user and sequence-user embeddings and apply Barlow Twins
+  - SASRec aligns the last valid sequential state with `g_u`
+  - BERT4Rec aligns the per-user mean masked-position state with `g_u`
+
+### 5. Gradient flow by objective
+
+- Warm-up phase: only `L_global` is active, so only the graph encoder learns.
+- Joint phase:
+  - `L_local` updates the sequence encoder and graph item embeddings.
+  - `L_global` updates the graph encoder only.
+  - `L_align` updates both the graph-user branch and the sequence branch, plus the projectors.
+
+This is now much closer to the CREATE-Uni theory, with one practical approximation left intentionally in place: the global BPR sampler excludes the current positive item, but does not explicitly filter every historical positive for that user.
+
 ### Architecture Diagram
 
 ```

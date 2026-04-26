@@ -69,7 +69,7 @@ class UniGNNEncoder(nn.Module):
                 assert embedding_dim % heads == 0, f"embedding_dim ({embedding_dim}) must be divisible by heads ({heads})"
                 out_channels_per_head = embedding_dim // heads
                 in_dim = embedding_dim if i == 0 else embedding_dim
-                out_dim = embedding_dim
+                out_dim = out_channels_per_head
                 layer_heads = heads
             else:
                 # For non-attention convs, heads is effectively 1
@@ -128,7 +128,8 @@ class UniGNNEncoder(nn.Module):
         if degE is None:
             degE = torch.ones(E, device=ego_embeddings.device)
 
-        # Apply UniGNN layers
+        # Apply UniGNN layers and layer-average outputs as in CREATE-Uni.
+        layer_outputs = []
         for conv in self.convs:
             ego_embeddings = self.dropout(ego_embeddings)
             ego_embeddings = conv(
@@ -138,7 +139,10 @@ class UniGNNEncoder(nn.Module):
                 degE=degE,
                 degV=degV,
             )
-            ego_embeddings = F.relu(ego_embeddings)
+            layer_outputs.append(ego_embeddings)
+
+        if layer_outputs:
+            ego_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
 
         # Split back into user and item embeddings
         user_final = ego_embeddings[: self.num_users]

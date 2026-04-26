@@ -135,6 +135,11 @@ class Collator:
         self.ensure_one_mask = ensure_one_mask
         self.seq_encoder_type = seq_encoder_type
 
+    @staticmethod
+    def _shift_item_ids(item_ids: List[int]) -> List[int]:
+        """Map raw item ids 0..N-1 to token ids 1..N."""
+        return [item_id + 1 for item_id in item_ids]
+
     def _pad_sequence(
         self, sequences: List[List[int]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -164,7 +169,8 @@ class Collator:
 
     def _mask_bert4rec_input(
         self,
-        input_ids: torch.Tensor,
+        token_input_ids: torch.Tensor,
+        raw_item_ids: torch.Tensor,
         attn_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -175,11 +181,15 @@ class Collator:
             mlm_labels: Target labels for masked positions (-100 for non-masked)
             mlm_mask: Boolean mask for MLM positions
         """
-        device = input_ids.device
-        B, L = input_ids.shape
+        device = token_input_ids.device
+        B, L = token_input_ids.shape
 
         # Candidates for masking: real tokens only
-        can_mask = attn_mask & (input_ids != self.pad_id) & (input_ids != self.mask_id)
+        can_mask = (
+            attn_mask
+            & (token_input_ids != self.pad_id)
+            & (token_input_ids != self.mask_id)
+        )
 
         # Sample masking positions
         probs = torch.full((B, L), self.mlm_prob, device=device)
@@ -198,11 +208,11 @@ class Collator:
                     mlm_mask[no_mask_rows, pos] = True
 
         # Labels: true IDs at masked positions
-        mlm_labels = input_ids.clone()
+        mlm_labels = raw_item_ids.clone()
         mlm_labels[~mlm_mask] = -100  # Ignore index
 
         # Create masked input
-        masked_input_ids = input_ids.clone()
+        masked_input_ids = token_input_ids.clone()
         rand = torch.rand((B, L), device=device)
 
         # 80% -> [MASK]
@@ -217,7 +227,7 @@ class Collator:
         )
         if replace_with_random.any():
             random_ids = torch.randint(
-                low=2,  # Start from 2 to avoid PAD and MASK
+                low=1,  # Real item token ids are 1..num_items
                 high=self.num_items + 1,
                 size=(replace_with_random.sum().item(),),
                 device=device,
@@ -240,37 +250,51 @@ class Collator:
         processed = {
             "user.ids": [],
             "item.ids": [],
+            "item.raw_ids": [],
             "item.length": [],
             "labels.ids": [],
+            "graph_pos_user.ids": [],
+            "graph_pos_item.ids": [],
         }
 
         for sample in batch:
-            processed["user.ids"].append(sample["user.ids"])
+            user_id = sample["user.ids"]
+            raw_items = sample["item.ids"]
+            processed["user.ids"].append(user_id)
 
             if self.seq_encoder_type == "bert4rec" and self.mode == "train":
                 # BERT4Rec: use full sequence for MLM
-                context_items = sample["item.ids"]
-                processed["item.ids"].extend(context_items)
-                processed["item.length"].append(len(context_items))
+                token_items = self._shift_item_ids(raw_items)
+                processed["item.ids"].extend(token_items)
+                processed["item.raw_ids"].extend(raw_items)
+                processed["item.length"].append(len(token_items))
+                processed["graph_pos_user.ids"].extend([user_id] * len(raw_items))
+                processed["graph_pos_item.ids"].extend(raw_items)
             elif self.mode == "train":
-                # SASRec: use all but last for prediction (next-item prediction)
-                context_items = sample["item.ids"][:-1] if len(sample["item.ids"]) > 1 else sample["item.ids"]
-                processed["item.ids"].extend(context_items)
-                processed["item.length"].append(len(context_items))
-                # Target is the last item (next item after sequence)
-                processed["labels.ids"].append(sample["item.ids"][-1])
+                # SASRec: supervise every next-item position, like CREATE.
+                context_raw_items = raw_items[:-1]
+                context_token_items = self._shift_item_ids(context_raw_items)
+                next_items = raw_items[1:]
+                processed["item.ids"].extend(context_token_items)
+                processed["item.raw_ids"].extend(context_raw_items)
+                processed["item.length"].append(len(context_token_items))
+                processed["labels.ids"].extend(next_items)
+                processed["graph_pos_user.ids"].extend([user_id] * len(next_items))
+                processed["graph_pos_item.ids"].extend(next_items)
             else:
                 # Validation/Test: use all but last item
                 # Ensure at least 1 item in context (handle edge case of single-item sequences)
-                if len(sample["item.ids"]) > 1:
-                    context_items = sample["item.ids"][:-1]
+                if len(raw_items) > 1:
+                    context_raw_items = raw_items[:-1]
                 else:
                     # Single-item sequence: use that item as context, no label (will be filtered by mask)
-                    context_items = sample["item.ids"]
-                processed["item.ids"].extend(context_items)
-                processed["item.length"].append(len(context_items))
+                    context_raw_items = raw_items
+                context_token_items = self._shift_item_ids(context_raw_items)
+                processed["item.ids"].extend(context_token_items)
+                processed["item.raw_ids"].extend(context_raw_items)
+                processed["item.length"].append(len(context_token_items))
                 # Target is last item
-                processed["labels.ids"].append(sample["item.ids"][-1])
+                processed["labels.ids"].append(raw_items[-1])
 
         # Convert to tensors
         processed["user.ids"] = torch.tensor(processed["user.ids"], dtype=torch.long)
@@ -283,23 +307,66 @@ class Collator:
             current_idx += seq_len
             item_sequences.append(processed["item.ids"][current_idx - seq_len : current_idx])
 
+        raw_item_sequences = []
+        current_idx = 0
+        for seq_len in processed["item.length"].tolist():
+            current_idx += seq_len
+            raw_item_sequences.append(
+                processed["item.raw_ids"][current_idx - seq_len : current_idx]
+            )
+
         padded_items, attention_mask = self._pad_sequence(item_sequences)
-        processed["item.ids"] = padded_items  # Overwrite flat list with padded tensor (matches model's batch.get("item.ids"))
+        padded_raw_items, _ = self._pad_sequence(raw_item_sequences)
+        processed["item.ids"] = padded_items
+        processed["item.raw_ids"] = padded_raw_items
         processed["mask"] = attention_mask
 
-        # Labels: one per sample (next-item prediction)
+        if processed["graph_pos_user.ids"]:
+            processed["graph_pos_user.ids"] = torch.tensor(
+                processed["graph_pos_user.ids"], dtype=torch.long
+            )
+            processed["graph_pos_item.ids"] = torch.tensor(
+                processed["graph_pos_item.ids"], dtype=torch.long
+            )
+        else:
+            processed["graph_pos_user.ids"] = torch.empty(0, dtype=torch.long)
+            processed["graph_pos_item.ids"] = torch.empty(0, dtype=torch.long)
+
         processed["labels.ids"] = torch.tensor(processed["labels.ids"], dtype=torch.long)
 
         # Apply MLM masking for BERT4Rec training
         if self.mode == "train" and self.seq_encoder_type == "bert4rec":
             masked_ids, mlm_labels, mlm_mask = self._mask_bert4rec_input(
-                padded_items, attention_mask
+                padded_items,
+                padded_raw_items,
+                attention_mask,
             )
             processed["input_ids"] = masked_ids
             processed["mlm_labels"] = mlm_labels
             processed["mlm_mask"] = mlm_mask
             # Flatten labels for masked positions (BERT4Rec MLM style)
             processed["labels.ids"] = mlm_labels[mlm_mask]
+        elif self.seq_encoder_type == "bert4rec":
+            batch_size, seq_len = padded_items.shape
+            extended_input_ids = torch.full(
+                (batch_size, seq_len + 1),
+                fill_value=self.pad_id,
+                dtype=torch.long,
+            )
+            extended_input_ids[:, :seq_len] = padded_items
+            extended_mask = torch.zeros((batch_size, seq_len + 1), dtype=torch.bool)
+            extended_mask[:, :seq_len] = attention_mask
+
+            mask_positions = attention_mask.sum(dim=1)
+            extended_input_ids[torch.arange(batch_size), mask_positions] = self.mask_id
+            extended_mask[torch.arange(batch_size), mask_positions] = True
+
+            mlm_mask = torch.zeros((batch_size, seq_len + 1), dtype=torch.bool)
+            mlm_mask[torch.arange(batch_size), mask_positions] = True
+
+            processed["input_ids"] = extended_input_ids
+            processed["mask"] = extended_mask
+            processed["mlm_mask"] = mlm_mask
 
         return processed
 

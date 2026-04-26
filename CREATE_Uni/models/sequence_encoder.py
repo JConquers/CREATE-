@@ -103,6 +103,19 @@ class SequentialEncoder(nn.Module):
         )
         return mask
 
+    @staticmethod
+    def get_last_valid_embeddings(
+        embeddings: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the final non-padding embedding for each sequence."""
+        last_indices = attention_mask.long().sum(dim=1) - 1
+        last_indices = last_indices.clamp_min(0)
+        gather_indices = last_indices.unsqueeze(1).unsqueeze(2).expand(
+            -1, 1, embeddings.shape[-1]
+        )
+        return embeddings.gather(dim=1, index=gather_indices).squeeze(1)
+
     def forward(
         self,
         item_ids: torch.Tensor,
@@ -152,11 +165,7 @@ class SequentialEncoder(nn.Module):
         )
 
         if return_last:
-            # Safely fetch the last valid token chronologically (agnostic to left/right sequence padding)
-            last_indices = attention_mask.int().cumsum(dim=1).argmax(dim=1)
-            gather_indices = last_indices.unsqueeze(1).unsqueeze(2).expand(-1, -1, self.embedding_dim)
-            last_emb = seq_emb.gather(dim=1, index=gather_indices).squeeze(1)
-            return last_emb
+            return self.get_last_valid_embeddings(seq_emb, attention_mask)
 
         return seq_emb
 

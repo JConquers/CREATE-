@@ -231,6 +231,7 @@ class CREATEUni(nn.Module):
         attention_mask: torch.Tensor,
         mlm_mask: torch.Tensor = None,
         graph_item_emb: torch.Tensor = None,
+        return_last: bool = True,
     ) -> torch.Tensor:
         """
         Encode using sequence encoder.
@@ -260,14 +261,17 @@ class CREATEUni(nn.Module):
             precomputed = padded[item_sequence]  # (B, L, D)
 
         if self.seq_encoder_type == "bert4rec":
-            masked_emb, all_emb = self.seq_encoder(
+            bert_output = self.seq_encoder(
                 item_sequence, attention_mask, mlm_mask,
                 precomputed_emb=precomputed,
             )
+            if mlm_mask is None:
+                return bert_output
+            masked_emb, all_emb = bert_output
             return masked_emb, all_emb
         else:
             seq_emb = self.seq_encoder(
-                item_sequence, attention_mask, return_last=True,
+                item_sequence, attention_mask, return_last=return_last,
                 precomputed_emb=precomputed,
             )
             return seq_emb
@@ -303,12 +307,15 @@ class CREATEUni(nn.Module):
 
         user_ids = batch.get("user.ids")
         item_sequence = batch.get("item.ids")
+        sequence_input = batch.get("input_ids", item_sequence)
         attention_mask = batch.get("mask")  # Boolean mask: 1 for valid items, 0 for padded positions (prevents attending to padding)
         labels = batch.get("labels.ids")
         mlm_mask = batch.get("mlm_mask")  # Boolean mask: 1 for items masked out for Masked Language Modeling (BERT4Rec target)
+        graph_pos_user_ids = batch.get("graph_pos_user.ids")
+        graph_pos_item_ids = batch.get("graph_pos_item.ids")
 
-        batch_size = user_ids.shape[0] if user_ids is not None else item_sequence.shape[0]
-        device = item_sequence.device if item_sequence is not None else user_ids.device
+        batch_size = user_ids.shape[0] if user_ids is not None else sequence_input.shape[0]
+        device = sequence_input.device if sequence_input is not None else user_ids.device
 
         # === 1. Graph Branch Encoding ===
         # Process the global hypergraph through the UniGNN encoder to get embeddings 
@@ -325,26 +332,49 @@ class CREATEUni(nn.Module):
         # Process the chronological sequence of items using Transformer-based models.
         seq_emb = None
         all_seq_emb = None
+        seq_emb_for_alignment = None
         # Only skip sequence computation if we are in warmup AND we actually have a graph to warmup
         skip_sequence = is_warmup and self.use_graph
-        if self.use_sequence and item_sequence is not None and not skip_sequence:
+        if self.use_sequence and sequence_input is not None and not skip_sequence:
             if self.seq_encoder_type == "bert4rec":
                 # For BERT4Rec (Masked Language Modeling): we extract embeddings only 
                 # at the specifically masked positions to calculate the targeted MLM loss later.
                 mlm_emb, all_seq_emb = self.encode_sequence(
-                    item_sequence, attention_mask, mlm_mask,
+                    sequence_input, attention_mask, mlm_mask,
                     # Pass the graph-learned item embeddings (all_item_emb) to the sequence encoder
                     # instead of using raw table lookups (Implementation of Eq. 20: x_k = g_{i_k} + p_k)
                     graph_item_emb=all_item_emb,  
                 )
                 seq_emb = mlm_emb  # Shape: (total_num_masked_items_in_batch, D)
+                if mlm_mask is not None:
+                    seq_emb_for_alignment = torch.zeros_like(graph_user_emb)
+                    for i in range(batch_size):
+                        user_mlm_mask = mlm_mask[i]
+                        if user_mlm_mask.any():
+                            seq_emb_for_alignment[i] = all_seq_emb[i][user_mlm_mask].mean(dim=0)
+                        else:
+                            seq_emb_for_alignment[i] = all_seq_emb[i][attention_mask[i]].mean(dim=0)
             else:
-                # For SASRec (Next-item prediction): we just need the final aggregated 
-                # sequence embedding to predict the next user action.
-                seq_emb = self.encode_sequence(
-                    item_sequence, attention_mask,
-                    graph_item_emb=all_item_emb,  # Eq. 20: x_k = g_{i_k} + p_k
-                )  # Shape: (batch_size, D)
+                if self.training:
+                    all_seq_emb = self.encode_sequence(
+                        sequence_input,
+                        attention_mask,
+                        graph_item_emb=all_item_emb,
+                        return_last=False,
+                    )
+                    seq_emb = all_seq_emb[attention_mask]
+                    seq_emb_for_alignment = self.seq_encoder.get_last_valid_embeddings(
+                        all_seq_emb,
+                        attention_mask,
+                    )
+                else:
+                    seq_emb = self.encode_sequence(
+                        sequence_input,
+                        attention_mask,
+                        graph_item_emb=all_item_emb,
+                        return_last=True,
+                    )
+                    seq_emb_for_alignment = seq_emb
 
         # === 3. Prediction (No Fusion) ===
         # Per the paper, there is NO fusion of graph and sequence embeddings.
@@ -362,24 +392,8 @@ class CREATEUni(nn.Module):
 
             # Eq. 22: Barlow Twins alignment between h_u and g_u (no fusion)
             if return_alignment and not is_warmup:
-                if self.seq_encoder_type == "bert4rec" and mlm_mask is not None:
-                    # For BERT4Rec, average the per-position sequence embeddings
-                    # back to one embedding per user for alignment with g_u
-                    # all_seq_emb: (batch_size, seq_len, D)
-                    seq_emb_per_user = torch.zeros_like(graph_user_emb)
-                    for i in range(batch_size):
-                        user_mlm_mask = mlm_mask[i]
-                        if user_mlm_mask.any():
-                            # Average embeddings at masked positions for this user
-                            seq_emb_per_user[i] = all_seq_emb[i][user_mlm_mask].mean(dim=0)
-                        else:
-                            # Fallback: use mean of all positions
-                            seq_emb_per_user[i] = all_seq_emb[i][attention_mask[i]].mean(dim=0) if attention_mask[i].any() else all_seq_emb[i].mean(dim=0)
-                    graph_proj = self.graph_projector(graph_user_emb)   # project g_u
-                    seq_proj = self.seq_projector(seq_emb_per_user)     # project h_u
-                else:
-                    graph_proj = self.graph_projector(graph_user_emb)   # project g_u
-                    seq_proj = self.seq_projector(seq_emb)              # project h_u
+                graph_proj = self.graph_projector(graph_user_emb)   # project g_u
+                seq_proj = self.seq_projector(seq_emb_for_alignment) # project h_u
                 outputs["alignment_fst_embeddings"] = graph_proj
                 outputs["alignment_snd_embeddings"] = seq_proj
 
@@ -391,20 +405,31 @@ class CREATEUni(nn.Module):
 
         elif self.use_sequence:
             # Sequence-only mode: scores = h_u @ item_emb.T
-            scores = seq_emb @ self.output_item_embeddings.weight.T
+            scores = seq_emb @ self.output_item_embeddings.weight[1 : self.num_items + 1].T
             outputs["local_prediction"] = scores
 
         # === 4. Global BPR Objective (Eq. 19) ===
         # g_u^T * g_i_pos vs g_u^T * g_i_neg
         # Fires whenever graph encoder is active (joint mode, warmup, or graph-only)
-        if self.use_graph and user_ids is not None and labels is not None:
-            pos_item_emb = all_item_emb[labels]  # (batch_size, D)
+        if (
+            self.use_graph
+            and graph_pos_user_ids is not None
+            and graph_pos_item_ids is not None
+            and graph_pos_item_ids.numel() > 0
+        ):
+            graph_pos_user_emb = all_user_emb[graph_pos_user_ids]
+            pos_item_emb = all_item_emb[graph_pos_item_ids]
             neg_item_ids = torch.randint(
-                0, all_item_emb.shape[0], (batch_size,), device=device
+                0, all_item_emb.shape[0], graph_pos_item_ids.shape, device=device
             )
-            neg_item_emb = all_item_emb[neg_item_ids]  # (batch_size, D)
-            pos_scores = (graph_user_emb * pos_item_emb).sum(dim=1)
-            neg_scores = (graph_user_emb * neg_item_emb).sum(dim=1)
+            neg_item_ids = torch.where(
+                neg_item_ids == graph_pos_item_ids,
+                (neg_item_ids + 1) % all_item_emb.shape[0],
+                neg_item_ids,
+            )
+            neg_item_emb = all_item_emb[neg_item_ids]
+            pos_scores = (graph_pos_user_emb * pos_item_emb).sum(dim=1)
+            neg_scores = (graph_pos_user_emb * neg_item_emb).sum(dim=1)
             outputs["global_positive"] = pos_scores
             outputs["global_negative"] = neg_scores
 
@@ -443,10 +468,36 @@ class CREATEUni(nn.Module):
 
             # Sequence encoding (with graph-learned item embeddings per Eq. 20)
             if self.use_sequence:
-                seq_emb = self.encode_sequence(
-                    item_sequence, attention_mask,
-                    graph_item_emb=all_item_emb,
-                )
+                if self.seq_encoder_type == "bert4rec":
+                    batch_size, seq_len = item_sequence.shape
+                    extended_input_ids = torch.full(
+                        (batch_size, seq_len + 1),
+                        fill_value=self.num_items + 1,
+                        dtype=torch.long,
+                        device=item_sequence.device,
+                    )
+                    extended_input_ids[:, :seq_len] = item_sequence
+                    extended_mask = torch.zeros(
+                        (batch_size, seq_len + 1),
+                        dtype=torch.bool,
+                        device=attention_mask.device,
+                    )
+                    extended_mask[:, :seq_len] = attention_mask
+                    mask_positions = attention_mask.sum(dim=1)
+                    extended_mask[torch.arange(batch_size), mask_positions] = True
+                    mlm_mask = torch.zeros_like(extended_mask)
+                    mlm_mask[torch.arange(batch_size), mask_positions] = True
+                    seq_emb, _ = self.encode_sequence(
+                        extended_input_ids,
+                        extended_mask,
+                        mlm_mask=mlm_mask,
+                        graph_item_emb=all_item_emb,
+                    )
+                else:
+                    seq_emb = self.encode_sequence(
+                        item_sequence, attention_mask,
+                        graph_item_emb=all_item_emb,
+                    )
             else:
                 seq_emb = None
 
@@ -457,15 +508,9 @@ class CREATEUni(nn.Module):
             elif self.use_graph:
                 scores = graph_user_emb @ all_item_emb.T
             else:
-                scores = seq_emb @ self.output_item_embeddings.weight.T
+                scores = seq_emb @ self.output_item_embeddings.weight[1 : self.num_items + 1].T
 
             # Mask padding and special tokens
-            scores[:, 0] = -torch.inf  # PAD
-            if self.use_graph:
-                scores[:, self.num_items + 1:] = -torch.inf  # MASK and beyond
-            else:
-                scores[:, self.num_items + 1:] = -torch.inf
-
             # Get top-k
             topk_scores, topk_indices = torch.topk(scores, k=topk, dim=-1)
 

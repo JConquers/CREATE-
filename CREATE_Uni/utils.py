@@ -494,7 +494,8 @@ def get_graph_structure(
     items_shifted = item_ids + num_users
 
     # For UniGNN hypergraph representation:
-    # A Session hyperedge connects the user and all items interacted with in that session window.
+    # A session hyperedge connects the user and the unique items observed in a
+    # fixed-width time bin anchored at the user's first interaction.
     vertex_list = []
     edges_list = []
 
@@ -506,34 +507,26 @@ def get_graph_structure(
             it = items_shifted[i].item()
             t = timestamps[i].item()
             user_interactions[u].append((it, t))
-            
+
         edge_idx_counter = 0
         for u, history in user_interactions.items():
             history.sort(key=lambda x: x[1])
-            if not history: continue
-            
-            curr_start = history[0][1]
-            curr_items = []
-            
+            if not history:
+                continue
+
+            session_anchor = history[0][1]
+            sessions = defaultdict(set)
             for it, t in history:
-                if t - curr_start >= session_length:
-                    # Push hyperedge
-                    vertex_list.append(u)
-                    edges_list.append(edge_idx_counter)
-                    for c_it in curr_items:
-                        vertex_list.append(c_it)
-                        edges_list.append(edge_idx_counter)
-                    edge_idx_counter += 1
-                    
-                    curr_start = t
-                    curr_items = [it]
-                else:
-                    curr_items.append(it)
-                    
-            if curr_items:
+                session_idx = int((t - session_anchor) // session_length) if session_length > 0 else 0
+                sessions[session_idx].add(it)
+
+            for session_idx in sorted(sessions):
+                session_items = sorted(sessions[session_idx])
+                if not session_items:
+                    continue
                 vertex_list.append(u)
                 edges_list.append(edge_idx_counter)
-                for c_it in curr_items:
+                for c_it in session_items:
                     vertex_list.append(c_it)
                     edges_list.append(edge_idx_counter)
                 edge_idx_counter += 1
