@@ -80,10 +80,17 @@ def parse_args():
         help="Embedding dimension",
     )
     parser.add_argument(
+        "--graph_type",
+        type=str,
+        default="hypergraph",
+        choices=["hypergraph", "bipartite"],
+        help="Graph type: hypergraph (UniGNN) or bipartite (LightGCN)",
+    )
+    parser.add_argument(
         "--graph_conv_type",
         type=str,
         default="UniGCN",
-        choices=["UniGCN", "UniGIN", "UniSAGE", "UniGAT"],
+        choices=["UniGCN", "UniGIN", "UniSAGE", "UniGAT", "LightGCN"],
         help="Graph convolution type",
     )
     parser.add_argument(
@@ -476,17 +483,32 @@ def main():
     # Set up graph structure if using graph encoder
     if args.use_graph and data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
         logger.info("Setting up graph structure...")
-        vertex, edges, degV, degE = get_graph_structure(
-            user_ids=data["train_user"],
-            item_ids=data["train_item"],
-            timestamps=data.get("train_time", None),
-            num_users=num_users,
-            num_items=num_items,
-            device=device,
-            session_length=args.session_length,
-        )
-        model.set_graph_structure(vertex, edges, degV, degE)
-        logger.info(f"Graph structure: {len(vertex)} nodes in incidence matrix, {edges.max().item() + 1} edges")
+
+        if args.graph_type == "bipartite" or args.graph_conv_type == "LightGCN":
+            # LightGCN: simple bipartite graph
+            from .utils import get_bipartite_graph_structure
+            edge_index, degV_inv_sqrt = get_bipartite_graph_structure(
+                user_ids=data["train_user"],
+                item_ids=data["train_item"],
+                num_users=num_users,
+                num_items=num_items,
+                device=device,
+            )
+            model.set_graph_structure(edge_index=edge_index, degV_inv_sqrt=degV_inv_sqrt, is_hypergraph=False)
+            logger.info(f"Bipartite graph: {edge_index.shape[1]//2} undirected edges")
+        else:
+            # UniGNN: session-based hypergraph
+            vertex, edges, degV, degE = get_graph_structure(
+                user_ids=data["train_user"],
+                item_ids=data["train_item"],
+                timestamps=data.get("train_time", None),
+                num_users=num_users,
+                num_items=num_items,
+                device=device,
+                session_length=args.session_length,
+            )
+            model.set_graph_structure(vertex, edges, degV, degE)
+            logger.info(f"Hypergraph structure: {len(vertex)} nodes in incidence matrix, {edges.max().item() + 1} edges")
 
     model = model.to(device)
 

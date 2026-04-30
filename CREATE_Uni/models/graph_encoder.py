@@ -1,5 +1,5 @@
 """
-Graph Encoder for CREATE-Uni using UniGNN convolutions.
+Graph Encoder for CREATE-Uni using UniGNN convolutions and LightGCN.
 """
 
 import torch
@@ -143,6 +143,93 @@ class UniGNNEncoder(nn.Module):
 
         if layer_outputs:
             ego_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
+
+        # Split back into user and item embeddings
+        user_final = ego_embeddings[: self.num_users]
+        item_final = ego_embeddings[self.num_users :]
+
+        return user_final, item_final
+
+
+class LightGCNEncoder(nn.Module):
+    """
+    LightGCN graph encoder for user-item bipartite graph.
+
+    Implements LightGCN propagation:
+        e_u^(k+1) = sum_{i in N(u)} 1/sqrt(|N(u)||N(i)|) * e_i^(k)
+        e_i^(k+1) = sum_{u in N(i)} 1/sqrt(|N(i)||N(u)|) * e_u^(k)
+
+    Final embeddings are layer-average: e_u = mean(e_u^(0), ..., e_u^(K))
+    """
+
+    def __init__(
+        self,
+        num_users: int,
+        num_items: int,
+        embedding_dim: int,
+        n_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_users = num_users
+        self.num_items = num_items
+        self.embedding_dim = embedding_dim
+        self.n_layers = n_layers
+
+        # User and item embeddings
+        self.user_embeddings = nn.Embedding(num_users, embedding_dim)
+        self.item_embeddings = nn.Embedding(num_items, embedding_dim)
+
+        # Initialize embeddings
+        nn.init.xavier_uniform_(self.user_embeddings.weight)
+        nn.init.xavier_uniform_(self.item_embeddings.weight)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        edge_index: torch.Tensor,
+        degV_inv_sqrt: torch.Tensor,
+    ):
+        """
+        Forward pass through LightGCN encoder.
+
+        Args:
+            edge_index: Edge indices [2, 2*E] - [users; items_shifted] + reverse
+            degV_inv_sqrt: Vertex degree normalization (N,)
+
+        Returns:
+            user_embeddings: Final user embeddings (num_users, D)
+            item_embeddings: Final item embeddings (num_items, D)
+        """
+        N = self.num_users + self.num_items
+
+        # Combine user and item embeddings
+        ego_embeddings = torch.cat(
+            [self.user_embeddings.weight, self.item_embeddings.weight], dim=0
+        )
+
+        # Store all layer embeddings for layer-average pooling
+        all_embeddings = [ego_embeddings]
+
+        for _ in range(self.n_layers):
+            # LightGCN propagation: e^(k+1) = D^(-0.5) * A * D^(-0.5) * e^(k)
+            # Step 1: Multiply source embeddings by D^(-0.5)
+            ego_embeddings = ego_embeddings * degV_inv_sqrt.unsqueeze(-1)
+
+            # Step 2: Message passing - sum neighbor embeddings
+            # edge_index[0] = destination nodes, edge_index[1] = source nodes
+            neighbor_embeddings = ego_embeddings[edge_index[1]]
+            ego_embeddings = torch.zeros(N, self.embedding_dim, device=ego_embeddings.device)
+            ego_embeddings.index_add_(0, edge_index[0], neighbor_embeddings)
+
+            # Step 3: Multiply by D^(-0.5) again for symmetric normalization
+            ego_embeddings = ego_embeddings * degV_inv_sqrt.unsqueeze(-1)
+
+            all_embeddings.append(ego_embeddings)
+
+        # Layer combination: average all layer outputs (LightGCN style)
+        ego_embeddings = torch.stack(all_embeddings, dim=0).mean(dim=0)
 
         # Split back into user and item embeddings
         user_final = ego_embeddings[: self.num_users]

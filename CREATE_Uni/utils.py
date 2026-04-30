@@ -454,6 +454,55 @@ def compute_item_distance_matrix(
     return dist
 
 
+def get_bipartite_graph_structure(
+    user_ids: torch.Tensor,
+    item_ids: torch.Tensor,
+    num_users: int,
+    num_items: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Prepare bipartite graph structure for LightGCN message passing.
+
+    Builds a simple user-item bipartite graph (not hypergraph).
+    Each interaction (u, i) creates an undirected edge u <-> i.
+
+    Args:
+        user_ids: User IDs tensor (num_interactions,)
+        item_ids: Item IDs tensor (num_interactions,)
+        num_users: Number of users
+        num_items: Number of items
+        device: Device to place tensors on
+
+    Returns:
+        edge_index: Edge indices [2, 2*E] - [user_ids; item_ids_shifted] + reverse
+        degV_inv_sqrt: Vertex degree normalization (num_users+num_items,)
+    """
+    # Build bipartite graph in combined space
+    # Users: 0 to num_users-1
+    # Items: num_users to num_users+num_items-1
+    total_nodes = num_users + num_items
+
+    # Shift item IDs to be in combined space
+    items_shifted = item_ids + num_users
+
+    # Build edge index [2, E]
+    edge_index = torch.stack([user_ids, items_shifted], dim=0).to(device)
+
+    # Make undirected (add reverse edges) for LightGCN propagation
+    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+
+    # Compute vertex degrees
+    degV = torch.zeros(total_nodes, device=device)
+    degV.index_add_(0, edge_index[0], torch.ones_like(edge_index[0], dtype=torch.float))
+
+    # Normalize: D^(-0.5) for symmetric Laplacian
+    degV_inv_sqrt = degV.pow(-0.5)
+    degV_inv_sqrt[torch.isinf(degV_inv_sqrt)] = 1.0
+
+    return edge_index, degV_inv_sqrt
+
+
 def get_graph_structure(
     user_ids: torch.Tensor,
     item_ids: torch.Tensor,

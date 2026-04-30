@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
-from .graph_encoder import UniGNNEncoder, LightGCNStyleEncoder
+from .graph_encoder import UniGNNEncoder, LightGCNEncoder, LightGCNStyleEncoder
 from .sequence_encoder import SequentialEncoder, Bert4RecEncoder
 
 
@@ -120,21 +120,35 @@ class CREATEUni(nn.Module):
 
         # Graph Encoder
         if use_graph:
-            self.graph_encoder = UniGNNEncoder(
-                num_users=num_users,
-                num_items=num_items,
-                embedding_dim=embedding_dim,
-                n_layers=graph_n_layers,
-                conv_type=graph_conv_type,
-                heads=graph_heads,
-                dropout=graph_dropout,
-                use_norm=graph_use_norm,
-                first_aggregate=graph_first_agg,
-                second_aggregate=graph_second_agg,
-            )
-            # Store graph structure for message passing
-            self.register_buffer("graph_vertex", torch.zeros(0, dtype=torch.long))
-            self.register_buffer("graph_edges", torch.zeros(0, dtype=torch.long))
+            if graph_conv_type == "LightGCN":
+                self.graph_encoder = LightGCNEncoder(
+                    num_users=num_users,
+                    num_items=num_items,
+                    embedding_dim=embedding_dim,
+                    n_layers=graph_n_layers,
+                    dropout=graph_dropout,
+                )
+                self.is_hypergraph = False
+                # Store bipartite graph structure
+                self.register_buffer("graph_edge_index", torch.zeros(0, dtype=torch.long))
+                self.register_buffer("graph_degV_inv_sqrt", torch.zeros(0))
+            else:
+                self.graph_encoder = UniGNNEncoder(
+                    num_users=num_users,
+                    num_items=num_items,
+                    embedding_dim=embedding_dim,
+                    n_layers=graph_n_layers,
+                    conv_type=graph_conv_type,
+                    heads=graph_heads,
+                    dropout=graph_dropout,
+                    use_norm=graph_use_norm,
+                    first_aggregate=graph_first_agg,
+                    second_aggregate=graph_second_agg,
+                )
+                self.is_hypergraph = True
+                # Store hypergraph structure
+                self.register_buffer("graph_vertex", torch.zeros(0, dtype=torch.long))
+                self.register_buffer("graph_edges", torch.zeros(0, dtype=torch.long))
 
         # Sequence Encoder
         if use_sequence:
@@ -178,26 +192,38 @@ class CREATEUni(nn.Module):
 
     def set_graph_structure(
         self,
-        vertex: torch.Tensor,
-        edges: torch.Tensor,
+        vertex: torch.Tensor = None,
+        edges: torch.Tensor = None,
         degV: torch.Tensor = None,
         degE: torch.Tensor = None,
+        edge_index: torch.Tensor = None,
+        degV_inv_sqrt: torch.Tensor = None,
+        is_hypergraph: bool = True,
     ):
         """
         Set the graph structure for message passing.
 
         Args:
-            vertex: Row indices of incidence matrix (2*E,)
-            edges: Column indices of incidence matrix (2*E,)
-            degV: Vertex degree normalization (N,)
-            degE: Edge degree normalization (E,)
+            vertex: Row indices of incidence matrix (2*E,) - for hypergraph
+            edges: Column indices of incidence matrix (2*E,) - for hypergraph
+            degV: Vertex degree normalization (N,) - for hypergraph
+            degE: Edge degree normalization (E,) - for hypergraph
+            edge_index: Edge indices [2, 2*E] - for bipartite (LightGCN)
+            degV_inv_sqrt: Inverse sqrt vertex degree (N,) - for bipartite (LightGCN)
+            is_hypergraph: True for UniGNN hypergraph, False for LightGCN bipartite
         """
-        self.register_buffer("graph_vertex", vertex)
-        self.register_buffer("graph_edges", edges)
-        if degV is not None:
-            self.register_buffer("graph_degV", degV)
-        if degE is not None:
-            self.register_buffer("graph_degE", degE)
+        self.is_hypergraph = is_hypergraph
+        if is_hypergraph:
+            self.register_buffer("graph_vertex", vertex)
+            self.register_buffer("graph_edges", edges)
+            if degV is not None:
+                self.register_buffer("graph_degV", degV)
+            if degE is not None:
+                self.register_buffer("graph_degE", degE)
+        else:
+            self.register_buffer("graph_edge_index", edge_index)
+            if degV_inv_sqrt is not None:
+                self.register_buffer("graph_degV_inv_sqrt", degV_inv_sqrt)
 
     def encode_graph(
         self,
@@ -211,12 +237,18 @@ class CREATEUni(nn.Module):
             user_emb: User embeddings (num_users, D) or (batch_size, D) if user_ids provided
             item_emb: Item embeddings (num_items, D)
         """
-        vertex = getattr(self, "graph_vertex", None)
-        edges = getattr(self, "graph_edges", None)
-        degV = getattr(self, "graph_degV", None)  # Note: stored as graph_degV buffer
-        degE = getattr(self, "graph_degE", None)  # Note: stored as graph_degE buffer
-
-        user_emb, item_emb = self.graph_encoder(vertex, edges, degE, degV)
+        if self.is_hypergraph:
+            # UniGNN hypergraph encoding
+            vertex = getattr(self, "graph_vertex", None)
+            edges = getattr(self, "graph_edges", None)
+            degV = getattr(self, "graph_degV", None)
+            degE = getattr(self, "graph_degE", None)
+            user_emb, item_emb = self.graph_encoder(vertex, edges, degE, degV)
+        else:
+            # LightGCN bipartite graph encoding
+            edge_index = getattr(self, "graph_edge_index", None)
+            degV_inv_sqrt = getattr(self, "graph_degV_inv_sqrt", None)
+            user_emb, item_emb = self.graph_encoder(edge_index, degV_inv_sqrt)
 
         if user_ids is not None:
             user_emb = user_emb[user_ids]
