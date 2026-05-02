@@ -26,6 +26,22 @@ class AmazonBooksDataset(BaseDataset):
         "Books.csv.gz",
         "reviews_Books_5.json.gz",
     ]
+
+    JSON_CHUNK_SIZE = 200_000
+    CSV_CHUNK_SIZE = 200_000
+
+    def _read_chunks(self, chunk_iter: pd.io.parsers.TextFileReader) -> pd.DataFrame:
+        chunks = []
+        total_rows = 0
+        for idx, chunk in enumerate(chunk_iter, start=1):
+            normalized = self._normalize_raw_columns(chunk)
+            chunks.append(normalized)
+            total_rows += len(normalized)
+            if idx % 10 == 0:
+                print(f"Processed {total_rows:,} rows...")
+        if not chunks:
+            raise ValueError("No valid interactions after chunked load.")
+        return pd.concat(chunks, ignore_index=True)
     @staticmethod
     def _resolve_column(columns: list[str], candidates: list[str], field_name: str) -> str:
         for name in candidates:
@@ -179,15 +195,24 @@ class AmazonBooksDataset(BaseDataset):
             print(f"Detected JSON reviews input: {self.raw_file}")
             opener = gzip.open if raw_name.endswith(".gz") else open
             with opener(self.raw_file, 'rt') as f:
-                df = pd.read_json(f, lines=True)
+                if self.JSON_CHUNK_SIZE > 0:
+                    chunk_iter = pd.read_json(
+                        f,
+                        lines=True,
+                        chunksize=self.JSON_CHUNK_SIZE,
+                    )
+                    df = self._read_chunks(chunk_iter)
+                else:
+                    df = self._normalize_raw_columns(pd.read_json(f, lines=True))
         else:
             print(f"Detected CSV reviews input: {self.raw_file}")
             opener = gzip.open if raw_name.endswith(".gz") else open
             with opener(self.raw_file, 'rt') as f:
-                df = pd.read_csv(f)
-
-        # Normalize schema differences across Amazon dumps.
-        df = self._normalize_raw_columns(df)
+                if self.CSV_CHUNK_SIZE > 0:
+                    chunk_iter = pd.read_csv(f, chunksize=self.CSV_CHUNK_SIZE)
+                    df = self._read_chunks(chunk_iter)
+                else:
+                    df = self._normalize_raw_columns(pd.read_csv(f))
 
         # Sort by user and timestamp to ensure chronological order
         df = df.sort_values(['user_id', 'timestamp'])
