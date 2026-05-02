@@ -16,6 +16,7 @@ class CreatePoneLoss:
         contrastive_tau: float,
         neg_branch_scale: float,
         local_loss_chunk_size: int = 0,
+        rating_offset: float = 0.0,
     ):
         self.w_global = w_global
         self.w_align = w_align
@@ -24,10 +25,19 @@ class CreatePoneLoss:
         self.contrastive_tau = contrastive_tau
         self.neg_branch_scale = neg_branch_scale
         self.local_loss_chunk_size = local_loss_chunk_size
+        self.rating_offset = rating_offset
 
     @staticmethod
     def _zero_like(reference: torch.Tensor) -> torch.Tensor:
         return reference.sum() * 0.0
+
+    def _rating_weight(self, ratings: torch.Tensor | None, positive: bool) -> torch.Tensor | None:
+        if ratings is None or ratings.numel() == 0:
+            return None
+        sign = torch.sign(ratings - self.rating_offset)
+        if positive:
+            return (-0.5 * sign + 1.5)
+        return (0.5 * sign + 1.5)
 
     def _local_loss(self, outputs: dict, batch: dict) -> torch.Tensor:
         target_ids = batch["target_ids"]
@@ -101,31 +111,43 @@ class CreatePoneLoss:
         loss = self._zero_like(interest_user)
 
         pos_users = triplets["pos_users"]
-        if pos_users.numel() > 0:
+        pos_negs = triplets.get("pos_negs")
+        pos_ratings = triplets.get("pos_ratings")
+        if pos_users.numel() > 0 and pos_negs is not None and pos_negs.numel() > 0:
             pos_items = triplets["pos_items"]
-            pos_negs = triplets["pos_negs"]
-
             z_u = interest_user[pos_users]
             z_i = interest_item[pos_items]
+            if pos_negs.dim() == 1:
+                pos_negs = pos_negs.unsqueeze(1)
             z_j = interest_item[pos_negs]
 
             y_ui = (z_u * z_i).sum(dim=1)
-            y_uj = (z_u * z_j).sum(dim=1)
-            loss = loss - F.logsigmoid(y_ui - y_uj).mean()
+            y_uj = (z_u.unsqueeze(1) * z_j).sum(dim=2)
+            weight = self._rating_weight(pos_ratings, positive=True)
+            if weight is None:
+                weight = torch.ones_like(y_ui)
+            diff = weight.unsqueeze(1) * y_ui.unsqueeze(1) - y_uj
+            loss = loss - F.logsigmoid(diff).mean()
 
         if include_negative:
             neg_users = triplets["neg_users"]
-            if neg_users.numel() > 0:
+            neg_negs = triplets.get("neg_negs")
+            neg_ratings = triplets.get("neg_ratings")
+            if neg_users.numel() > 0 and neg_negs is not None and neg_negs.numel() > 0:
                 neg_items = triplets["neg_items"]
-                neg_negs = triplets["neg_negs"]
-
                 v_u = disinterest_user[neg_users]
                 v_i = disinterest_item[neg_items]
+                if neg_negs.dim() == 1:
+                    neg_negs = neg_negs.unsqueeze(1)
                 v_j = disinterest_item[neg_negs]
 
                 y_ui = self.neg_branch_scale * (v_u * v_i).sum(dim=1)
-                y_uj = (v_u * v_j).sum(dim=1)
-                loss = loss - F.logsigmoid(y_uj - y_ui).mean()
+                y_uj = (v_u.unsqueeze(1) * v_j).sum(dim=2)
+                weight = self._rating_weight(neg_ratings, positive=False)
+                if weight is None:
+                    weight = torch.ones_like(y_ui)
+                diff = y_uj - weight.unsqueeze(1) * y_ui.unsqueeze(1)
+                loss = loss - F.logsigmoid(diff).mean()
 
         return loss
 

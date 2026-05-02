@@ -167,13 +167,16 @@ def backward_and_step(
 
 def build_empty_triplets(device: torch.device) -> dict[str, torch.Tensor]:
     empty = torch.empty(0, dtype=torch.long, device=device)
+    empty_float = torch.empty(0, dtype=torch.float32, device=device)
     return {
         "pos_users": empty,
         "pos_items": empty,
         "pos_negs": empty,
+        "pos_ratings": empty_float,
         "neg_users": empty,
         "neg_items": empty,
         "neg_negs": empty,
+        "neg_ratings": empty_float,
     }
 
 
@@ -540,6 +543,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pos-threshold", type=float, default=4.0)
     parser.add_argument("--neg-threshold", type=float, default=3.0)
     parser.add_argument(
+        "--rating-offset",
+        type=float,
+        default=3.5,
+        help="Rating offset used for Pone-style BPR weighting.",
+    )
+    parser.add_argument(
+        "--neg-sample-k",
+        type=int,
+        default=40,
+        help="Number of negatives to sample per interaction (Pone uses 40).",
+    )
+    parser.add_argument(
+        "--neg-sample-power",
+        type=float,
+        default=0.75,
+        help="Popularity sampling power for negatives (Pone uses 0.75).",
+    )
+    parser.add_argument(
+        "--neg-sample-exclude-all",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude all seen items (pos+neg) when sampling negatives.",
+    )
+    parser.add_argument(
         "--allow-kaggle-cpu",
         action="store_true",
         help="Allow CPU fallback on Kaggle when CUDA is unavailable.",
@@ -808,6 +835,9 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         pos_threshold=args.pos_threshold,
         neg_threshold=args.neg_threshold,
         seed=args.seed,
+        num_negs=args.neg_sample_k,
+        neg_sampling_power=args.neg_sample_power,
+        exclude_seen=args.neg_sample_exclude_all,
     )
 
     model = CreatePoneModel(
@@ -831,6 +861,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         contrastive_tau=args.contrastive_tau,
         neg_branch_scale=args.neg_branch_scale,
         local_loss_chunk_size=args.local_loss_chunk_size,
+        rating_offset=args.rating_offset,
     )
 
     optimizer = torch.optim.AdamW(
