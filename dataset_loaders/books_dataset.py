@@ -157,13 +157,7 @@ class AmazonBooksDataset(BaseDataset):
 
         self.raw_file.parent.mkdir(parents=True, exist_ok=True)
 
-        def reporthook(blocknum, blocksize, totalsize):
-            readsofar = blocknum * blocksize
-            if totalsize > 0:
-                percent = readsofar * 100 / totalsize
-                print(f"\rDownload progress: {percent:.1f}%", end='')
-
-        urllib.request.urlretrieve(self.URL, self.raw_file, reporthook)
+        urllib.request.urlretrieve(self.URL, self.raw_file)
         print(f"\nDownload complete: {self.raw_file}")
 
     def _preprocess(self):
