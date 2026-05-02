@@ -87,7 +87,12 @@ class CreatePoneLoss:
         log_denom = max_scores + torch.log(sum_exp + 1e-12)
         return -(target_logits - log_denom).mean()
 
-    def _dual_feedback_loss(self, outputs: dict, triplets: dict) -> torch.Tensor:
+    def _dual_feedback_loss(
+        self,
+        outputs: dict,
+        triplets: dict,
+        include_negative: bool = True,
+    ) -> torch.Tensor:
         interest_user = outputs["interest_user_embeddings"]
         disinterest_user = outputs["disinterest_user_embeddings"]
         interest_item = outputs["interest_item_embeddings"]
@@ -108,18 +113,19 @@ class CreatePoneLoss:
             y_uj = (z_u * z_j).sum(dim=1)
             loss = loss - F.logsigmoid(y_ui - y_uj).mean()
 
-        neg_users = triplets["neg_users"]
-        if neg_users.numel() > 0:
-            neg_items = triplets["neg_items"]
-            neg_negs = triplets["neg_negs"]
+        if include_negative:
+            neg_users = triplets["neg_users"]
+            if neg_users.numel() > 0:
+                neg_items = triplets["neg_items"]
+                neg_negs = triplets["neg_negs"]
 
-            v_u = disinterest_user[neg_users]
-            v_i = disinterest_item[neg_items]
-            v_j = disinterest_item[neg_negs]
+                v_u = disinterest_user[neg_users]
+                v_i = disinterest_item[neg_items]
+                v_j = disinterest_item[neg_negs]
 
-            y_ui = self.neg_branch_scale * (v_u * v_i).sum(dim=1)
-            y_uj = (v_u * v_j).sum(dim=1)
-            loss = loss - F.logsigmoid(y_uj - y_ui).mean()
+                y_ui = self.neg_branch_scale * (v_u * v_i).sum(dim=1)
+                y_uj = (v_u * v_j).sum(dim=1)
+                loss = loss - F.logsigmoid(y_uj - y_ui).mean()
 
         return loss
 
@@ -212,9 +218,24 @@ class CreatePoneLoss:
 
         return on_diag + self.barlow_lambda * off_diag + self.orthogonal_mu * orthogonal
 
-    def __call__(self, outputs: dict, batch: dict, triplets: dict, warmup: bool) -> dict:
-        global_df = self._dual_feedback_loss(outputs, triplets)
-        global_cl = self._contrastive_loss(outputs, triplets)
+    def __call__(
+        self,
+        outputs: dict,
+        batch: dict,
+        triplets: dict,
+        warmup: bool,
+        include_negative: bool = True,
+        include_contrastive: bool = True,
+    ) -> dict:
+        global_df = self._dual_feedback_loss(
+            outputs,
+            triplets,
+            include_negative=include_negative,
+        )
+        if include_contrastive:
+            global_cl = self._contrastive_loss(outputs, triplets)
+        else:
+            global_cl = self._zero_like(outputs["interest_user_embeddings"])
         global_loss = global_df + global_cl
 
         if warmup:

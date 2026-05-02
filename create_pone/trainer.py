@@ -479,6 +479,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", choices=["beauty", "books"], required=True)
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./outputs/create_pone")
+    parser.add_argument(
+        "--books-protocol",
+        choices=["default", "pone"],
+        default="default",
+        help="Books data protocol: default loader or Pone-GNN pre-split files.",
+    )
+    parser.add_argument(
+        "--books-pone-version",
+        type=int,
+        default=1,
+        help="Pone-GNN Amazon split version used when --books-protocol pone.",
+    )
+    parser.add_argument(
+        "--books-pone-split-dir",
+        type=str,
+        default="",
+        help="Directory containing train_amazon{version}.dat and test_amazon{version}.dat.",
+    )
 
     parser.add_argument("--max-seq-len", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -506,6 +524,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orthogonal-mu", type=float, default=0.1)
     parser.add_argument("--contrastive-tau", type=float, default=1.0)
     parser.add_argument("--neg-branch-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--pone-neg-every",
+        type=int,
+        default=10,
+        help="Enable Pone-style negative/contrastive losses every N epochs (<=0 always on).",
+    )
+    parser.add_argument(
+        "--pone-neg-offset",
+        type=int,
+        default=1,
+        help="Epoch offset for Pone scheduling (1 means epochs 1,11,21...).",
+    )
 
     parser.add_argument("--pos-threshold", type=float, default=4.0)
     parser.add_argument("--neg-threshold", type=float, default=3.0)
@@ -709,7 +739,21 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         dataset_name=args.dataset,
         data_dir=args.data_dir,
         max_sequence_length=args.max_seq_len,
+        books_protocol=args.books_protocol,
+        books_pone_version=args.books_pone_version,
+        books_pone_split_dir=(args.books_pone_split_dir or None),
     )
+    if args.dataset == "books" and args.books_protocol == "pone":
+        print(
+            "Using Pone-GNN books protocol:",
+            f"version={args.books_pone_version}",
+            f"bundle={bundle.name}",
+        )
+        if bundle.num_users != 35736 or bundle.num_items != 38121:
+            print(
+                "Warning: loaded Pone protocol but cardinalities differ from the paper benchmark "
+                f"(expected users=35736, items=38121; got users={bundle.num_users}, items={bundle.num_items})."
+            )
 
     amp_element_multiplier = 2 if use_amp else 1
     effective_logit_elements = int(args.max_logit_elements * amp_element_multiplier)
@@ -844,6 +888,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         "Loaded dataset:",
         f"users={bundle.num_users}",
         f"items={bundle.num_items}",
+        f"books_protocol={args.books_protocol if args.dataset == 'books' else 'n/a'}",
         f"train_interactions={len(bundle.train_df)}",
         f"train_sequences={len(train_dataset)}",
         f"batch_size={effective_batch_size}",
@@ -875,6 +920,11 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         print(
             "Warning: low free disk space detected. "
             "Consider removing old outputs or lowering checkpoint retention."
+        )
+    if args.dataset == "books" and (args.pos_threshold != 3.5 or args.neg_threshold != 3.5):
+        print(
+            "Note: for closer Pone-GNN comparison on Amazon-Books, "
+            "use --pos-threshold 3.5 --neg-threshold 3.5."
         )
     if args.warmup_epochs > 0 and args.eval_every > 0:
         print(
@@ -913,6 +963,12 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         warmup = epoch < args.warmup_epochs
         model.train()
 
+        if args.pone_neg_every <= 0:
+            pone_neg_active = True
+        else:
+            offset = args.pone_neg_offset % args.pone_neg_every
+            pone_neg_active = ((epoch + 1) % args.pone_neg_every) == offset
+
         global_steps = max(1, args.warmup_global_steps if warmup else args.global_steps_per_epoch)
         global_value_sum = 0.0
         global_df_sum = 0.0
@@ -931,6 +987,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 batch={},
                 triplets=global_triplets,
                 warmup=True,
+                include_negative=pone_neg_active,
+                include_contrastive=pone_neg_active,
             )
 
             global_step_loss = (
@@ -1026,6 +1084,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             batch=batch,
                             triplets=joint_triplets,
                             warmup=False,
+                            include_negative=pone_neg_active,
+                            include_contrastive=pone_neg_active,
                         )
                 else:
                     autocast_ctx = amp_autocast_context(
@@ -1061,6 +1121,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                             batch=batch,
                             triplets=empty_triplets,
                             warmup=False,
+                            include_negative=pone_neg_active,
+                            include_contrastive=pone_neg_active,
                         )
 
                 used_full_joint_step = run_full_joint
@@ -1119,6 +1181,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                                 batch=batch,
                                 triplets=empty_triplets,
                                 warmup=False,
+                                include_negative=pone_neg_active,
+                                include_contrastive=pone_neg_active,
                             )
 
                         try:
@@ -1267,10 +1331,10 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             print(
                 f"Eval {eval_metrics['split']}@{eval_metrics['topk']} | "
                 f"users={eval_metrics['users']} | "
-                f"P={eval_metrics['precision']:.4f} | "
-                f"R={eval_metrics['recall']:.4f} | "
-                f"NDCG={eval_metrics['ndcg']:.4f} | "
-                f"HR={eval_metrics['hr']:.4f} | "
+                f"P={eval_metrics['precision']:.4f} ({eval_metrics['precision'] * 100:.2f}%) | "
+                f"R={eval_metrics['recall']:.4f} ({eval_metrics['recall'] * 100:.2f}%) | "
+                f"NDCG={eval_metrics['ndcg']:.4f} ({eval_metrics['ndcg'] * 100:.2f}%) | "
+                f"HR={eval_metrics['hr']:.4f} ({eval_metrics['hr'] * 100:.2f}%) | "
                 f"targets/user={eval_metrics['avg_targets']:.2f} | "
                 f"time={format_duration(eval_elapsed)}"
             )

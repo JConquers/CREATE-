@@ -39,12 +39,13 @@ class SequenceEncoder(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = item_embeddings.shape
 
+        lengths = attention_mask.long().sum(dim=1).clamp(min=1)
         positions = (
-            torch.arange(seq_len, device=item_embeddings.device)
-            .unsqueeze(0)
-            .expand(batch_size, seq_len)
-        )
-        sequence_inputs = item_embeddings + self.position_embedding(positions)
+            lengths[:, None] - 1
+            - torch.arange(seq_len, device=item_embeddings.device)[None]
+        ).clamp(min=0)
+        sequence_inputs = item_embeddings * (item_embeddings.size(-1) ** 0.5)
+        sequence_inputs = sequence_inputs + self.position_embedding(positions)
         sequence_inputs = self.layer_norm(sequence_inputs)
         sequence_inputs = self.dropout(sequence_inputs)
         sequence_inputs = sequence_inputs.masked_fill(

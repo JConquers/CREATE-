@@ -12,7 +12,7 @@ class AmazonBooksDataset(BaseDataset):
     """Amazon Books dataset (5-core).
 
     Downloads from:
-    https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Books.csv.gz
+    https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Books_5.json.gz
 
     Uses leave-last-out splitting:
     - For each user, the last interaction (by timestamp) goes to test
@@ -20,8 +20,12 @@ class AmazonBooksDataset(BaseDataset):
     - All earlier interactions go to training
     """
 
-    URL = "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/benchmark/5core/rating_only/Books.csv.gz"
+    URL = "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Books_5.json.gz"
 
+    RAW_FALLBACKS = [
+        "Books.csv.gz",
+        "reviews_Books_5.json.gz",
+    ]
     @staticmethod
     def _resolve_column(columns: list[str], candidates: list[str], field_name: str) -> str:
         for name in candidates:
@@ -70,6 +74,8 @@ class AmazonBooksDataset(BaseDataset):
         super().__init__(data_dir, max_sequence_length)
         self.dataset_name = 'amazon_books'
 
+        raw_filename = Path(self.URL).name
+
         # Check multiple possible locations for Kaggle compatibility
         data_dir_path = Path(data_dir)
 
@@ -95,11 +101,20 @@ class AmazonBooksDataset(BaseDataset):
         # If no preprocessed file found, look for raw file
         if self.processed_file is None:
             possible_raw_paths = [
-                data_dir_path / 'Books.csv.gz',
-                Path('./data/Books.csv.gz'),
-                Path('../input/books/Books.csv.gz'),
-                Path('/kaggle/input/books/Books.csv.gz'),
+                data_dir_path / raw_filename,
+                Path('./data') / raw_filename,
+                Path('../input/books') / raw_filename,
+                Path('/kaggle/input/books') / raw_filename,
             ]
+            for fallback in self.RAW_FALLBACKS:
+                possible_raw_paths.extend(
+                    [
+                        data_dir_path / fallback,
+                        Path('./data') / fallback,
+                        Path('../input/books') / fallback,
+                        Path('/kaggle/input/books') / fallback,
+                    ]
+                )
             for p in possible_raw_paths:
                 if p.exists():
                     self.raw_file = p
@@ -109,11 +124,11 @@ class AmazonBooksDataset(BaseDataset):
 
             # Default to download if no raw file found
             if self.raw_file is None:
-                self.raw_file = data_dir_path / 'Books.csv.gz'
+                self.raw_file = data_dir_path / raw_filename
                 self.processed_file = data_dir_path / 'books_processed.pkl'
         else:
             # Set raw_file for potential re-download if needed
-            self.raw_file = data_dir_path / 'Books.csv.gz'
+            self.raw_file = data_dir_path / raw_filename
 
     def _download(self):
         """Download the dataset if not already present."""
@@ -157,10 +172,19 @@ class AmazonBooksDataset(BaseDataset):
 
         print("Preprocessing dataset...")
 
-        # Read the CSV
+        # Read CSV or JSON (line-delimited) based on file extension.
         import gzip
-        with gzip.open(self.raw_file, 'rt') as f:
-            df = pd.read_csv(f)
+        raw_name = self.raw_file.name.lower()
+        if raw_name.endswith(".json") or raw_name.endswith(".json.gz"):
+            print(f"Detected JSON reviews input: {self.raw_file}")
+            opener = gzip.open if raw_name.endswith(".gz") else open
+            with opener(self.raw_file, 'rt') as f:
+                df = pd.read_json(f, lines=True)
+        else:
+            print(f"Detected CSV reviews input: {self.raw_file}")
+            opener = gzip.open if raw_name.endswith(".gz") else open
+            with opener(self.raw_file, 'rt') as f:
+                df = pd.read_csv(f)
 
         # Normalize schema differences across Amazon dumps.
         df = self._normalize_raw_columns(df)
