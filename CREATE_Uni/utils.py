@@ -511,6 +511,7 @@ def get_graph_structure(
     device: torch.device,
     timestamps: Optional[torch.Tensor] = None,
     session_length: int = 86400,
+    first_aggregate: str = "mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prepare graph structure for UniGNN message passing using session hyperedges.
@@ -523,12 +524,13 @@ def get_graph_structure(
         device: Device to place tensors on
         timestamps: timestamps of interactions (Optional)
         session_length: Maximum temporal length to bound a user's isolated session.
+        first_aggregate: Aggregation method for V→E scatter (must match UniGNN conv).
 
     Returns:
         vertex: Row indices of incidence matrix (2*num_interactions,)
         edges: Column indices of incidence matrix (2*num_interactions,)
         degV: Vertex degree normalization (num_users+num_items,)
-        degE: Edge degree normalization (num_interactions,)
+        degE: Edge degree normalization (num_hyperedges,)
     """
     import scipy.sparse as sp
     from torch_scatter import scatter
@@ -598,18 +600,20 @@ def get_graph_structure(
     data = np.ones(len(row))
     H = sp.csr_matrix((data, (row, col)), shape=(total_nodes, num_hyperedges))
 
-    # Compute degrees
+    # Compute raw vertex degrees from incidence matrix
     degV_raw = np.array(H.sum(1)).flatten()  # Node degrees
-    degE_raw = np.array(H.sum(0)).flatten()  # Edge degrees (size of each session hyperedge)
-
     degV = torch.from_numpy(degV_raw).float().to(device)
-    degE = torch.from_numpy(degE_raw).float().to(device)
 
-    # Normalize for GCN-style propagation: D^(-0.5)
-    degE_inv_sqrt = degE.pow(-0.5)
-    degE_inv_sqrt[torch.isinf(degE_inv_sqrt)] = 1.0
+    # --- Official UniGNN degE computation (from prepare.py) ---
+    # degE is NOT edge cardinality. It's the aggregated vertex degrees of
+    # nodes within each edge, matching the first_aggregate used in the conv.
+    # degE = scatter(degV[vertex], edges, reduce=first_aggregate).pow(-0.5)
+    degE = scatter(degV[vertex], edges, dim=0, reduce=first_aggregate)
+    degE = degE.pow(-0.5)
+    degE[torch.isinf(degE)] = 0.0
 
+    # Vertex degree normalization: D_V^{-0.5}
     degV_inv_sqrt = degV.pow(-0.5)
-    degV_inv_sqrt[torch.isinf(degV_inv_sqrt)] = 1.0
+    degV_inv_sqrt[torch.isinf(degV_inv_sqrt)] = 0.0
 
-    return vertex, edges, degV_inv_sqrt, degE_inv_sqrt
+    return vertex, edges, degV_inv_sqrt, degE

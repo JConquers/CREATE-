@@ -128,8 +128,9 @@ class UniGNNEncoder(nn.Module):
         if degE is None:
             degE = torch.ones(E, device=ego_embeddings.device)
 
-        # Apply UniGNN layers and layer-average outputs as in CREATE-Uni.
-        layer_outputs = []
+        # Apply UniGNN layers and layer-average outputs (including layer-0 ego).
+        # Including layer-0 preserves node identity, matching LightGCN design.
+        layer_outputs = [ego_embeddings]  # Layer-0: raw ego embeddings
         for conv in self.convs:
             ego_embeddings = self.dropout(ego_embeddings)
             ego_embeddings = conv(
@@ -141,8 +142,7 @@ class UniGNNEncoder(nn.Module):
             )
             layer_outputs.append(ego_embeddings)
 
-        if layer_outputs:
-            ego_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
+        ego_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
 
         # Split back into user and item embeddings
         user_final = ego_embeddings[: self.num_users]
