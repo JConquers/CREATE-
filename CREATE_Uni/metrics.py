@@ -147,6 +147,12 @@ class Metric:
         """Compute metric values for individual samples in batch."""
         raise NotImplementedError
 
+    def aggregate(self, values: List[float]) -> float:
+        """Aggregate per-batch outputs collected over a full evaluation split."""
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
 
 class HitRateMetric(Metric):
     """Hit Rate@K metric."""
@@ -223,7 +229,27 @@ class MAPMetric(Metric):
         return sum(self.values) / len(self.values)
 
 
-def create_metrics(k_values: List[int] = [5, 10, 20]) -> Dict[str, Metric]:
+class CoverageMetric(Metric):
+    """Catalog coverage@K: fraction of unique items recommended in top-K."""
+
+    def __init__(self, k: int = 10, num_items: int = 0):
+        super().__init__(k, name=f"cov@{k}")
+        self.num_items = num_items
+
+    def compute_batch(self, predictions: torch.Tensor, targets: torch.Tensor) -> List[int]:
+        _, topk_indices = torch.topk(predictions, self.k, dim=-1)
+        return topk_indices.reshape(-1).detach().cpu().tolist()
+
+    def aggregate(self, values: List[int]) -> float:
+        if not values or self.num_items <= 0:
+            return 0.0
+        return len(set(values)) / self.num_items
+
+    def compute(self) -> float:
+        return self.aggregate(self.values)
+
+
+def create_metrics(k_values: List[int] = [5, 10, 20], num_items: int = 0) -> Dict[str, Metric]:
     """
     Create a dictionary of metrics for evaluation.
 
@@ -240,6 +266,7 @@ def create_metrics(k_values: List[int] = [5, 10, 20]) -> Dict[str, Metric]:
         metrics[f"precision@{k}"] = PrecisionMetric(k=k)
         metrics[f"recall@{k}"] = RecallMetric(k=k)
         metrics[f"map@{k}"] = MAPMetric(k=k)
+        metrics[f"cov@{k}"] = CoverageMetric(k=k, num_items=num_items)
     return metrics
 
 

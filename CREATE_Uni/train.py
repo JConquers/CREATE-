@@ -64,6 +64,16 @@ def parse_args():
         default="./outputs",
         help="Directory for outputs",
     )
+    parser.add_argument(
+        "--run_mode",
+        type=str,
+        default="val",
+        choices=["val", "test"],
+        help=(
+            "Option-B protocol stage. 'val': train on T and evaluate v. "
+            "'test': train on T+v and evaluate t."
+        ),
+    )
 
     # Model architecture arguments
     parser.add_argument(
@@ -301,7 +311,7 @@ def main():
 
     # Setup logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) / f"{args.dataset}_{args.seq_encoder}_{timestamp}"
+    output_dir = Path(args.output_dir) / f"{args.dataset}_{args.seq_encoder}_{args.run_mode}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = create_logger(
@@ -314,6 +324,7 @@ def main():
     logger.info("CREATE-Uni Training")
     logger.info("=" * 60)
     logger.info(f"Arguments: {json.dumps(vars(args), indent=2)}")
+    logger.info(f"Run mode: {args.run_mode}")
 
     # Fix random seed
     fix_random_seed(args.seed)
@@ -351,6 +362,16 @@ def main():
             "item_id": data["train_item"].cpu().numpy(),
             "timestamp": data["train_time"].cpu().numpy() if "train_time" in data else None,
         })
+        val_target_df = pd.DataFrame({
+            "user_id": data["val_user"].cpu().numpy(),
+            "item_id": data["val_item"].cpu().numpy(),
+            "timestamp": data["val_time"].cpu().numpy() if "val_time" in data else None,
+        })
+        train_val_df = (
+            pd.concat([train_df, val_target_df], ignore_index=True)
+            .sort_values(["user_id", "timestamp"])
+            .reset_index(drop=True)
+        )
         # Build val/test CSVs with full history context.
         # SequenceDataset groups by user_id and Collator splits off the last item
         # as the target, so each user's CSV rows must contain:
@@ -420,18 +441,29 @@ def main():
         temp_dir.mkdir()
 
         train_path = temp_dir / "train.csv"
+        train_val_path = temp_dir / "train_validation.csv"
         val_path = temp_dir / "validation.csv"
         test_path = temp_dir / "test.csv"
 
         train_df.to_csv(train_path, index=False)
+        train_val_df.to_csv(train_val_path, index=False)
         val_df.to_csv(val_path, index=False)
         test_df.to_csv(test_path, index=False)
     else:
         # Use CSV files directly
         data_dir = Path(args.data_dir) / args.dataset
         train_path = data_dir / "train.csv"
+        train_val_path = data_dir / "train_validation.csv"
         val_path = data_dir / "validation.csv"
         test_path = data_dir / "test.csv"
+        if args.run_mode == "test" and not train_val_path.exists():
+            import pandas as pd
+            train_val_path = output_dir / "temp_train_validation.csv"
+            train_val_df = pd.concat(
+                [pd.read_csv(train_path), pd.read_csv(val_path)],
+                ignore_index=True,
+            )
+            train_val_df.to_csv(train_val_path, index=False)
 
         # Get dataset stats
         stats = get_dataset_stats(str(train_path))
@@ -441,12 +473,23 @@ def main():
     logger.info(f"Number of users: {num_users}")
     logger.info(f"Number of items: {num_items}")
 
+    if args.run_mode == "val":
+        active_train_path = train_path
+        active_val_path = val_path
+        active_test_path = val_path
+        logger.info("Protocol: val mode trains on T and evaluates v.")
+    else:
+        active_train_path = train_val_path
+        active_val_path = test_path
+        active_test_path = test_path
+        logger.info("Protocol: test mode trains on T+v and evaluates t.")
+
     # Create dataloaders
     logger.info("Creating dataloaders...")
     dataloaders = create_dataloaders(
-        train_path=str(train_path),
-        val_path=str(val_path),
-        test_path=str(test_path),
+        train_path=str(active_train_path),
+        val_path=str(active_val_path),
+        test_path=str(active_test_path),
         max_sequence_length=args.max_sequence_length,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -483,13 +526,24 @@ def main():
     # Set up graph structure if using graph encoder
     if args.use_graph and data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
         logger.info("Setting up graph structure...")
+        if args.run_mode == "test":
+            graph_user_ids = torch.cat([data["train_user"], data["val_user"]])
+            graph_item_ids = torch.cat([data["train_item"], data["val_item"]])
+            if "train_time" in data and "val_time" in data:
+                graph_timestamps = torch.cat([data["train_time"], data["val_time"]])
+            else:
+                graph_timestamps = None
+        else:
+            graph_user_ids = data["train_user"]
+            graph_item_ids = data["train_item"]
+            graph_timestamps = data.get("train_time", None)
 
         if args.graph_type == "bipartite" or args.graph_conv_type == "LightGCN":
             # LightGCN: simple bipartite graph
             from .utils import get_bipartite_graph_structure
             edge_index, degV_inv_sqrt = get_bipartite_graph_structure(
-                user_ids=data["train_user"],
-                item_ids=data["train_item"],
+                user_ids=graph_user_ids,
+                item_ids=graph_item_ids,
                 num_users=num_users,
                 num_items=num_items,
                 device=device,
@@ -499,9 +553,9 @@ def main():
         else:
             # UniGNN: session-based hypergraph
             vertex, edges, degV, degE = get_graph_structure(
-                user_ids=data["train_user"],
-                item_ids=data["train_item"],
-                timestamps=data.get("train_time", None),
+                user_ids=graph_user_ids,
+                item_ids=graph_item_ids,
+                timestamps=graph_timestamps,
                 num_users=num_users,
                 num_items=num_items,
                 device=device,
@@ -532,7 +586,7 @@ def main():
     )
 
     # Build metrics
-    metrics = create_metrics(k_values=args.eval_k)
+    metrics = create_metrics(k_values=args.eval_k, num_items=num_items)
 
     # Train
     logger.info("Starting training...")
@@ -550,6 +604,7 @@ def main():
         log_interval=args.log_interval,
         warmup_epochs=args.warmup_epochs,
         output_dir=str(output_dir),
+        select_best=(args.run_mode == "val"),
     )
 
     # Save results
@@ -568,9 +623,14 @@ def main():
 
     logger.info("=" * 60)
     logger.info("Training completed!")
-    logger.info(f"Best epoch: {best_metrics.get('best_epoch', 'N/A')}")
-    logger.info(f"Best validation NDCG@10: {best_metrics.get('val/ndcg@10', 'N/A'):.4f}")
-    logger.info(f"Best test NDCG@10: {best_metrics.get('test/ndcg@10', 'N/A'):.4f}")
+    if args.run_mode == "val":
+        logger.info(f"Best epoch: {best_metrics.get('best_epoch', 'N/A')}")
+        logger.info(f"Best validation NDCG@10: {best_metrics.get('val/ndcg@10', 'N/A'):.4f}")
+    else:
+        logger.info(f"Final epoch: {best_metrics.get('best_epoch', 'N/A')}")
+        logger.info(f"Final test NDCG@10: {best_metrics.get('test/ndcg@10', 'N/A'):.4f}")
+        logger.info(f"Final test Recall@10: {best_metrics.get('test/recall@10', 'N/A'):.4f}")
+        logger.info(f"Final test Cov@10: {best_metrics.get('test/cov@10', 'N/A'):.4f}")
     logger.info(f"Results saved to: {output_dir}")
     logger.info("=" * 60)
 

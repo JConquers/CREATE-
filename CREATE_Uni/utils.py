@@ -162,7 +162,10 @@ def inference(
     # Aggregate metrics
     results = {}
     for metric_name, values in running_metrics.items():
-        if values:
+        metric_fn = metrics.get(metric_name)
+        if values and hasattr(metric_fn, "aggregate"):
+            results[metric_name] = float(metric_fn.aggregate(values))
+        elif values:
             results[metric_name] = float(np.mean(values))
         else:
             results[metric_name] = 0.0
@@ -188,6 +191,7 @@ def train(
     log_interval: int = 1,
     warmup_epochs: int = 0,
     output_dir: Optional[str] = None,
+    select_best: bool = True,
 ) -> Tuple[List[Dict], Dict]:
     """
     Training loop for CREATE-Uni.
@@ -290,7 +294,7 @@ def train(
             best_val_metric = -1.0
             best_epoch = epoch
 
-        if val_ndcg > best_val_metric:
+        if select_best and val_ndcg > best_val_metric:
             best_val_metric = val_ndcg
             best_epoch = epoch
             best_metrics = epoch_metrics.copy()
@@ -306,6 +310,9 @@ def train(
                     "val_ndcg@10": val_ndcg,
                     "best_metrics": best_metrics,
                 }, checkpoint_path)
+        elif not select_best:
+            best_epoch = epoch
+            best_metrics = epoch_metrics.copy()
 
         # Save checkpoint for all epochs (latest model tracking)
         if output_dir:
@@ -356,7 +363,10 @@ def train(
     best_metrics["train_time"] = total_time
     best_metrics["best_epoch"] = best_epoch
 
-    logger.info(f"Training completed. Best epoch: {best_epoch}, Best val NDCG@10: {best_val_metric:.4f}")
+    if select_best:
+        logger.info(f"Training completed. Best epoch: {best_epoch}, Best val NDCG@10: {best_val_metric:.4f}")
+    else:
+        logger.info(f"Training completed. Final epoch: {best_epoch}")
     logger.info(f"Best metrics: {best_metrics}")
 
     return history, best_metrics
