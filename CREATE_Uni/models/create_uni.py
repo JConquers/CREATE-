@@ -365,6 +365,7 @@ class CREATEUni(nn.Module):
         seq_emb = None
         all_seq_emb = None
         seq_emb_for_alignment = None
+        graph_emb_for_alignment = graph_user_emb
         # Only skip sequence computation if we are in warmup AND we actually have a graph to warmup
         skip_sequence = is_warmup and self.use_graph
         if self.use_sequence and sequence_input is not None and not skip_sequence:
@@ -395,10 +396,9 @@ class CREATEUni(nn.Module):
                         return_last=False,
                     )
                     seq_emb = all_seq_emb[attention_mask]
-                    seq_emb_for_alignment = self.seq_encoder.get_last_valid_embeddings(
-                        all_seq_emb,
-                        attention_mask,
-                    )
+                    seq_emb_for_alignment = seq_emb
+                    if graph_pos_user_ids is not None and graph_pos_user_ids.numel() == seq_emb.shape[0]:
+                        graph_emb_for_alignment = all_user_emb[graph_pos_user_ids]
                 else:
                     seq_emb = self.encode_sequence(
                         sequence_input,
@@ -424,7 +424,7 @@ class CREATEUni(nn.Module):
 
             # Eq. 22: Barlow Twins alignment between h_u and g_u (no fusion)
             if return_alignment and not is_warmup:
-                graph_proj = self.graph_projector(graph_user_emb)   # project g_u
+                graph_proj = self.graph_projector(graph_emb_for_alignment)   # project g_u
                 seq_proj = self.seq_projector(seq_emb_for_alignment) # project h_u
                 outputs["alignment_fst_embeddings"] = graph_proj
                 outputs["alignment_snd_embeddings"] = seq_proj

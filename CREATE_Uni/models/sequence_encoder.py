@@ -146,9 +146,11 @@ class SequentialEncoder(nn.Module):
             item_emb = self.item_embeddings(item_ids)  # (B, L, D) — raw lookup fallback
             item_emb = item_emb * math.sqrt(self.embedding_dim)
 
-        # SAS4Rec reverse position embeddings (Eq. 2):
-        # Most recent item (last position) gets position 0, oldest gets position seq_len-1
-        positions = torch.arange(seq_len - 1, -1, -1, device=item_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        # Reverse positions per real sequence length: latest real item gets 0,
+        # older items increase leftward. Padding positions are masked later.
+        offsets = torch.arange(seq_len, device=item_ids.device, dtype=torch.long).unsqueeze(0)
+        lengths = attention_mask.long().sum(dim=1, keepdim=True)
+        positions = (lengths - 1 - offsets).clamp_min(0)
         pos_emb = self.position_embeddings(positions)
 
         # Combine embeddings: Eq. 20 x_k = g_{i_k} + p_k

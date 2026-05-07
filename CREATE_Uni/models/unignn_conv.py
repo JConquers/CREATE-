@@ -74,9 +74,6 @@ class UniGCNConv(nn.Module):
 
         X = Xv
 
-        # GELU activation after φ₂ (edge→vertex) aggregation
-        X = F.gelu(X)
-
         if self.use_norm:
             X = normalize_l2(X)
 
