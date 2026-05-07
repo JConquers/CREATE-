@@ -292,11 +292,11 @@ def train(
         # Reset tracking when transitioning from warmup to joint training
         if epoch == warmup_epochs and warmup_epochs > 0:
             best_val_metric = -1.0
-            best_epoch = epoch
+            best_epoch = epoch + 1
 
         if select_best and val_ndcg > best_val_metric:
             best_val_metric = val_ndcg
-            best_epoch = epoch
+            best_epoch = epoch + 1
             best_metrics = epoch_metrics.copy()
             improved = " ★"
 
@@ -304,21 +304,21 @@ def train(
             if output_dir:
                 checkpoint_path = Path(output_dir) / "best_model.pt"
                 torch.save({
-                    "epoch": epoch,
+                    "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_ndcg@10": val_ndcg,
                     "best_metrics": best_metrics,
                 }, checkpoint_path)
         elif not select_best:
-            best_epoch = epoch
+            best_epoch = epoch + 1
             best_metrics = epoch_metrics.copy()
 
         # Save checkpoint for all epochs (latest model tracking)
         if output_dir:
             latest_path = Path(output_dir) / "latest_checkpoint.pt"
             torch.save({
-                "epoch": epoch,
+                "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": epoch_metrics,
@@ -345,7 +345,7 @@ def train(
     if output_dir:
         final_checkpoint_path = Path(output_dir) / "final_model.pt"
         torch.save({
-            "epoch": epoch,
+            "epoch": epoch + 1,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_ndcg@10": val_ndcg,
