@@ -119,7 +119,7 @@ class BeautyDataset:
 
     def _load_processed(self):
         """Load processed data from disk."""
-        return torch.load(self.processed_file)
+        return torch.load(self.processed_file, weights_only=False)
 
     def get_edge_index(self):
         """Get the interaction graph edge index."""
