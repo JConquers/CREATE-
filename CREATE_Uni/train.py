@@ -266,6 +266,11 @@ def parse_args():
         default=[5, 10, 20],
         help="K values for evaluation metrics",
     )
+    parser.add_argument(
+        "--plot_results",
+        action="store_true",
+        help="Plot combined loss and metric curves after training",
+    )
 
     return parser.parse_args()
 
@@ -609,7 +614,7 @@ def main():
 
     # Save results
     logger.info("Saving results...")
-    save_metrics(history, str(output_dir))
+    save_metrics(history, str(output_dir), plot_results=args.plot_results)
 
     # Save config
     config = vars(args)

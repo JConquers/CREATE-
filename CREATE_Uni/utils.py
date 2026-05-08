@@ -279,6 +279,9 @@ def train(
         # Prepare epoch metrics
         epoch_metrics = {
             "train/loss": avg_train_loss,
+            "train/local_loss": avg_local_loss,
+            "train/global_loss": avg_global_loss,
+            "train/align_loss": avg_align_loss,
         }
         epoch_metrics.update({f"val/{k}": v for k, v in val_metrics.items()})
         epoch_metrics.update({f"test/{k}": v for k, v in test_metrics.items()})
@@ -372,7 +375,72 @@ def train(
     return history, best_metrics
 
 
-def save_metrics(history: List[Dict], output_dir: str):
+def _plot_selected_curves(
+    history: List[Dict],
+    output_dir: Path,
+    keys: List[str],
+    labels: List[str],
+    title: str,
+    ylabel: str,
+    filename: str,
+):
+    epochs = range(1, len(history) + 1)
+    plt.figure(figsize=(8, 5))
+
+    plotted = False
+    for key, label in zip(keys, labels):
+        values = [epoch_metrics.get(key) for epoch_metrics in history]
+        if all(value is None for value in values):
+            continue
+        values = [0.0 if value is None else value for value in values]
+        plt.plot(epochs, values, marker="o", label=label)
+        plotted = True
+
+    if not plotted:
+        plt.close()
+        return
+
+    plt.title(title)
+    plt.xlabel("Epoch")
+    plt.ylabel(ylabel)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / filename, dpi=150)
+    plt.close()
+
+
+def plot_training_results(history: List[Dict], output_dir: str):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _plot_selected_curves(
+        history=history,
+        output_dir=output_dir,
+        keys=["train/global_loss", "train/local_loss", "train/align_loss"],
+        labels=["Global", "Local", "Align"],
+        title="Training Losses",
+        ylabel="Loss",
+        filename="losses.png",
+    )
+
+    metric_prefix = "test" if history and "test/ndcg@10" in history[-1] else "val"
+    _plot_selected_curves(
+        history=history,
+        output_dir=output_dir,
+        keys=[
+            f"{metric_prefix}/ndcg@10",
+            f"{metric_prefix}/precision@10",
+            f"{metric_prefix}/recall@10",
+        ],
+        labels=["NDCG@10", "Precision@10", "Recall@10"],
+        title="Evaluation Metrics",
+        ylabel="Metric",
+        filename="metrics.png",
+    )
+
+
+def save_metrics(history: List[Dict], output_dir: str, plot_results: bool = False):
     """
     Save training metrics to JSON and plot learning curves.
 
@@ -387,37 +455,8 @@ def save_metrics(history: List[Dict], output_dir: str):
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    # Organize metrics by split
-    metrics_per_split = defaultdict(lambda: defaultdict(list))
-    for epoch_metrics in history:
-        for key, value in epoch_metrics.items():
-            if "/" in key:
-                split, metric_name = key.split("/", 1)
-                metrics_per_split[split][metric_name].append(value)
-
-    # Plot metrics
-    metric_names = sorted(
-        {name for split in metrics_per_split.values() for name in split}
-    )
-
-    for metric_name in metric_names:
-        plt.figure(figsize=(8, 5))
-        for split, split_metrics in metrics_per_split.items():
-            if metric_name in split_metrics:
-                plt.plot(
-                    range(1, len(split_metrics[metric_name]) + 1),
-                    split_metrics[metric_name],
-                    marker="o",
-                    label=split,
-                )
-        plt.title(metric_name)
-        plt.xlabel("Epoch")
-        plt.ylabel(metric_name)
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{metric_name.replace('@', '_at_')}.png", dpi=150)
-        plt.close()
+    if plot_results:
+        plot_training_results(history, str(output_dir))
 
     # Save summary
     summary = {
@@ -427,7 +466,10 @@ def save_metrics(history: List[Dict], output_dir: str):
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"Saved metrics and plots to {output_dir}")
+    if plot_results:
+        print(f"Saved metrics and plots to {output_dir}")
+    else:
+        print(f"Saved metrics to {output_dir}")
 
 
 def compute_item_distance_matrix(
