@@ -579,7 +579,7 @@ def main():
     )
 
     # Build optimizer
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -630,7 +630,7 @@ def main():
         logger.info(f"Final epoch: {best_metrics.get('best_epoch', 'N/A')}")
         logger.info(f"Final test NDCG@10: {best_metrics.get('test/ndcg@10', 'N/A'):.4f}")
         logger.info(f"Final test Recall@10: {best_metrics.get('test/recall@10', 'N/A'):.4f}")
-        logger.info(f"Final test Cov@10: {best_metrics.get('test/cov@10', 'N/A'):.4f}")
+        logger.info(f"Final test Precision@10: {best_metrics.get('test/precision@10', 'N/A'):.4f}")
     logger.info(f"Results saved to: {output_dir}")
     logger.info("=" * 60)
 

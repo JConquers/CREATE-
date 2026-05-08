@@ -261,12 +261,9 @@ def create_metrics(k_values: List[int] = [5, 10, 20], num_items: int = 0) -> Dic
     """
     metrics = {}
     for k in k_values:
-        metrics[f"hr@{k}"] = HitRateMetric(k=k)
         metrics[f"ndcg@{k}"] = NDCGMetric(k=k)
-        metrics[f"precision@{k}"] = PrecisionMetric(k=k)
         metrics[f"recall@{k}"] = RecallMetric(k=k)
-        metrics[f"map@{k}"] = MAPMetric(k=k)
-        metrics[f"cov@{k}"] = CoverageMetric(k=k, num_items=num_items)
+        metrics[f"precision@{k}"] = PrecisionMetric(k=k)
     return metrics
 
 
