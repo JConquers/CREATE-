@@ -60,12 +60,21 @@ class UniGCNConv(nn.Module):
         edges: torch.Tensor,
         degE: torch.Tensor,
         degV: torch.Tensor,
+        incidence_weight: torch.Tensor = None,
     ) -> torch.Tensor:
         N = X.shape[0]
 
         X = self.W(X)
         Xve = X[vertex]
-        Xe = scatter(Xve, edges, dim=0, reduce=self.first_aggregate)
+        if incidence_weight is not None:
+            Xve = Xve * incidence_weight.unsqueeze(-1)
+        Xe = scatter(
+            Xve,
+            edges,
+            dim=0,
+            dim_size=degE.shape[0],
+            reduce=self.first_aggregate,
+        )
         Xe = Xe * degE.unsqueeze(-1)  # (E,) -> (E,1) for broadcasting with (E,D)
 
         Xev = Xe[edges]

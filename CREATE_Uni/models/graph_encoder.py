@@ -91,7 +91,7 @@ class UniGNNEncoder(nn.Module):
             conv = ConvClass(**kwargs)
             self.convs.append(conv)
 
-        self.dropout = nn.Dropout(dropout)
+        self.incidence_dropout_p = dropout
         self.use_norm = use_norm
 
     def forward(
@@ -132,14 +132,39 @@ class UniGNNEncoder(nn.Module):
         # Including layer-0 preserves node identity, matching LightGCN design.
         layer_outputs = [ego_embeddings]  # Layer-0: raw ego embeddings
         for conv in self.convs:
-            ego_embeddings = self.dropout(ego_embeddings)
-            ego_embeddings = conv(
-                X=ego_embeddings,
-                vertex=vertex,
-                edges=edges,
-                degE=degE,
-                degV=degV,
-            )
+            conv_vertex = vertex
+            conv_edges = edges
+            incidence_weight = None
+            if self.training and self.incidence_dropout_p > 0 and self.conv_type == "UniGCN":
+                keep_prob = 1.0 - self.incidence_dropout_p
+                incidence_mask = torch.rand(vertex.shape[0], device=vertex.device) < keep_prob
+                if incidence_mask.any():
+                    conv_vertex = vertex[incidence_mask]
+                    conv_edges = edges[incidence_mask]
+                    incidence_weight = torch.full(
+                        (conv_vertex.shape[0],),
+                        1.0 / keep_prob,
+                        device=vertex.device,
+                        dtype=ego_embeddings.dtype,
+                    )
+
+            if self.conv_type == "UniGCN":
+                ego_embeddings = conv(
+                    X=ego_embeddings,
+                    vertex=conv_vertex,
+                    edges=conv_edges,
+                    degE=degE,
+                    degV=degV,
+                    incidence_weight=incidence_weight,
+                )
+            else:
+                ego_embeddings = conv(
+                    X=ego_embeddings,
+                    vertex=conv_vertex,
+                    edges=conv_edges,
+                    degE=degE,
+                    degV=degV,
+                )
             layer_outputs.append(ego_embeddings)
 
         ego_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
@@ -211,6 +236,14 @@ class LightGCNEncoder(nn.Module):
 
         # Store all layer embeddings for layer-average pooling
         all_embeddings = [ego_embeddings]
+        edge_scale = 1.0
+
+        if self.training and self.dropout.p > 0:
+            keep_prob = 1.0 - self.dropout.p
+            edge_mask = torch.rand(edge_index.shape[1], device=edge_index.device) < keep_prob
+            if edge_mask.any():
+                edge_index = edge_index[:, edge_mask]
+                edge_scale = 1.0 / keep_prob
 
         for _ in range(self.n_layers):
             # LightGCN propagation: e^(k+1) = D^(-0.5) * A * D^(-0.5) * e^(k)
@@ -219,7 +252,7 @@ class LightGCNEncoder(nn.Module):
 
             # Step 2: Message passing - sum neighbor embeddings
             # edge_index[0] = destination nodes, edge_index[1] = source nodes
-            neighbor_embeddings = ego_embeddings[edge_index[1]]
+            neighbor_embeddings = ego_embeddings[edge_index[1]] * edge_scale
             ego_embeddings = torch.zeros(N, self.embedding_dim, device=ego_embeddings.device)
             ego_embeddings.index_add_(0, edge_index[0], neighbor_embeddings)
 
