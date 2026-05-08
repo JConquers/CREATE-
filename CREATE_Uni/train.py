@@ -49,7 +49,7 @@ def parse_args():
         "--dataset",
         type=str,
         default="beauty",
-        choices=["beauty", "office_products"],
+        choices=["beauty", "office_products", "ml1m", "movielens_1m"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -289,6 +289,9 @@ def get_dataset_paths(args) -> tuple:
         elif args.dataset == "office_products":
             from dataset_loaders.office_products_dataset import OfficeProductsDataset
             dataset = OfficeProductsDataset(root=str(data_dir))
+        elif args.dataset in ["ml1m", "movielens_1m"]:
+            from dataset_loaders.movielens_1m_dataset import MovieLens1MDataset
+            dataset = MovieLens1MDataset(root=str(data_dir))
         else:
             raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -344,14 +347,18 @@ def main():
 
     # Try to use dataset_loaders module
     data_module_path = Path(__file__).parent.parent / "dataset_loaders"
-    if data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
+    loader_datasets = ["beauty", "office_products", "ml1m", "movielens_1m"]
+    if data_module_path.exists() and args.dataset in loader_datasets:
         sys.path.insert(0, str(data_module_path.parent))
         if args.dataset == "beauty":
             from dataset_loaders.beauty_dataset import BeautyDataset
             dataset = BeautyDataset(root=str(Path(args.data_dir) / args.dataset))
-        else:
+        elif args.dataset == "office_products":
             from dataset_loaders.office_products_dataset import OfficeProductsDataset
             dataset = OfficeProductsDataset(root=str(Path(args.data_dir) / args.dataset))
+        else:
+            from dataset_loaders.movielens_1m_dataset import MovieLens1MDataset
+            dataset = MovieLens1MDataset(root=str(Path(args.data_dir) / args.dataset))
 
         data = dataset.load()
 
@@ -529,7 +536,7 @@ def main():
     )
 
     # Set up graph structure if using graph encoder
-    if args.use_graph and data_module_path.exists() and args.dataset in ["beauty", "office_products"]:
+    if args.use_graph and data_module_path.exists() and args.dataset in loader_datasets:
         logger.info("Setting up graph structure...")
         if args.run_mode == "test":
             graph_user_ids = torch.cat([data["train_user"], data["val_user"]])

@@ -28,7 +28,12 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--dataset", type=str, default="beauty", choices=["beauty", "office_products"])
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="beauty",
+        choices=["beauty", "office_products", "ml1m", "movielens_1m"],
+    )
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--output_dir", type=str, default="./outputs/optuna")
     parser.add_argument("--study_name", type=str, default="create_uni_val")
