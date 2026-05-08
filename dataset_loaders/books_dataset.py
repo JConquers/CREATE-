@@ -9,12 +9,13 @@ from .base_dataset import BaseDataset
 
 
 class AmazonBooksDataset(BaseDataset):
-    """Amazon Books dataset (5-core).
+    """Amazon Books dataset (5-core source, 20-core filtered).
 
     Downloads from:
     https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Books_5.json.gz
 
-    Uses leave-last-out splitting:
+    Applies 20-core filtering (users/items with >= 20 interactions), then
+    uses leave-last-out splitting:
     - For each user, the last interaction (by timestamp) goes to test
     - The second-to-last goes to validation
     - All earlier interactions go to training
@@ -29,6 +30,7 @@ class AmazonBooksDataset(BaseDataset):
 
     JSON_CHUNK_SIZE = 200_000
     CSV_CHUNK_SIZE = 200_000
+    MIN_INTERACTIONS = 20
 
     def _read_chunks(self, chunk_iter: pd.io.parsers.TextFileReader) -> pd.DataFrame:
         chunks = []
@@ -85,6 +87,32 @@ class AmazonBooksDataset(BaseDataset):
 
         normalized["timestamp"] = normalized["timestamp"].astype("int64")
         return normalized
+
+    def _apply_k_core_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        min_interactions = self.MIN_INTERACTIONS
+        print(
+            f"Applying {min_interactions}-core filtering "
+            f"(users/items >= {min_interactions} interactions)..."
+        )
+        while True:
+            user_counts = df["user_id"].value_counts()
+            item_counts = df["item_id"].value_counts()
+            keep_users = user_counts[user_counts >= min_interactions].index
+            keep_items = item_counts[item_counts >= min_interactions].index
+            filtered = df[
+                df["user_id"].isin(keep_users) & df["item_id"].isin(keep_items)
+            ]
+            if len(filtered) == len(df):
+                break
+            df = filtered
+
+        print(
+            "After filtering: "
+            f"{df['user_id'].nunique():,} users, "
+            f"{df['item_id'].nunique():,} items, "
+            f"{len(df):,} interactions"
+        )
+        return df
 
     def __init__(self, data_dir: str, max_sequence_length: int = 50):
         super().__init__(data_dir, max_sequence_length)
@@ -207,6 +235,8 @@ class AmazonBooksDataset(BaseDataset):
                     df = self._read_chunks(chunk_iter)
                 else:
                     df = self._normalize_raw_columns(pd.read_csv(f))
+
+        df = self._apply_k_core_filter(df)
 
         # Sort by user and timestamp to ensure chronological order
         df = df.sort_values(['user_id', 'timestamp'])
