@@ -2,12 +2,12 @@
 
 import argparse
 import json
+import logging
 import math
 import os
 import random
 import shutil
 import time
-from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +37,23 @@ def set_random_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def create_logger(name: str, level: int, log_file: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
+    return logger
 
 
 def is_kaggle_runtime() -> bool:
@@ -73,72 +90,9 @@ def resolve_device(device_name: str, allow_kaggle_cpu: bool) -> torch.device:
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     moved = {}
-    non_blocking = device.type == "cuda"
     for key, value in batch.items():
-        moved[key] = value.to(device, non_blocking=non_blocking) if torch.is_tensor(value) else value
+        moved[key] = value.to(device) if torch.is_tensor(value) else value
     return moved
-
-
-def resolve_effective_batch_size(
-    requested_batch_size: int,
-    max_seq_len: int,
-    num_items: int,
-    device: torch.device,
-    max_logit_elements: int,
-    use_dense_sequence_logits: bool,
-) -> int:
-    if device.type != "cuda" or max_logit_elements <= 0 or not use_dense_sequence_logits:
-        return requested_batch_size
-
-    per_batch_elements = requested_batch_size * max_seq_len * max(1, num_items)
-    if per_batch_elements <= max_logit_elements:
-        return requested_batch_size
-
-    safe_batch = max(1, max_logit_elements // (max_seq_len * max(1, num_items)))
-    return min(requested_batch_size, safe_batch)
-
-
-def resolve_amp_config(
-    use_mixed_precision: bool,
-    amp_dtype_name: str,
-    device: torch.device,
-) -> tuple[bool, torch.dtype]:
-    if not use_mixed_precision or device.type != "cuda":
-        return False, torch.float32
-
-    if amp_dtype_name == "bf16":
-        supports_bf16 = bool(
-            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
-        )
-        if supports_bf16:
-            return True, torch.bfloat16
-        print("Requested bf16 AMP but device does not support bf16. Falling back to fp16 AMP.")
-
-    return True, torch.float16
-
-
-def build_grad_scaler(use_amp: bool, device: torch.device):
-    if device.type != "cuda":
-        return None
-
-    try:
-        return torch.amp.GradScaler("cuda", enabled=use_amp)
-    except (AttributeError, TypeError):
-        return torch.cuda.amp.GradScaler(enabled=use_amp)
-
-
-def amp_autocast_context(
-    use_amp: bool,
-    amp_dtype: torch.dtype,
-    device: torch.device,
-):
-    if not use_amp or device.type != "cuda":
-        return nullcontext()
-
-    try:
-        return torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
-    except (AttributeError, TypeError):
-        return torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype)
 
 
 def backward_and_step(
@@ -146,19 +100,8 @@ def backward_and_step(
     optimizer: torch.optim.Optimizer,
     model: torch.nn.Module,
     grad_clip: float,
-    scaler,
 ) -> None:
     optimizer.zero_grad(set_to_none=True)
-
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        if grad_clip > 0:
-            scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        return
-
     loss.backward()
     if grad_clip > 0:
         clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -201,16 +144,6 @@ def free_disk_gb(path: Path) -> float:
         usage = shutil.disk_usage(path)
         return usage.free / (1024 ** 3)
     except OSError:
-        return -1.0
-
-
-def cuda_free_gb(device: torch.device) -> float:
-    if device.type != "cuda":
-        return -1.0
-    try:
-        free_bytes, _ = torch.cuda.mem_get_info(device=device)
-        return free_bytes / (1024 ** 3)
-    except RuntimeError:
         return -1.0
 
 
@@ -333,8 +266,6 @@ def evaluate_ranking(
     topk: int,
     batch_size: int,
     split: str,
-    use_amp: bool,
-    amp_dtype: torch.dtype,
     filter_seen: bool,
     seen_items_lookup: dict[int, list[int]] | None,
     neg_penalty_weight: float,
@@ -398,36 +329,32 @@ def evaluate_ranking(
             attention_mask[row_idx, :seq_len] = True
             batch_user_ids[row_idx] = int(user_id)
 
-        autocast_ctx = amp_autocast_context(
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            device=device,
+        input_item_embeddings = sequence_item_table[input_ids]
+        encoded_sequence = model.sequence_encoder(
+            item_ids=input_ids,
+            attention_mask=attention_mask,
+            return_last=False,
+            precomputed_emb=input_item_embeddings,
         )
-        with autocast_ctx:
-            input_item_embeddings = sequence_item_table[input_ids]
-            encoded_sequence = model.sequence_encoder(
-                item_embeddings=input_item_embeddings,
-                attention_mask=attention_mask,
-            )
-            last_hidden = model.sequence_encoder.get_last_hidden(
-                encoded=encoded_sequence,
-                attention_mask=attention_mask,
-            )
-            scores = last_hidden @ interest_item_embeddings.t()
+        last_hidden = model.sequence_encoder.get_last_valid_embeddings(
+            embeddings=encoded_sequence,
+            attention_mask=attention_mask,
+        )
+        scores = last_hidden @ interest_item_embeddings.t()
 
-            if neg_penalty_weight > 0 or neg_filter_threshold > -1e8:
-                disinterest_users = disinterest_user_embeddings[batch_user_ids]
-                chunk_size = max(1, int(neg_chunk_size))
-                for start in range(0, disinterest_item_embeddings.size(0), chunk_size):
-                    end = min(start + chunk_size, disinterest_item_embeddings.size(0))
-                    neg_chunk = disinterest_users @ disinterest_item_embeddings[start:end].t()
-                    if neg_penalty_weight > 0:
-                        scores[:, start:end] = scores[:, start:end] - neg_penalty_weight * neg_chunk
-                    if neg_filter_threshold > -1e8:
-                        scores[:, start:end] = scores[:, start:end].masked_fill(
-                            neg_chunk > neg_filter_threshold,
-                            float("-inf"),
-                        )
+        if neg_penalty_weight > 0 or neg_filter_threshold > -1e8:
+            disinterest_users = disinterest_user_embeddings[batch_user_ids]
+            chunk_size = max(1, int(neg_chunk_size))
+            for start in range(0, disinterest_item_embeddings.size(0), chunk_size):
+                end = min(start + chunk_size, disinterest_item_embeddings.size(0))
+                neg_chunk = disinterest_users @ disinterest_item_embeddings[start:end].t()
+                if neg_penalty_weight > 0:
+                    scores[:, start:end] = scores[:, start:end] - neg_penalty_weight * neg_chunk
+                if neg_filter_threshold > -1e8:
+                    scores[:, start:end] = scores[:, start:end].masked_fill(
+                        neg_chunk > neg_filter_threshold,
+                        float("-inf"),
+                    )
 
         if filter_seen:
             # Match common recommendation protocol: remove seen context items from candidates.
@@ -543,12 +470,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pos-threshold", type=float, default=4.0)
     parser.add_argument("--neg-threshold", type=float, default=3.0)
     parser.add_argument(
-        "--rating-offset",
-        type=float,
-        default=3.5,
-        help="Rating offset used for Pone-style BPR weighting.",
-    )
-    parser.add_argument(
         "--neg-sample-k",
         type=int,
         default=40,
@@ -570,18 +491,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow-kaggle-cpu",
         action="store_true",
         help="Allow CPU fallback on Kaggle when CUDA is unavailable.",
-    )
-    parser.add_argument(
-        "--max-logit-elements",
-        type=int,
-        default=120_000_000,
-        help="CUDA safety cap for batch*seq_len*num_items when dense logits are enabled.",
-    )
-    parser.add_argument(
-        "--local-loss-chunk-size",
-        type=int,
-        default=4096,
-        help="Chunk size across items for local full-softmax CE (<=0 uses dense logits).",
     )
     parser.add_argument(
         "--global-user-sample",
@@ -618,12 +527,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Run a full graph+sequence joint step every N local batches (<=0 disables).",
-    )
-    parser.add_argument(
-        "--min-free-gb-for-joint-refresh",
-        type=float,
-        default=4.0,
-        help="Skip full joint refresh when free CUDA memory falls below this threshold.",
     )
     parser.add_argument(
         "--eval-split",
@@ -695,18 +598,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--mixed-precision",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable CUDA AMP for sequence-heavy training steps.",
-    )
-    parser.add_argument(
-        "--amp-dtype",
-        choices=["fp16", "bf16"],
-        default="fp16",
-        help="AMP dtype when --mixed-precision is enabled.",
-    )
-    parser.add_argument(
         "--checkpoint-every",
         type=int,
         default=1,
@@ -738,29 +629,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"create_pone_{args.dataset}_{stamp}"
+
+    output_dir = Path(args.output_dir) / run_prefix
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = create_logger(
+        "CREATE-Pone",
+        level=logging.INFO,
+        log_file=str(output_dir / "training.log"),
+    )
+    logger.info("=" * 60)
+    logger.info("CREATE-Pone Training")
+    logger.info("=" * 60)
+    logger.info("Arguments: %s", json.dumps(vars(args), indent=2))
+
     set_random_seed(args.seed)
     device = resolve_device(args.device, allow_kaggle_cpu=args.allow_kaggle_cpu)
-    use_amp, amp_dtype = resolve_amp_config(
-        use_mixed_precision=args.mixed_precision,
-        amp_dtype_name=args.amp_dtype,
-        device=device,
-    )
-    scaler = build_grad_scaler(use_amp=use_amp, device=device)
 
-    print(f"Using device: {device}")
+    logger.info("Using device: %s", device)
     if device.type == "cuda":
         cuda_index = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(cuda_index)
-        print(
-            f"CUDA device {cuda_index}: {props.name} | "
-            f"VRAM={props.total_memory / (1024 ** 3):.1f} GB"
+        logger.info(
+            "CUDA device %s: %s | VRAM=%.1f GB",
+            cuda_index,
+            props.name,
+            props.total_memory / (1024 ** 3),
         )
         if torch.backends.cudnn.is_available():
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
-    if use_amp:
-        print(f"Using mixed precision AMP with dtype={args.amp_dtype}")
 
     bundle = load_dataset_bundle(
         dataset_name=args.dataset,
@@ -771,36 +671,21 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         books_pone_split_dir=(args.books_pone_split_dir or None),
     )
     if args.dataset == "books" and args.books_protocol == "pone":
-        print(
-            "Using Pone-GNN books protocol:",
-            f"version={args.books_pone_version}",
-            f"bundle={bundle.name}",
+        logger.info(
+            "Using Pone-GNN books protocol: version=%s bundle=%s",
+            args.books_pone_version,
+            bundle.name,
         )
         if bundle.num_users != 35736 or bundle.num_items != 38121:
-            print(
-                "Warning: loaded Pone protocol but cardinalities differ from the paper benchmark "
-                f"(expected users=35736, items=38121; got users={bundle.num_users}, items={bundle.num_items})."
+            logger.warning(
+                "Loaded Pone protocol but cardinalities differ from the paper benchmark "
+                "(expected users=35736, items=38121; got users=%s, items=%s).",
+                bundle.num_users,
+                bundle.num_items,
             )
 
-    amp_element_multiplier = 2 if use_amp else 1
-    effective_logit_elements = int(args.max_logit_elements * amp_element_multiplier)
-    compute_dense_sequence_logits = args.local_loss_chunk_size <= 0
-
-    effective_batch_size = resolve_effective_batch_size(
-        requested_batch_size=args.batch_size,
-        max_seq_len=args.max_seq_len,
-        num_items=bundle.num_items,
-        device=device,
-        max_logit_elements=effective_logit_elements,
-        use_dense_sequence_logits=compute_dense_sequence_logits,
-    )
-    if effective_batch_size < args.batch_size:
-        print(
-            f"Reducing batch size from {args.batch_size} to {effective_batch_size} "
-            "for CUDA memory safety on full-softmax logits."
-        )
-    elif not compute_dense_sequence_logits:
-        print("Using chunked local loss; skipping dense-logit batch-size cap.")
+    compute_dense_sequence_logits = True
+    effective_batch_size = args.batch_size
 
     train_dataset = UserSequenceDataset(bundle.user_sequences)
     if len(train_dataset) == 0:
@@ -860,8 +745,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         orthogonal_mu=args.orthogonal_mu,
         contrastive_tau=args.contrastive_tau,
         neg_branch_scale=args.neg_branch_scale,
-        local_loss_chunk_size=args.local_loss_chunk_size,
-        rating_offset=args.rating_offset,
     )
 
     optimizer = torch.optim.AdamW(
@@ -871,12 +754,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     )
 
     history = []
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_prefix = f"create_pone_{args.dataset}_{stamp}"
 
     checkpoint_dir = output_dir / f"{run_prefix}_checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -915,50 +792,51 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     last_eval_metrics = None
     free_gb_at_start = free_disk_gb(output_dir)
 
-    print(
-        "Loaded dataset:",
-        f"users={bundle.num_users}",
-        f"items={bundle.num_items}",
-        f"books_protocol={args.books_protocol if args.dataset == 'books' else 'n/a'}",
-        f"train_interactions={len(bundle.train_df)}",
-        f"train_sequences={len(train_dataset)}",
-        f"batch_size={effective_batch_size}",
-        f"steps_per_epoch={len(train_loader)}",
-        f"warmup_global_steps={max(1, args.warmup_global_steps)}",
-        f"global_steps={max(1, args.global_steps_per_epoch)}",
-        f"joint_refresh_every={args.joint_refresh_every}",
-        f"min_free_gb_for_refresh={args.min_free_gb_for_joint_refresh}",
-        f"eval_split={args.eval_split}",
-        f"eval_users={len(eval_examples)}",
-        f"eval_topk={args.eval_topk}",
-        f"eval_min_rating={args.eval_min_rating}",
-        f"eval_include_val_context={args.eval_include_val_context}",
-        f"eval_neg_penalty_weight={args.eval_neg_penalty_weight}",
-        f"eval_neg_filter_threshold={args.eval_neg_filter_threshold}",
-        f"eval_neg_chunk_size={args.eval_neg_chunk_size}",
-        f"eval_filter_seen={args.eval_filter_seen}",
-        f"eval_filter_seen_users={0 if eval_seen_items is None else len(eval_seen_items)}",
-        f"mixed_precision={use_amp}",
-        f"local_loss_chunk_size={args.local_loss_chunk_size}",
-        f"effective_logit_cap={effective_logit_elements}",
-        f"keep_last_checkpoints={args.keep_last_checkpoints}",
-        f"save_opt_periodic={args.save_optimizer_periodic}",
-        f"save_opt_best={args.save_optimizer_best}",
-        f"save_opt_final={args.save_optimizer_final}",
-        f"free_disk_gb={free_gb_at_start:.2f}",
+    logger.info(
+        "Loaded dataset: users=%s items=%s books_protocol=%s train_interactions=%s "
+        "train_sequences=%s batch_size=%s steps_per_epoch=%s warmup_global_steps=%s "
+        "global_steps=%s joint_refresh_every=%s eval_split=%s eval_users=%s eval_topk=%s "
+        "eval_min_rating=%s eval_include_val_context=%s eval_neg_penalty_weight=%s "
+        "eval_neg_filter_threshold=%s eval_neg_chunk_size=%s eval_filter_seen=%s "
+        "eval_filter_seen_users=%s keep_last_checkpoints=%s save_opt_periodic=%s "
+        "save_opt_best=%s save_opt_final=%s free_disk_gb=%.2f",
+        bundle.num_users,
+        bundle.num_items,
+        args.books_protocol if args.dataset == "books" else "n/a",
+        len(bundle.train_df),
+        len(train_dataset),
+        effective_batch_size,
+        len(train_loader),
+        max(1, args.warmup_global_steps),
+        max(1, args.global_steps_per_epoch),
+        args.joint_refresh_every,
+        args.eval_split,
+        len(eval_examples),
+        args.eval_topk,
+        args.eval_min_rating,
+        args.eval_include_val_context,
+        args.eval_neg_penalty_weight,
+        args.eval_neg_filter_threshold,
+        args.eval_neg_chunk_size,
+        args.eval_filter_seen,
+        0 if eval_seen_items is None else len(eval_seen_items),
+        args.keep_last_checkpoints,
+        args.save_optimizer_periodic,
+        args.save_optimizer_best,
+        args.save_optimizer_final,
+        free_gb_at_start,
     )
     if 0 < free_gb_at_start < 5.0:
-        print(
-            "Warning: low free disk space detected. "
-            "Consider removing old outputs or lowering checkpoint retention."
+        logger.warning(
+            "Low free disk space detected. Consider removing old outputs or lowering checkpoint retention."
         )
     if args.dataset == "books" and (args.pos_threshold != 3.5 or args.neg_threshold != 3.5):
-        print(
+        logger.info(
             "Note: for closer Pone-GNN comparison on Amazon-Books, "
             "use --pos-threshold 3.5 --neg-threshold 3.5."
         )
     if args.warmup_epochs > 0 and args.eval_every > 0:
-        print(
+        logger.info(
             "Note: warmup epochs optimize global loss only; "
             "ranking metrics are often low until joint training starts."
         )
@@ -1031,7 +909,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 optimizer=optimizer,
                 model=model,
                 grad_clip=args.grad_clip,
-                scaler=scaler,
             )
 
             global_value_sum += float(global_losses["global"].detach().item())
@@ -1048,9 +925,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         step_count = 0
 
         joint_refresh_steps = 0
-        skipped_refresh_low_mem = 0
-        oom_recovery_steps = 0
-        oom_skipped_batches = 0
 
         if not warmup:
             model.eval()
@@ -1088,158 +962,64 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                     and (batch_idx % args.joint_refresh_every == 0)
                 )
 
-                if (
-                    run_full_joint
-                    and device.type == "cuda"
-                    and args.min_free_gb_for_joint_refresh > 0
-                ):
-                    free_gb_before_refresh = cuda_free_gb(device)
-                    if 0 < free_gb_before_refresh < args.min_free_gb_for_joint_refresh:
-                        run_full_joint = False
-                        skipped_refresh_low_mem += 1
-
                 if run_full_joint:
                     joint_triplets = triplet_sampler.sample(batch["user_ids"], device=device)
 
-                    # Keep signed sparse propagation in fp32; sparse CUDA matmul does not support fp16.
-                    autocast_ctx = nullcontext()
-                    with autocast_ctx:
-                        outputs = model(
-                            batch=batch,
-                            signed_graph=signed_graph,
-                            run_sequence=True,
-                            compute_sequence_logits=compute_dense_sequence_logits,
-                        )
-                        losses = criterion(
-                            outputs=outputs,
-                            batch=batch,
-                            triplets=joint_triplets,
-                            warmup=False,
-                            include_negative=pone_neg_active,
-                            include_contrastive=pone_neg_active,
-                        )
-                else:
-                    autocast_ctx = amp_autocast_context(
-                        use_amp=use_amp,
-                        amp_dtype=amp_dtype,
-                        device=device,
+                    outputs = model(
+                        batch=batch,
+                        signed_graph=signed_graph,
+                        run_sequence=True,
+                        compute_sequence_logits=compute_dense_sequence_logits,
                     )
-                    with autocast_ctx:
-                        input_item_embeddings = sequence_item_table[batch["input_ids"]]
-                        encoded_sequence = model.sequence_encoder(
-                            item_embeddings=input_item_embeddings,
-                            attention_mask=batch["attention_mask"],
-                        )
+                    losses = criterion(
+                        outputs=outputs,
+                        batch=batch,
+                        triplets=joint_triplets,
+                        warmup=False,
+                        include_negative=pone_neg_active,
+                        include_contrastive=pone_neg_active,
+                    )
+                else:
+                    input_item_embeddings = sequence_item_table[batch["input_ids"]]
+                    encoded_sequence = model.sequence_encoder(
+                        item_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        return_last=False,
+                        precomputed_emb=input_item_embeddings,
+                    )
 
-                        last_hidden = model.sequence_encoder.get_last_hidden(
-                            encoded=encoded_sequence,
-                            attention_mask=batch["attention_mask"],
-                        )
+                    last_hidden = model.sequence_encoder.get_last_valid_embeddings(
+                        embeddings=encoded_sequence,
+                        attention_mask=batch["attention_mask"],
+                    )
 
-                        outputs = {
-                            "interest_user_embeddings": interest_user_embeddings,
-                            "disinterest_user_embeddings": disinterest_user_embeddings,
-                            "interest_item_embeddings": interest_item_embeddings,
-                            "disinterest_item_embeddings": disinterest_item_embeddings,
-                            "sequence_hidden": encoded_sequence,
-                            "sequence_user_embedding": last_hidden,
-                        }
-                        if compute_dense_sequence_logits:
-                            outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
+                    outputs = {
+                        "interest_user_embeddings": interest_user_embeddings,
+                        "disinterest_user_embeddings": disinterest_user_embeddings,
+                        "interest_item_embeddings": interest_item_embeddings,
+                        "disinterest_item_embeddings": disinterest_item_embeddings,
+                        "sequence_hidden": encoded_sequence,
+                        "sequence_user_embedding": last_hidden,
+                    }
+                    if compute_dense_sequence_logits:
+                        outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
 
-                        losses = criterion(
-                            outputs=outputs,
-                            batch=batch,
-                            triplets=empty_triplets,
-                            warmup=False,
-                            include_negative=pone_neg_active,
-                            include_contrastive=pone_neg_active,
-                        )
+                    losses = criterion(
+                        outputs=outputs,
+                        batch=batch,
+                        triplets=empty_triplets,
+                        warmup=False,
+                        include_negative=pone_neg_active,
+                        include_contrastive=pone_neg_active,
+                    )
 
                 used_full_joint_step = run_full_joint
-
-                try:
-                    backward_and_step(
-                        loss=losses["total"],
-                        optimizer=optimizer,
-                        model=model,
-                        grad_clip=args.grad_clip,
-                        scaler=scaler,
-                    )
-                except torch.OutOfMemoryError as exc:
-                    if device.type == "cuda":
-                        optimizer.zero_grad(set_to_none=True)
-                        torch.cuda.empty_cache()
-
-                    if run_full_joint:
-                        oom_recovery_steps += 1
-                        used_full_joint_step = False
-                        print(
-                            f"Warning: OOM on full-joint refresh at batch {batch_idx}; "
-                            "retrying with sequence-only step."
-                        )
-
-                        autocast_ctx = amp_autocast_context(
-                            use_amp=use_amp,
-                            amp_dtype=amp_dtype,
-                            device=device,
-                        )
-                        with autocast_ctx:
-                            input_item_embeddings = sequence_item_table[batch["input_ids"]]
-                            encoded_sequence = model.sequence_encoder(
-                                item_embeddings=input_item_embeddings,
-                                attention_mask=batch["attention_mask"],
-                            )
-
-                            last_hidden = model.sequence_encoder.get_last_hidden(
-                                encoded=encoded_sequence,
-                                attention_mask=batch["attention_mask"],
-                            )
-
-                            outputs = {
-                                "interest_user_embeddings": interest_user_embeddings,
-                                "disinterest_user_embeddings": disinterest_user_embeddings,
-                                "interest_item_embeddings": interest_item_embeddings,
-                                "disinterest_item_embeddings": disinterest_item_embeddings,
-                                "sequence_hidden": encoded_sequence,
-                                "sequence_user_embedding": last_hidden,
-                            }
-                            if compute_dense_sequence_logits:
-                                outputs["sequence_logits"] = encoded_sequence @ interest_item_embeddings.t()
-
-                            losses = criterion(
-                                outputs=outputs,
-                                batch=batch,
-                                triplets=empty_triplets,
-                                warmup=False,
-                                include_negative=pone_neg_active,
-                                include_contrastive=pone_neg_active,
-                            )
-
-                        try:
-                            backward_and_step(
-                                loss=losses["total"],
-                                optimizer=optimizer,
-                                model=model,
-                                grad_clip=args.grad_clip,
-                                scaler=scaler,
-                            )
-                        except torch.OutOfMemoryError:
-                            if device.type == "cuda":
-                                optimizer.zero_grad(set_to_none=True)
-                                torch.cuda.empty_cache()
-                            oom_skipped_batches += 1
-                            print(
-                                f"Warning: skipped batch {batch_idx} after OOM retry. "
-                                "Consider larger --joint-refresh-every or lower batch."
-                            )
-                            continue
-                    else:
-                        oom_skipped_batches += 1
-                        print(
-                            f"Warning: skipped batch {batch_idx} due to CUDA OOM: {exc}."
-                        )
-                        continue
+                backward_and_step(
+                    loss=losses["total"],
+                    optimizer=optimizer,
+                    model=model,
+                    grad_clip=args.grad_clip,
+                )
 
                 if used_full_joint_step:
                     joint_refresh_steps += 1
@@ -1284,9 +1064,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                         f"local={losses['local'].detach().item():.4f} | "
                         f"align={losses['align'].detach().item():.4f} | "
                         f"refresh_steps={joint_refresh_steps} | "
-                        f"refresh_skipped={skipped_refresh_low_mem} | "
-                        f"oom_recovered={oom_recovery_steps} | "
-                        f"oom_skipped={oom_skipped_batches} | "
                         f"eta={format_duration(eta_seconds)}"
                     )
 
@@ -1302,9 +1079,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "align": 0.0,
                 "local_steps": 0,
                 "joint_refresh_steps": 0,
-                "refresh_skipped": 0,
-                "oom_recovered": 0,
-                "oom_skipped": 0,
             }
         else:
             step_count = max(step_count, 1)
@@ -1322,9 +1096,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 "align": align_avg,
                 "local_steps": step_count,
                 "joint_refresh_steps": joint_refresh_steps,
-                "refresh_skipped": skipped_refresh_low_mem,
-                "oom_recovered": oom_recovery_steps,
-                "oom_skipped": oom_skipped_batches,
             }
 
         should_save_best = epoch_metrics["total"] < best_total
@@ -1350,8 +1121,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 topk=args.eval_topk,
                 batch_size=args.eval_batch_size,
                 split=args.eval_split,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
                 filter_seen=args.eval_filter_seen,
                 seen_items_lookup=eval_seen_items,
                 neg_penalty_weight=args.eval_neg_penalty_weight,
@@ -1359,7 +1128,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 neg_chunk_size=args.eval_neg_chunk_size,
             )
             eval_elapsed = time.time() - eval_start_time
-            print(
+            logger.info(
                 f"Eval {eval_metrics['split']}@{eval_metrics['topk']} | "
                 f"users={eval_metrics['users']} | "
                 f"P={eval_metrics['precision']:.4f} ({eval_metrics['precision'] * 100:.2f}%) | "
@@ -1381,7 +1150,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
 
         epoch_elapsed = time.time() - epoch_start_time
 
-        print(
+        logger.info(
             f"Epoch {epoch + 1:03d}/{args.epochs:03d} | "
             f"warmup={warmup} | "
             f"total={epoch_metrics['total']:.4f} | "
@@ -1390,9 +1159,6 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             f"align={epoch_metrics['align']:.4f} | "
             f"local_steps={epoch_metrics['local_steps']} | "
             f"refresh_steps={epoch_metrics['joint_refresh_steps']} | "
-            f"refresh_skipped={epoch_metrics['refresh_skipped']} | "
-            f"oom_recovered={epoch_metrics['oom_recovered']} | "
-            f"oom_skipped={epoch_metrics['oom_skipped']} | "
             f"time={format_duration(epoch_elapsed)}"
         )
 
@@ -1406,7 +1172,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
             )
             if safe_torch_save(best_payload, best_checkpoint_path, "best checkpoint"):
                 best_total = candidate_best
-                print(f"Saved best checkpoint to: {best_checkpoint_path}")
+                logger.info("Saved best checkpoint to: %s", best_checkpoint_path)
 
         if should_save_periodic:
             if args.keep_last_checkpoints > 0:
@@ -1422,7 +1188,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
                 include_optimizer=args.save_optimizer_periodic,
             )
             if safe_torch_save(periodic_payload, epoch_checkpoint_path, "periodic checkpoint"):
-                print(f"Saved epoch checkpoint to: {epoch_checkpoint_path}")
+                logger.info("Saved epoch checkpoint to: %s", epoch_checkpoint_path)
                 if args.keep_last_checkpoints > 0:
                     prune_epoch_checkpoints(
                         checkpoint_dir=checkpoint_dir,
@@ -1441,13 +1207,30 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     )
     final_saved = safe_torch_save(final_payload, checkpoint_path, "final checkpoint")
     if final_saved:
-        print(f"Saved checkpoint to: {checkpoint_path}")
+        logger.info("Saved checkpoint to: %s", checkpoint_path)
     else:
-        print("Warning: final checkpoint was not saved due to storage write failure.")
+        logger.warning("Final checkpoint was not saved due to storage write failure.")
 
     with history_path.open("w", encoding="utf-8") as file_obj:
         json.dump(history, file_obj, indent=2)
 
-    print(f"Saved history to: {history_path}")
+    logger.info("Saved history to: %s", history_path)
+
+    config_path = output_dir / "config.json"
+    config = {
+        "args": vars(args),
+        "num_users": bundle.num_users,
+        "num_items": bundle.num_items,
+        "run_prefix": run_prefix,
+        "output_dir": str(output_dir),
+        "best_total": best_total,
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "final_checkpoint_path": str(checkpoint_path),
+        "history_path": str(history_path),
+        "last_eval_metrics": last_eval_metrics,
+    }
+    with config_path.open("w", encoding="utf-8") as file_obj:
+        json.dump(config, file_obj, indent=2)
+    logger.info("Saved config to: %s", config_path)
 
     return checkpoint_path, history_path

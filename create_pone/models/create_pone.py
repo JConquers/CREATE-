@@ -5,7 +5,7 @@ from torch import nn
 
 from create_pone.dataset.signed_graph import SignedGraph
 
-from .sequence_encoder import SequenceEncoder
+from .sequence_encoder import SequentialEncoder
 from .signed_gnn import SignedDualGNN
 
 
@@ -38,7 +38,8 @@ class CreatePoneModel(nn.Module):
             num_layers=gnn_layers,
             dropout=gnn_dropout,
         )
-        self.sequence_encoder = SequenceEncoder(
+        self.sequence_encoder = SequentialEncoder(
+            num_items=num_items,
             embedding_dim=embedding_dim,
             num_heads=transformer_heads,
             num_layers=transformer_layers,
@@ -81,12 +82,14 @@ class CreatePoneModel(nn.Module):
 
         input_item_embeddings = sequence_item_table[batch["input_ids"]]
         encoded_sequence = self.sequence_encoder(
-            item_embeddings=input_item_embeddings,
+            item_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
+            return_last=False,
+            precomputed_emb=input_item_embeddings,
         )
 
-        last_hidden = self.sequence_encoder.get_last_hidden(
-            encoded=encoded_sequence,
+        last_hidden = self.sequence_encoder.get_last_valid_embeddings(
+            embeddings=encoded_sequence,
             attention_mask=batch["attention_mask"],
         )
 

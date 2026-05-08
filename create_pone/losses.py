@@ -1,7 +1,43 @@
 """Loss functions for the CREATE-Pone variant."""
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+
+class LocalObjective(nn.Module):
+    """
+    Local objective: Cross-entropy loss for next-item prediction.
+    This is the standard sequential recommendation loss.
+    """
+
+    def __init__(self, label_smoothing: float = 0.0):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute local objective loss.
+
+        Args:
+            logits: Prediction scores (batch_size, num_items) or (num_masked, num_items)
+            labels: Target item IDs (batch_size,) or (num_masked,)
+
+        Returns:
+            loss: Scalar tensor
+        """
+        assert logits.shape[0] == labels.shape[0], (
+            "Logits and labels must have same batch size: "
+            f"{logits.shape[0]} vs {labels.shape[0]}"
+        )
+
+        loss = self.loss_fn(logits, labels)
+        return loss
 
 
 class CreatePoneLoss:
@@ -15,8 +51,6 @@ class CreatePoneLoss:
         orthogonal_mu: float,
         contrastive_tau: float,
         neg_branch_scale: float,
-        local_loss_chunk_size: int = 0,
-        rating_offset: float = 0.0,
     ):
         self.w_global = w_global
         self.w_align = w_align
@@ -24,20 +58,11 @@ class CreatePoneLoss:
         self.orthogonal_mu = orthogonal_mu
         self.contrastive_tau = contrastive_tau
         self.neg_branch_scale = neg_branch_scale
-        self.local_loss_chunk_size = local_loss_chunk_size
-        self.rating_offset = rating_offset
+        self.local_objective = LocalObjective()
 
     @staticmethod
     def _zero_like(reference: torch.Tensor) -> torch.Tensor:
         return reference.sum() * 0.0
-
-    def _rating_weight(self, ratings: torch.Tensor | None, positive: bool) -> torch.Tensor | None:
-        if ratings is None or ratings.numel() == 0:
-            return None
-        sign = torch.sign(ratings - self.rating_offset)
-        if positive:
-            return (-0.5 * sign + 1.5)
-        return (0.5 * sign + 1.5)
 
     def _local_loss(self, outputs: dict, batch: dict) -> torch.Tensor:
         target_ids = batch["target_ids"]
@@ -47,55 +72,16 @@ class CreatePoneLoss:
         if not valid_mask.any():
             reference = outputs.get("sequence_hidden")
             if reference is None:
-                reference = outputs["sequence_logits"]
+                reference = outputs["interest_item_embeddings"]
             return self._zero_like(reference)
 
-        if self.local_loss_chunk_size <= 0 and "sequence_logits" in outputs:
-            logits = outputs["sequence_logits"]
-            return F.cross_entropy(logits[valid_mask], target_ids[valid_mask], reduction="mean")
+        logits = outputs.get("sequence_logits")
+        if logits is None:
+            sequence_hidden = outputs["sequence_hidden"]
+            item_embeddings = outputs["interest_item_embeddings"]
+            logits = sequence_hidden @ item_embeddings.t()
 
-        return self._local_loss_chunked(outputs=outputs, valid_mask=valid_mask, target_ids=target_ids)
-
-    def _local_loss_chunked(
-        self,
-        outputs: dict,
-        valid_mask: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        sequence_hidden = outputs["sequence_hidden"]
-        item_embeddings = outputs["interest_item_embeddings"]
-
-        hidden = sequence_hidden[valid_mask]
-        targets = target_ids[valid_mask]
-
-        if hidden.numel() == 0:
-            return self._zero_like(sequence_hidden)
-
-        target_vectors = item_embeddings[targets]
-        target_logits = (hidden * target_vectors).sum(dim=1)
-
-        chunk_size = max(1, int(self.local_loss_chunk_size))
-        num_items = item_embeddings.size(0)
-
-        max_scores = torch.full_like(target_logits, -float("inf"))
-        sum_exp = torch.zeros_like(target_logits)
-
-        for start in range(0, num_items, chunk_size):
-            end = min(start + chunk_size, num_items)
-            item_chunk = item_embeddings[start:end]
-            chunk_scores = hidden @ item_chunk.t()
-
-            chunk_max = chunk_scores.max(dim=1).values
-            updated_max = torch.maximum(max_scores, chunk_max)
-
-            sum_exp = (
-                sum_exp * torch.exp(max_scores - updated_max)
-                + torch.exp(chunk_scores - updated_max.unsqueeze(1)).sum(dim=1)
-            )
-            max_scores = updated_max
-
-        log_denom = max_scores + torch.log(sum_exp + 1e-12)
-        return -(target_logits - log_denom).mean()
+        return self.local_objective(logits[valid_mask], target_ids[valid_mask])
 
     def _dual_feedback_loss(
         self,
@@ -112,7 +98,6 @@ class CreatePoneLoss:
 
         pos_users = triplets["pos_users"]
         pos_negs = triplets.get("pos_negs")
-        pos_ratings = triplets.get("pos_ratings")
         if pos_users.numel() > 0 and pos_negs is not None and pos_negs.numel() > 0:
             pos_items = triplets["pos_items"]
             z_u = interest_user[pos_users]
@@ -123,16 +108,12 @@ class CreatePoneLoss:
 
             y_ui = (z_u * z_i).sum(dim=1)
             y_uj = (z_u.unsqueeze(1) * z_j).sum(dim=2)
-            weight = self._rating_weight(pos_ratings, positive=True)
-            if weight is None:
-                weight = torch.ones_like(y_ui)
-            diff = weight.unsqueeze(1) * y_ui.unsqueeze(1) - y_uj
+            diff = y_ui.unsqueeze(1) - y_uj
             loss = loss - F.logsigmoid(diff).mean()
 
         if include_negative:
             neg_users = triplets["neg_users"]
             neg_negs = triplets.get("neg_negs")
-            neg_ratings = triplets.get("neg_ratings")
             if neg_users.numel() > 0 and neg_negs is not None and neg_negs.numel() > 0:
                 neg_items = triplets["neg_items"]
                 v_u = disinterest_user[neg_users]
@@ -143,10 +124,7 @@ class CreatePoneLoss:
 
                 y_ui = self.neg_branch_scale * (v_u * v_i).sum(dim=1)
                 y_uj = (v_u.unsqueeze(1) * v_j).sum(dim=2)
-                weight = self._rating_weight(neg_ratings, positive=False)
-                if weight is None:
-                    weight = torch.ones_like(y_ui)
-                diff = y_uj - weight.unsqueeze(1) * y_ui.unsqueeze(1)
+                diff = y_uj - y_ui.unsqueeze(1)
                 loss = loss - F.logsigmoid(diff).mean()
 
         return loss
@@ -165,18 +143,16 @@ class CreatePoneLoss:
         if pos_users.numel() == 0 or neg_users.numel() == 0:
             return self._zero_like(interest_user)
 
-        # Eq. (11): pair positive and negative terms for the same user u.
-        pos_index_by_user = {}
+        # Eq. (11): pair all positive/negative samples for each user u.
+        pos_index_by_user: dict[int, list[int]] = {}
         for idx, user_id in enumerate(pos_users.detach().cpu().tolist()):
             user_id = int(user_id)
-            if user_id not in pos_index_by_user:
-                pos_index_by_user[user_id] = idx
+            pos_index_by_user.setdefault(user_id, []).append(idx)
 
-        neg_index_by_user = {}
+        neg_index_by_user: dict[int, list[int]] = {}
         for idx, user_id in enumerate(neg_users.detach().cpu().tolist()):
             user_id = int(user_id)
-            if user_id not in neg_index_by_user:
-                neg_index_by_user[user_id] = idx
+            neg_index_by_user.setdefault(user_id, []).append(idx)
 
         common_users = [
             user_id for user_id in pos_index_by_user if user_id in neg_index_by_user
@@ -184,13 +160,24 @@ class CreatePoneLoss:
         if not common_users:
             return self._zero_like(interest_user)
 
+        pos_pair_indices: list[int] = []
+        neg_pair_indices: list[int] = []
+        for user_id in common_users:
+            for pos_idx in pos_index_by_user[user_id]:
+                for neg_idx in neg_index_by_user[user_id]:
+                    pos_pair_indices.append(pos_idx)
+                    neg_pair_indices.append(neg_idx)
+
+        if not pos_pair_indices:
+            return self._zero_like(interest_user)
+
         pos_indices = torch.tensor(
-            [pos_index_by_user[user_id] for user_id in common_users],
+            pos_pair_indices,
             dtype=torch.long,
             device=interest_user.device,
         )
         neg_indices = torch.tensor(
-            [neg_index_by_user[user_id] for user_id in common_users],
+            neg_pair_indices,
             dtype=torch.long,
             device=interest_user.device,
         )
