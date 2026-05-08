@@ -243,11 +243,16 @@ def train(
 
         phase = "Warmup" if epoch < warmup_epochs else "Joint"
         desc = f"[{phase}] Epoch {epoch + 1}/{num_epochs}"
+        use_alignment = (
+            loss_fn.barlow_twins_coef > 0
+            and getattr(model, "use_graph", False)
+            and getattr(model, "use_sequence", False)
+        )
 
         for batch in tqdm(train_dataloader, desc=desc, mininterval=30, ncols=100):
             move_batch(batch, device)
             # Pass is_warmup to save sequence encoder computation during warmup training phase
-            outputs = model(batch, return_alignment=(loss_fn.barlow_twins_coef > 0), is_warmup=(epoch < warmup_epochs))
+            outputs = model(batch, return_alignment=use_alignment, is_warmup=(epoch < warmup_epochs))
 
             loss, loss_dict = loss_fn(batch, outputs, epoch_num=epoch, warmup_epochs=warmup_epochs)
 

@@ -353,6 +353,7 @@ class CREATEUni(nn.Module):
         # Process the global hypergraph through the UniGNN encoder to get embeddings 
         # for ALL users and items that capture collaborative filtering signals.
         graph_user_emb = None
+        all_user_emb = None
         all_item_emb = None
         if self.use_graph:
             all_user_emb, all_item_emb = self.encode_graph()
@@ -379,7 +380,7 @@ class CREATEUni(nn.Module):
                     graph_item_emb=all_item_emb,  
                 )
                 seq_emb = mlm_emb  # Shape: (total_num_masked_items_in_batch, D)
-                if mlm_mask is not None:
+                if mlm_mask is not None and self.use_graph:
                     seq_emb_for_alignment = torch.zeros_like(graph_user_emb)
                     for i in range(batch_size):
                         user_mlm_mask = mlm_mask[i]
@@ -397,7 +398,12 @@ class CREATEUni(nn.Module):
                     )
                     seq_emb = all_seq_emb[attention_mask]
                     seq_emb_for_alignment = seq_emb
-                    if graph_pos_user_ids is not None and graph_pos_user_ids.numel() == seq_emb.shape[0]:
+                    if (
+                        self.use_graph
+                        and all_user_emb is not None
+                        and graph_pos_user_ids is not None
+                        and graph_pos_user_ids.numel() == seq_emb.shape[0]
+                    ):
                         graph_emb_for_alignment = all_user_emb[graph_pos_user_ids]
                 else:
                     seq_emb = self.encode_sequence(
