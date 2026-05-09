@@ -7,11 +7,9 @@ import math
 import os
 import random
 import shutil
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -32,6 +30,7 @@ from create_pone.dataset import (
 )
 from create_pone.losses import CreatePoneLoss
 from create_pone.models import CreatePoneModel
+from create_pone.pone_baseline import train_pone_gnn_baseline
 
 
 def set_random_seed(seed: int) -> None:
@@ -520,188 +519,6 @@ def evaluate_graph_ranking(
     }
 
 
-def _ensure_pone_gnn_available() -> Path:
-    repo_root = Path(__file__).resolve().parents[1]
-    pone_root = repo_root / "Pone-GNN"
-    if not pone_root.exists():
-        raise RuntimeError(
-            "Pone-GNN folder not found. Expected: "
-            f"{pone_root}"
-        )
-    if str(pone_root) not in sys.path:
-        sys.path.append(str(pone_root))
-    return pone_root
-
-
-def _build_pone_frames(bundle) -> tuple[pd.DataFrame, pd.DataFrame, SimpleNamespace]:
-    train_df = bundle.train_df[["user_id", "item_id", "rating"]].copy()
-    test_df = bundle.test_df[["user_id", "item_id", "rating"]].copy()
-
-    train_df.rename(columns={"user_id": "userId", "item_id": "movieId"}, inplace=True)
-    test_df.rename(columns={"user_id": "userId", "item_id": "movieId"}, inplace=True)
-
-    # Pone-GNN expects 1-based ids and then subtracts 1 internally.
-    train_df["userId"] += 1
-    train_df["movieId"] += 1
-    test_df["userId"] += 1
-    test_df["movieId"] += 1
-
-    data_class = SimpleNamespace(
-        train=train_df,
-        test=test_df,
-        num_u=bundle.num_users,
-        num_v=bundle.num_items,
-    )
-
-    return train_df, test_df, data_class
-
-
-def train_pone_gnn_baseline(
-    args: argparse.Namespace,
-    bundle,
-    output_dir: Path,
-    logger: logging.Logger,
-    device: torch.device,
-) -> tuple[Path, Path]:
-    _ensure_pone_gnn_available()
-
-    from evaluator import evaluator as pone_evaluator
-    from ponegnn import PoneGNN
-    from torch_geometric.data import Data
-    from torch.optim.lr_scheduler import MultiStepLR
-    from util import bipartite_dataset, deg_dist_2, gen_top_k_new3
-
-    train_df, test_df, data_class = _build_pone_frames(bundle)
-
-    if train_df.empty:
-        raise RuntimeError("Pone-GNN baseline requires non-empty training data.")
-
-    neg_dist = deg_dist_2(train_df, data_class.num_v)
-    training_dataset = bipartite_dataset(
-        train_df,
-        neg_dist,
-        args.pone_offset,
-        data_class.num_u,
-        data_class.num_v,
-        args.neg_sample_k,
-    )
-
-    pos_train = train_df[train_df["rating"] > args.pone_offset]
-    neg_train = train_df[train_df["rating"] < args.pone_offset]
-
-    edge_user = torch.tensor(pos_train["userId"].values - 1, dtype=torch.long)
-    edge_item = torch.tensor(pos_train["movieId"].values - 1, dtype=torch.long) + data_class.num_u
-    edge_p = torch.stack(
-        [torch.cat([edge_user, edge_item]), torch.cat([edge_item, edge_user])],
-        dim=0,
-    )
-    data_p = Data(edge_index=edge_p).to(device)
-
-    edge_user_n = torch.tensor(neg_train["userId"].values - 1, dtype=torch.long)
-    edge_item_n = torch.tensor(neg_train["movieId"].values - 1, dtype=torch.long) + data_class.num_u
-    edge_n = torch.stack(
-        [torch.cat([edge_user_n, edge_item_n]), torch.cat([edge_item_n, edge_user_n])],
-        dim=0,
-    )
-    data_n = Data(edge_index=edge_n).to(device)
-
-    model = PoneGNN(
-        data_class.num_u,
-        data_class.num_v,
-        num_layer=args.pone_num_layers,
-        dim=args.embedding_dim,
-        reg=args.pone_reg,
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.pone_lr)
-    scheduler = MultiStepLR(optimizer, milestones=[20, 200], gamma=0.2)
-
-    history: list[dict] = []
-    best_metric = -float("inf")
-
-    eval_every = max(1, args.pone_eval_every)
-    for epoch in range(1, args.epochs + 1):
-        if eval_every == 1 or epoch % eval_every == 1:
-            training_dataset.negs_gen_EP(eval_every)
-
-        training_dataset.edge_4 = training_dataset.edge_4_tot[:, :, (epoch - 1) % eval_every]
-        ds = DataLoader(training_dataset, batch_size=args.pone_batch_size, shuffle=True)
-
-        total_loss = 0.0
-        model.train()
-        for u, v, w, negs in ds:
-            u = u.to(device)
-            v = v.to(device)
-            w = w.to(device)
-            negs = negs.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss = model.loss(u, v, w, negs, data_p, data_n, epoch)
-            loss.backward()
-            optimizer.step()
-            total_loss += float(loss.detach().item())
-
-        scheduler.step()
-
-        epoch_metrics = {
-            "epoch": epoch,
-            "loss": total_loss / max(1, len(ds)),
-        }
-
-        if eval_every == 1 or epoch % eval_every == 1:
-            model.eval()
-            emb_u, emb_n_u, emb_v, emb_n_v = model.get_ui_embeddings(data_p, data_n)
-            r_hat = emb_u.mm(emb_v.t()).cpu().detach()
-            r_hat_n = emb_n_u.mm(emb_n_v.t()).cpu().detach()
-
-            reco = gen_top_k_new3(data_class, r_hat, r_hat_n)
-            eval_ = pone_evaluator(data_class, reco, args, N=[args.eval_topk])
-            eval_.precision_and_recall()
-            eval_.normalized_DCG()
-
-            idx = args.eval_topk - 1
-            precision = float(eval_.p["total"][idx])
-            recall = float(eval_.r["total"][idx])
-            ndcg = float(eval_.nDCG["total"][idx])
-            hit = float(eval_.h["total"][idx])
-
-            epoch_metrics.update(
-                {
-                    "precision": precision,
-                    "recall": recall,
-                    "ndcg": ndcg,
-                    "hit": hit,
-                }
-            )
-            logger.info(
-                "Pone-GNN Eval@%s | P=%.4f R=%.4f NDCG=%.4f HR=%.4f",
-                args.eval_topk,
-                precision,
-                recall,
-                ndcg,
-                hit,
-            )
-
-            if ndcg > best_metric:
-                best_metric = ndcg
-
-        history.append(epoch_metrics)
-
-    checkpoint_path = output_dir / f"pone_gnn_{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
-    history_path = output_dir / f"pone_gnn_{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_history.json"
-
-    payload = {
-        "model_state_dict": model.state_dict(),
-        "args": vars(args),
-        "num_users": data_class.num_u,
-        "num_items": data_class.num_v,
-        "best_ndcg": best_metric,
-    }
-    safe_torch_save(payload, checkpoint_path, "pone_gnn checkpoint")
-    with history_path.open("w", encoding="utf-8") as file_obj:
-        json.dump(history, file_obj, indent=2)
-
-    return checkpoint_path, history_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
