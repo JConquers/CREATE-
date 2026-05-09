@@ -415,19 +415,47 @@ def _plot_selected_curves(
     plt.close()
 
 
+def _plot_loss_subplots(history: List[Dict], output_dir: Path):
+    epochs = range(1, len(history) + 1)
+    loss_specs = [
+        ("train/global_loss", "Global Loss"),
+        ("train/local_loss", "Local Loss"),
+        ("train/align_loss", "Align Loss"),
+    ]
+
+    fig, axes = plt.subplots(len(loss_specs), 1, figsize=(9, 9), sharex=True)
+    plotted = False
+
+    for ax, (key, label) in zip(axes, loss_specs):
+        values = [epoch_metrics.get(key) for epoch_metrics in history]
+        if all(value is None for value in values):
+            ax.set_visible(False)
+            continue
+
+        values = [0.0 if value is None else value for value in values]
+        ax.plot(epochs, values, marker="o", label=label)
+        ax.set_title(label)
+        ax.set_ylabel("Loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    axes[-1].set_xlabel("Epoch")
+    fig.suptitle("Training Losses", y=0.995)
+    fig.tight_layout()
+    fig.savefig(output_dir / "losses.png", dpi=150)
+    plt.close(fig)
+
+
 def plot_training_results(history: List[Dict], output_dir: str):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _plot_selected_curves(
-        history=history,
-        output_dir=output_dir,
-        keys=["train/global_loss", "train/local_loss", "train/align_loss"],
-        labels=["Global", "Local", "Align"],
-        title="Training Losses",
-        ylabel="Loss",
-        filename="losses.png",
-    )
+    _plot_loss_subplots(history, output_dir)
 
     metric_prefix = "test" if history and "test/ndcg@10" in history[-1] else "val"
     _plot_selected_curves(
