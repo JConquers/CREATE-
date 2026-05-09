@@ -7,9 +7,11 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -403,10 +405,315 @@ def evaluate_ranking(
     }
 
 
+@torch.no_grad()
+def evaluate_graph_ranking(
+    model: CreatePoneModel,
+    signed_graph,
+    eval_examples: list[tuple[int, list[int], list[int]]],
+    device: torch.device,
+    topk: int,
+    batch_size: int,
+    split: str,
+    filter_seen: bool,
+    seen_items_lookup: dict[int, list[int]] | None,
+    neg_penalty_weight: float,
+    neg_filter_threshold: float,
+    neg_chunk_size: int,
+) -> dict:
+    if not eval_examples:
+        return {
+            "split": split,
+            "users": 0,
+            "topk": max(1, topk),
+            "hr": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "ndcg": 0.0,
+            "avg_targets": 0.0,
+        }
+
+    model.eval()
+
+    graph_outputs = model(batch={}, signed_graph=signed_graph, run_sequence=False)
+    interest_user_embeddings = graph_outputs["interest_user_embeddings"]
+    disinterest_user_embeddings = graph_outputs["disinterest_user_embeddings"]
+    interest_item_embeddings = graph_outputs["interest_item_embeddings"]
+    disinterest_item_embeddings = graph_outputs["disinterest_item_embeddings"]
+
+    eval_topk = min(max(1, topk), interest_item_embeddings.size(0))
+
+    hits_total = 0.0
+    precision_total = 0.0
+    recall_total = 0.0
+    ndcg_total = 0.0
+    target_count_total = 0
+    user_count = len(eval_examples)
+
+    for start_idx in range(0, user_count, max(1, batch_size)):
+        batch_examples = eval_examples[start_idx:start_idx + max(1, batch_size)]
+        batch_len = len(batch_examples)
+        batch_user_ids = torch.empty((batch_len,), dtype=torch.long, device=device)
+
+        for row_idx, (user_id, _, _) in enumerate(batch_examples):
+            batch_user_ids[row_idx] = int(user_id)
+
+        scores = interest_user_embeddings[batch_user_ids] @ interest_item_embeddings.t()
+
+        if neg_penalty_weight > 0 or neg_filter_threshold > -1e8:
+            disinterest_users = disinterest_user_embeddings[batch_user_ids]
+            chunk_size = max(1, int(neg_chunk_size))
+            for start in range(0, disinterest_item_embeddings.size(0), chunk_size):
+                end = min(start + chunk_size, disinterest_item_embeddings.size(0))
+                neg_chunk = disinterest_users @ disinterest_item_embeddings[start:end].t()
+                if neg_penalty_weight > 0:
+                    scores[:, start:end] = scores[:, start:end] - neg_penalty_weight * neg_chunk
+                if neg_filter_threshold > -1e8:
+                    scores[:, start:end] = scores[:, start:end].masked_fill(
+                        neg_chunk > neg_filter_threshold,
+                        float("-inf"),
+                    )
+
+        if filter_seen:
+            # Match common recommendation protocol: remove seen context items from candidates.
+            for row_idx, (user_id, context, target_items) in enumerate(batch_examples):
+                target_tensor = torch.tensor(target_items, dtype=torch.long, device=device)
+                target_scores = scores[row_idx, target_tensor].clone()
+                seen_items = seen_items_lookup.get(user_id) if seen_items_lookup is not None else context
+                if seen_items:
+                    scores[row_idx, seen_items] = float("-inf")
+                scores[row_idx, target_tensor] = target_scores
+
+        _, topk_indices = torch.topk(scores, k=eval_topk, dim=1)
+
+        for row_idx, (_, _, target_items) in enumerate(batch_examples):
+            target_set = set(target_items)
+            target_count = len(target_set)
+            recommended_items = topk_indices[row_idx].tolist()
+
+            hit_count = 0
+            dcg = 0.0
+            for rank, item_id in enumerate(recommended_items):
+                if item_id in target_set:
+                    hit_count += 1
+                    dcg += 1.0 / math.log2(rank + 2.0)
+
+            ideal_count = min(target_count, eval_topk)
+            idcg = sum(1.0 / math.log2(rank + 2.0) for rank in range(ideal_count))
+
+            hits_total += 1.0 if hit_count > 0 else 0.0
+            precision_total += hit_count / max(1, eval_topk)
+            recall_total += hit_count / max(1, target_count)
+            ndcg_total += (dcg / idcg) if idcg > 0 else 0.0
+            target_count_total += target_count
+
+    model.train()
+
+    return {
+        "split": split,
+        "users": user_count,
+        "topk": eval_topk,
+        "hr": hits_total / max(1, user_count),
+        "precision": precision_total / max(1, user_count),
+        "recall": recall_total / max(1, user_count),
+        "ndcg": ndcg_total / max(1, user_count),
+        "avg_targets": target_count_total / max(1, user_count),
+    }
+
+
+def _ensure_pone_gnn_available() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    pone_root = repo_root / "Pone-GNN"
+    if not pone_root.exists():
+        raise RuntimeError(
+            "Pone-GNN folder not found. Expected: "
+            f"{pone_root}"
+        )
+    if str(pone_root) not in sys.path:
+        sys.path.append(str(pone_root))
+    return pone_root
+
+
+def _build_pone_frames(bundle) -> tuple[pd.DataFrame, pd.DataFrame, SimpleNamespace]:
+    train_df = bundle.train_df[["user_id", "item_id", "rating"]].copy()
+    test_df = bundle.test_df[["user_id", "item_id", "rating"]].copy()
+
+    train_df.rename(columns={"user_id": "userId", "item_id": "movieId"}, inplace=True)
+    test_df.rename(columns={"user_id": "userId", "item_id": "movieId"}, inplace=True)
+
+    # Pone-GNN expects 1-based ids and then subtracts 1 internally.
+    train_df["userId"] += 1
+    train_df["movieId"] += 1
+    test_df["userId"] += 1
+    test_df["movieId"] += 1
+
+    data_class = SimpleNamespace(
+        train=train_df,
+        test=test_df,
+        num_u=bundle.num_users,
+        num_v=bundle.num_items,
+    )
+
+    return train_df, test_df, data_class
+
+
+def train_pone_gnn_baseline(
+    args: argparse.Namespace,
+    bundle,
+    output_dir: Path,
+    logger: logging.Logger,
+    device: torch.device,
+) -> tuple[Path, Path]:
+    _ensure_pone_gnn_available()
+
+    from evaluator import evaluator as pone_evaluator
+    from ponegnn import PoneGNN
+    from torch_geometric.data import Data
+    from torch.optim.lr_scheduler import MultiStepLR
+    from util import bipartite_dataset, deg_dist_2, gen_top_k_new3
+
+    train_df, test_df, data_class = _build_pone_frames(bundle)
+
+    if train_df.empty:
+        raise RuntimeError("Pone-GNN baseline requires non-empty training data.")
+
+    neg_dist = deg_dist_2(train_df, data_class.num_v)
+    training_dataset = bipartite_dataset(
+        train_df,
+        neg_dist,
+        args.pone_offset,
+        data_class.num_u,
+        data_class.num_v,
+        args.neg_sample_k,
+    )
+
+    pos_train = train_df[train_df["rating"] > args.pone_offset]
+    neg_train = train_df[train_df["rating"] < args.pone_offset]
+
+    edge_user = torch.tensor(pos_train["userId"].values - 1, dtype=torch.long)
+    edge_item = torch.tensor(pos_train["movieId"].values - 1, dtype=torch.long) + data_class.num_u
+    edge_p = torch.stack(
+        [torch.cat([edge_user, edge_item]), torch.cat([edge_item, edge_user])],
+        dim=0,
+    )
+    data_p = Data(edge_index=edge_p).to(device)
+
+    edge_user_n = torch.tensor(neg_train["userId"].values - 1, dtype=torch.long)
+    edge_item_n = torch.tensor(neg_train["movieId"].values - 1, dtype=torch.long) + data_class.num_u
+    edge_n = torch.stack(
+        [torch.cat([edge_user_n, edge_item_n]), torch.cat([edge_item_n, edge_user_n])],
+        dim=0,
+    )
+    data_n = Data(edge_index=edge_n).to(device)
+
+    model = PoneGNN(
+        data_class.num_u,
+        data_class.num_v,
+        num_layer=args.pone_num_layers,
+        dim=args.embedding_dim,
+        reg=args.pone_reg,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.pone_lr)
+    scheduler = MultiStepLR(optimizer, milestones=[20, 200], gamma=0.2)
+
+    history: list[dict] = []
+    best_metric = -float("inf")
+
+    eval_every = max(1, args.pone_eval_every)
+    for epoch in range(1, args.epochs + 1):
+        if eval_every == 1 or epoch % eval_every == 1:
+            training_dataset.negs_gen_EP(eval_every)
+
+        training_dataset.edge_4 = training_dataset.edge_4_tot[:, :, (epoch - 1) % eval_every]
+        ds = DataLoader(training_dataset, batch_size=args.pone_batch_size, shuffle=True)
+
+        total_loss = 0.0
+        model.train()
+        for u, v, w, negs in ds:
+            u = u.to(device)
+            v = v.to(device)
+            w = w.to(device)
+            negs = negs.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.loss(u, v, w, negs, data_p, data_n, epoch)
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().item())
+
+        scheduler.step()
+
+        epoch_metrics = {
+            "epoch": epoch,
+            "loss": total_loss / max(1, len(ds)),
+        }
+
+        if eval_every == 1 or epoch % eval_every == 1:
+            model.eval()
+            emb_u, emb_n_u, emb_v, emb_n_v = model.get_ui_embeddings(data_p, data_n)
+            r_hat = emb_u.mm(emb_v.t()).cpu().detach()
+            r_hat_n = emb_n_u.mm(emb_n_v.t()).cpu().detach()
+
+            reco = gen_top_k_new3(data_class, r_hat, r_hat_n)
+            eval_ = pone_evaluator(data_class, reco, args, N=[args.eval_topk])
+            eval_.precision_and_recall()
+            eval_.normalized_DCG()
+
+            idx = args.eval_topk - 1
+            precision = float(eval_.p["total"][idx])
+            recall = float(eval_.r["total"][idx])
+            ndcg = float(eval_.nDCG["total"][idx])
+            hit = float(eval_.h["total"][idx])
+
+            epoch_metrics.update(
+                {
+                    "precision": precision,
+                    "recall": recall,
+                    "ndcg": ndcg,
+                    "hit": hit,
+                }
+            )
+            logger.info(
+                "Pone-GNN Eval@%s | P=%.4f R=%.4f NDCG=%.4f HR=%.4f",
+                args.eval_topk,
+                precision,
+                recall,
+                ndcg,
+                hit,
+            )
+
+            if ndcg > best_metric:
+                best_metric = ndcg
+
+        history.append(epoch_metrics)
+
+    checkpoint_path = output_dir / f"pone_gnn_{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+    history_path = output_dir / f"pone_gnn_{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_history.json"
+
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "args": vars(args),
+        "num_users": data_class.num_u,
+        "num_items": data_class.num_v,
+        "best_ndcg": best_metric,
+    }
+    safe_torch_save(payload, checkpoint_path, "pone_gnn checkpoint")
+    with history_path.open("w", encoding="utf-8") as file_obj:
+        json.dump(history, file_obj, indent=2)
+
+    return checkpoint_path, history_path
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train CREATE-Pone (CREATE++ signed variant)")
 
     parser.add_argument("--dataset", choices=["beauty", "books"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["create_pone", "pone_gnn"],
+        default="create_pone",
+        help="Training mode: full CREATE-Pone or signed GNN baseline.",
+    )
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./outputs/create_pone")
     parser.add_argument(
@@ -465,6 +772,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Epoch offset for Pone scheduling (1 means epochs 1,11,21...).",
+    )
+    parser.add_argument(
+        "--pone-batch-size",
+        type=int,
+        default=2048,
+        help="Batch size for the Pone-GNN baseline training loop.",
+    )
+    parser.add_argument(
+        "--pone-lr",
+        type=float,
+        default=5e-3,
+        help="Learning rate for the Pone-GNN baseline training loop.",
+    )
+    parser.add_argument(
+        "--pone-num-layers",
+        type=int,
+        default=4,
+        help="Number of GNN layers for the Pone-GNN baseline.",
+    )
+    parser.add_argument(
+        "--pone-reg",
+        type=float,
+        default=5e-5,
+        help="L2 regularization coefficient for the Pone-GNN baseline.",
+    )
+    parser.add_argument(
+        "--pone-eval-every",
+        type=int,
+        default=20,
+        help="Evaluation frequency (epochs) for the Pone-GNN baseline.",
+    )
+    parser.add_argument(
+        "--pone-offset",
+        type=float,
+        default=3.5,
+        help="Rating offset (likes/dislikes) for the Pone-GNN baseline.",
     )
 
     parser.add_argument("--pos-threshold", type=float, default=4.0)
@@ -630,7 +973,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_prefix = f"create_pone_{args.dataset}_{stamp}"
+    mode_prefix = "pone_gnn" if args.mode == "pone_gnn" else "create_pone"
+    run_prefix = f"{mode_prefix}_{args.dataset}_{stamp}"
+
+    graph_only = args.mode == "pone_gnn"
 
     output_dir = Path(args.output_dir) / run_prefix
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -643,6 +989,8 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
     logger.info("CREATE-Pone Training")
     logger.info("=" * 60)
     logger.info("Arguments: %s", json.dumps(vars(args), indent=2))
+    if graph_only:
+        logger.info("Mode: signed GNN baseline (global loss only)")
 
     set_random_seed(args.seed)
     device = resolve_device(args.device, allow_kaggle_cpu=args.allow_kaggle_cpu)
@@ -670,6 +1018,14 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         books_pone_version=args.books_pone_version,
         books_pone_split_dir=(args.books_pone_split_dir or None),
     )
+    if graph_only:
+        return train_pone_gnn_baseline(
+            args=args,
+            bundle=bundle,
+            output_dir=output_dir,
+            logger=logger,
+            device=device,
+        )
     if args.dataset == "books" and args.books_protocol == "pone":
         logger.info(
             "Using Pone-GNN books protocol: version=%s bundle=%s",
@@ -869,7 +1225,7 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
-        warmup = epoch < args.warmup_epochs
+        warmup = graph_only or epoch < args.warmup_epochs
         model.train()
 
         if args.pone_neg_every <= 0:
@@ -1112,21 +1468,37 @@ def train_create_pone(args: argparse.Namespace) -> tuple[Path, Path]:
         eval_metrics = None
         if eval_examples and (should_eval_standalone or needs_eval_for_checkpoint):
             eval_start_time = time.time()
-            eval_metrics = evaluate_ranking(
-                model=model,
-                signed_graph=signed_graph,
-                eval_examples=eval_examples,
-                pad_id=bundle.num_items,
-                device=device,
-                topk=args.eval_topk,
-                batch_size=args.eval_batch_size,
-                split=args.eval_split,
-                filter_seen=args.eval_filter_seen,
-                seen_items_lookup=eval_seen_items,
-                neg_penalty_weight=args.eval_neg_penalty_weight,
-                neg_filter_threshold=args.eval_neg_filter_threshold,
-                neg_chunk_size=args.eval_neg_chunk_size,
-            )
+            if graph_only:
+                eval_metrics = evaluate_graph_ranking(
+                    model=model,
+                    signed_graph=signed_graph,
+                    eval_examples=eval_examples,
+                    device=device,
+                    topk=args.eval_topk,
+                    batch_size=args.eval_batch_size,
+                    split=args.eval_split,
+                    filter_seen=args.eval_filter_seen,
+                    seen_items_lookup=eval_seen_items,
+                    neg_penalty_weight=args.eval_neg_penalty_weight,
+                    neg_filter_threshold=args.eval_neg_filter_threshold,
+                    neg_chunk_size=args.eval_neg_chunk_size,
+                )
+            else:
+                eval_metrics = evaluate_ranking(
+                    model=model,
+                    signed_graph=signed_graph,
+                    eval_examples=eval_examples,
+                    pad_id=bundle.num_items,
+                    device=device,
+                    topk=args.eval_topk,
+                    batch_size=args.eval_batch_size,
+                    split=args.eval_split,
+                    filter_seen=args.eval_filter_seen,
+                    seen_items_lookup=eval_seen_items,
+                    neg_penalty_weight=args.eval_neg_penalty_weight,
+                    neg_filter_threshold=args.eval_neg_filter_threshold,
+                    neg_chunk_size=args.eval_neg_chunk_size,
+                )
             eval_elapsed = time.time() - eval_start_time
             logger.info(
                 f"Eval {eval_metrics['split']}@{eval_metrics['topk']} | "
