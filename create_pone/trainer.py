@@ -453,7 +453,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--barlow-lambda", type=float, default=0.1)
     parser.add_argument("--orthogonal-mu", type=float, default=0.1)
     parser.add_argument("--contrastive-tau", type=float, default=1.0)
-    parser.add_argument("--neg-branch-scale", type=float, default=1.0)
+    parser.add_argument("--neg-branch-scale", type=float, default=2.0)
     parser.add_argument(
         "--pone-neg-every",
         type=int,
@@ -567,13 +567,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-neg-penalty-weight",
         type=float,
-        default=0.25,
+        default=0.0,
         help="Subtract weight * disinterest score from ranking scores during evaluation.",
     )
     parser.add_argument(
         "--eval-neg-filter-threshold",
         type=float,
-        default=1e9,
+        default=-1e9,
         help="Mask items with disinterest score above this threshold during evaluation.",
     )
     parser.add_argument(
