@@ -472,10 +472,17 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
 
     metrics_overall = {"ndcg@10": [], "precision@10": [], "recall@10": []}
 
+    total_edges = len(edges)
     for pct in [10, 20, 30, 40, 50]:
         remove_count = int(len(edges) * pct / 100)
         removed_idx = set(removal_order[:remove_count])
         kept_edges = [edge for idx, edge in enumerate(edges) if idx not in removed_idx]
+        kept_count = len(kept_edges)
+
+        print(
+            "Running robustness step: "
+            f"removed={pct}% | original_edges={total_edges} | training_edges={kept_count}"
+        )
 
         graph = build_create_graph_from_edges(
             kept_edges,
@@ -609,10 +616,17 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
 
     metrics_overall = {"ndcg@10": [], "precision@10": [], "recall@10": []}
 
+    total_edges = len(train_df)
     for pct in [10, 20, 30, 40, 50]:
         remove_count = int(len(train_df) * pct / 100)
         removed_idx = set(removal_order[:remove_count])
         kept_df = train_df.drop(index=train_df.index[list(removed_idx)]).reset_index(drop=True)
+        kept_count = len(kept_df)
+
+        print(
+            "Running robustness step: "
+            f"removed={pct}% | original_edges={total_edges} | training_edges={kept_count}"
+        )
 
         user_ids = torch.tensor(kept_df["user_id"].values, dtype=torch.long, device=device)
         item_ids = torch.tensor(kept_df["item_id"].values, dtype=torch.long, device=device)
