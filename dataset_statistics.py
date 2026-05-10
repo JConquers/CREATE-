@@ -34,6 +34,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--session_length", type=int, default=86400)
+    parser.add_argument(
+        "--item_metadata",
+        type=str,
+        default=None,
+        help="Optional CSV with item metadata (for label stats)",
+    )
+    parser.add_argument(
+        "--item_id_col",
+        type=str,
+        default="item_id",
+        help="Item id column in metadata CSV",
+    )
+    parser.add_argument(
+        "--label_col",
+        type=str,
+        default=None,
+        help="Label column in metadata CSV (e.g., genres)",
+    )
+    parser.add_argument(
+        "--label_sep",
+        type=str,
+        default="|",
+        help="Separator for multi-label strings",
+    )
     return parser.parse_args()
 
 
@@ -303,7 +327,84 @@ def compute_session_stats(df: pd.DataFrame, session_length: int) -> Dict[str, fl
     }
 
 
-def compute_stats(df: pd.DataFrame, session_length: int) -> Dict:
+def compute_session_label_stats(
+    df: pd.DataFrame,
+    session_length: int,
+    item_labels: Dict[int, List[str]],
+) -> Dict[str, float]:
+    if session_length <= 0:
+        return {}
+    if not item_labels:
+        return {}
+    if "timestamp" not in df.columns or df["timestamp"].isna().all():
+        return {}
+
+    unique_label_counts = []
+    label_density = []
+
+    for _, user_df in df.sort_values(["user_id", "timestamp"]).groupby("user_id"):
+        times = user_df["timestamp"].fillna(0).to_numpy(dtype=float)
+        items = user_df["item_id"].to_numpy(dtype=int)
+        if times.size == 0:
+            continue
+        anchor = times[0]
+        session_ids = ((times - anchor) // session_length).astype(int)
+        for sid in np.unique(session_ids):
+            mask = session_ids == sid
+            session_items = items[mask]
+            if session_items.size == 0:
+                continue
+            labels = []
+            for item_id in session_items:
+                labels.extend(item_labels.get(int(item_id), []))
+            if not labels:
+                continue
+            unique_labels = set(labels)
+            unique_label_counts.append(float(len(unique_labels)))
+            label_density.append(float(len(unique_labels)) / float(session_items.size))
+
+    if not unique_label_counts:
+        return {}
+
+    percentiles = np.percentile(unique_label_counts, [50, 90])
+    return {
+        "avg_unique_labels_per_hyperedge": float(np.mean(unique_label_counts)),
+        "median_unique_labels_per_hyperedge": float(percentiles[0]),
+        "p90_unique_labels_per_hyperedge": float(percentiles[1]),
+        "avg_label_density_per_hyperedge": float(np.mean(label_density)) if label_density else 0.0,
+    }
+
+
+def load_item_labels(
+    metadata_path: str | None,
+    item_id_col: str,
+    label_col: str | None,
+    label_sep: str,
+) -> Dict[int, List[str]]:
+    if not metadata_path or not label_col:
+        return {}
+    meta_df = pd.read_csv(metadata_path)
+    if item_id_col not in meta_df.columns or label_col not in meta_df.columns:
+        return {}
+    labels: Dict[int, List[str]] = {}
+    for row in meta_df[[item_id_col, label_col]].itertuples(index=False):
+        item_id = int(getattr(row, item_id_col))
+        raw = getattr(row, label_col)
+        if pd.isna(raw):
+            continue
+        if isinstance(raw, str):
+            parts = [p.strip() for p in raw.split(label_sep) if p.strip()]
+            labels[item_id] = parts
+        else:
+            labels[item_id] = [str(raw)]
+    return labels
+
+
+def compute_stats(
+    df: pd.DataFrame,
+    session_length: int,
+    item_labels: Dict[int, List[str]],
+) -> Dict:
     stats: Dict = {}
 
     n_users = int(df["user_id"].nunique()) if not df.empty else 0
@@ -359,6 +460,7 @@ def compute_stats(df: pd.DataFrame, session_length: int) -> Dict:
 
     stats["temporal"] = compute_temporal_stats(df)
     stats["session"] = compute_session_stats(df, session_length)
+    stats["session_labels"] = compute_session_label_stats(df, session_length, item_labels)
 
     return stats
 
@@ -386,9 +488,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary = {}
+    item_labels = load_item_labels(
+        metadata_path=args.item_metadata,
+        item_id_col=args.item_id_col,
+        label_col=args.label_col,
+        label_sep=args.label_sep,
+    )
+
     for dataset in datasets:
         all_df, split_sizes = load_all_splits(dataset, args.data_dir, output_dir)
-        stats = compute_stats(all_df, args.session_length)
+        stats = compute_stats(all_df, args.session_length, item_labels)
         stats["splits"] = split_sizes
         summary[dataset] = stats
 
