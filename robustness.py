@@ -58,7 +58,6 @@ def import_create_modules():
 
 # CREATE-Uni imports
 from CREATE_Uni.data import create_dataloaders as create_uni_dataloaders
-from CREATE_Uni.data import get_dataset_stats
 from CREATE_Uni.loss import CREATEUniLoss
 from CREATE_Uni.metrics import create_metrics
 from CREATE_Uni.models import CREATEUni
@@ -557,7 +556,7 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
     return metrics_overall
 
 
-def prepare_create_uni_paths(args: argparse.Namespace, output_dir: Path) -> Tuple[SplitPaths, int, int]:
+def prepare_create_uni_paths(args: argparse.Namespace, output_dir: Path) -> SplitPaths:
     split_paths = resolve_split_paths(args.dataset, args.data_dir, output_dir)
 
     if split_paths.train_validation is None:
@@ -572,17 +571,12 @@ def prepare_create_uni_paths(args: argparse.Namespace, output_dir: Path) -> Tupl
             ),
         )
 
-    if args.run_mode == "test":
-        stats = get_dataset_stats(str(split_paths.train_validation))
-    else:
-        stats = get_dataset_stats(str(split_paths.train))
-
-    return split_paths, stats["n_users"], stats["n_items"]
+    return split_paths
 
 
 def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[str, List[float]]:
     device = torch.device(args.device)
-    split_paths, num_users, num_items = prepare_create_uni_paths(args, output_dir)
+    split_paths = prepare_create_uni_paths(args, output_dir)
 
     if args.run_mode == "test":
         active_train = split_paths.train_validation
@@ -592,6 +586,13 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
         active_train = split_paths.train
         active_val = split_paths.validation
         active_test = split_paths.validation
+
+    train_df = pd.read_csv(active_train)
+    val_df = pd.read_csv(active_val)
+    test_df = pd.read_csv(active_test)
+    all_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    num_users = int(all_df["user_id"].max()) + 1
+    num_items = int(all_df["item_id"].max()) + 1
 
     dataloaders = create_uni_dataloaders(
         train_path=str(active_train),
@@ -604,7 +605,6 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
         num_items=num_items,
     )
 
-    train_df = pd.read_csv(active_train)
     removal_order = build_edge_removal_order(len(train_df), args.seed)
 
     metrics_overall = {"ndcg@10": [], "precision@10": [], "recall@10": []}
