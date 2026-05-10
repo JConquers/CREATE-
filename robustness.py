@@ -21,16 +21,40 @@ from matplotlib import pyplot as plt
 # Ensure CREATE (src) modules are importable
 ROOT = Path(__file__).resolve().parent
 CREATE_ROOT = ROOT / "CREATE"
+SRC_ROOT = ROOT / "src"
 if CREATE_ROOT.exists() and str(CREATE_ROOT) not in sys.path:
     sys.path.insert(0, str(CREATE_ROOT))
+if SRC_ROOT.exists() and str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# CREATE (classic) imports
-from src.dataset import get_dataloaders, get_sparse_graph_layer, _convert_sp_mat_to_sp_tensor
-from src.loss import UnderDogLoss, LocalObjective, GlobalObjective
-from src.metrics import NDCGMetric, RecallMetric
-from src.models.underdog import UnderDogModel
-from src.optimizer import BasicOptimizer
-from src.utils import train as create_train
+
+def import_create_modules():
+    try:
+        from src.dataset import get_dataloaders, get_sparse_graph_layer, _convert_sp_mat_to_sp_tensor
+        from src.loss import UnderDogLoss, LocalObjective, GlobalObjective
+        from src.metrics import NDCGMetric, RecallMetric
+        from src.models.underdog import UnderDogModel
+        from src.optimizer import BasicOptimizer
+        from src.utils import train as create_train
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Could not import CREATE 'src' package. "
+            "Make sure CREATE/src exists for running model=CREATE."
+        ) from exc
+
+    return {
+        "get_dataloaders": get_dataloaders,
+        "get_sparse_graph_layer": get_sparse_graph_layer,
+        "_convert_sp_mat_to_sp_tensor": _convert_sp_mat_to_sp_tensor,
+        "UnderDogLoss": UnderDogLoss,
+        "LocalObjective": LocalObjective,
+        "GlobalObjective": GlobalObjective,
+        "NDCGMetric": NDCGMetric,
+        "RecallMetric": RecallMetric,
+        "UnderDogModel": UnderDogModel,
+        "BasicOptimizer": BasicOptimizer,
+        "create_train": create_train,
+    }
 
 # CREATE-Uni imports
 from CREATE_Uni.data import create_dataloaders as create_uni_dataloaders
@@ -289,6 +313,9 @@ def build_create_graph_from_edges(
     num_items: int,
     device: torch.device,
 ) -> torch.Tensor:
+    create_modules = import_create_modules()
+    get_sparse_graph_layer = create_modules["get_sparse_graph_layer"]
+    convert_sp = create_modules["_convert_sp_mat_to_sp_tensor"]
     if not edges:
         user_ids = np.array([], dtype=np.int64)
         item_ids = np.array([], dtype=np.int64)
@@ -306,7 +333,7 @@ def build_create_graph_from_edges(
         shape=(num_users + 2, num_items + 2),
     )
     graph = get_sparse_graph_layer(user2item, num_users + 2, num_items + 2, biparite=True)
-    return _convert_sp_mat_to_sp_tensor(graph).coalesce().to(device)
+    return convert_sp(graph).coalesce().to(device)
 
 
 def compute_create_metrics(
@@ -350,6 +377,8 @@ def prepare_create_dataloaders(
     split_paths: SplitPaths,
     run_mode: str,
 ) -> Tuple[Dict, Dict, Dict]:
+    create_modules = import_create_modules()
+    get_dataloaders = create_modules["get_dataloaders"]
     if run_mode == "test":
         train_val_path = split_paths.train_validation or (
             split_paths.train.parent / "train_validation.csv"
@@ -418,6 +447,15 @@ def prepare_create_dataloaders(
 
 
 def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[str, List[float]]:
+    create_modules = import_create_modules()
+    UnderDogModel = create_modules["UnderDogModel"]
+    UnderDogLoss = create_modules["UnderDogLoss"]
+    LocalObjective = create_modules["LocalObjective"]
+    GlobalObjective = create_modules["GlobalObjective"]
+    NDCGMetric = create_modules["NDCGMetric"]
+    RecallMetric = create_modules["RecallMetric"]
+    BasicOptimizer = create_modules["BasicOptimizer"]
+    create_train = create_modules["create_train"]
     device = torch.device(args.device)
     split_paths = resolve_split_paths(args.dataset, args.data_dir, output_dir)
     dataloaders, dataset_meta, data_frames = prepare_create_dataloaders(args, split_paths, args.run_mode)
