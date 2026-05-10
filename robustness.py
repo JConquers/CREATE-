@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import random
 import sys
 from dataclasses import dataclass
@@ -471,6 +472,12 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
     removal_order = build_edge_removal_order(len(edges), args.seed)
 
     metrics_overall = {"ndcg@10": [], "precision@10": [], "recall@10": []}
+    time_log_path = output_dir / "robust_time_output.txt"
+    time_log_lines = [
+        "model=CREATE (routed to CREATEUni LightGCN/bipartite)",
+        f"dataset={args.dataset}",
+        f"run_mode={args.run_mode}",
+    ]
 
     total_edges = len(edges)
     for pct in [10, 20, 30, 40, 50]:
@@ -535,7 +542,8 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
             "recall@10": RecallMetric(k=10),
         }
 
-        create_train(
+        train_start = time.time()
+        history, best_metrics = create_train(
             train_dataloader=dataloaders["train"],
             val_dataloader=dataloaders["validation"],
             test_dataloader=dataloaders["test"],
@@ -547,6 +555,9 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
             device=device,
             metrics=metrics,
         )
+        train_time = best_metrics.get("train_time", time.time() - train_start)
+        epochs_ran = max(1, len(history))
+        avg_epoch_time = train_time / epochs_ran
 
         results = compute_create_metrics(dataloaders["test"], model, device, k=10)
 
@@ -559,6 +570,14 @@ def run_create_robustness(args: argparse.Namespace, output_dir: Path) -> Dict[st
         metrics_overall["ndcg@10"].append(results["ndcg@10"])
         metrics_overall["precision@10"].append(results["precision@10"])
         metrics_overall["recall@10"].append(results["recall@10"])
+
+        time_log_lines.append(
+            f"removed={pct}% | original_edges={total_edges} | "
+            f"training_edges={kept_count} | avg_epoch_time_sec={avg_epoch_time:.6f}"
+        )
+
+    with time_log_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(time_log_lines) + "\n")
 
     return metrics_overall
 
@@ -615,6 +634,14 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
     removal_order = build_edge_removal_order(len(train_df), args.seed)
 
     metrics_overall = {"ndcg@10": [], "precision@10": [], "recall@10": []}
+    time_log_path = output_dir / "robust_time_output.txt"
+    time_log_lines = [
+        "model=CREATEUni",
+        f"dataset={args.dataset}",
+        f"run_mode={args.run_mode}",
+        f"graph_type={args.graph_type}",
+        f"graph_conv_type={args.graph_conv_type}",
+    ]
 
     total_edges = len(train_df)
     for pct in [10, 20, 30, 40, 50]:
@@ -688,7 +715,8 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
 
         metrics = create_metrics(k_values=[10], num_items=num_items)
 
-        create_uni_train(
+        train_start = time.time()
+        history, best_metrics = create_uni_train(
             train_dataloader=dataloaders["train"],
             val_dataloader=dataloaders["validation"],
             test_dataloader=dataloaders["test"],
@@ -704,6 +732,9 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
             output_dir=None,
             select_best=(args.run_mode == "val"),
         )
+        train_time = best_metrics.get("train_time", time.time() - train_start)
+        epochs_ran = max(1, len(history))
+        avg_epoch_time = train_time / epochs_ran
 
         results, _ = create_uni_inference(dataloaders["test"], model, metrics, device)
 
@@ -716,6 +747,14 @@ def run_create_uni_robustness(args: argparse.Namespace, output_dir: Path) -> Dic
         metrics_overall["ndcg@10"].append(results["ndcg@10"])
         metrics_overall["precision@10"].append(results["precision@10"])
         metrics_overall["recall@10"].append(results["recall@10"])
+
+        time_log_lines.append(
+            f"removed={pct}% | original_edges={total_edges} | "
+            f"training_edges={kept_count} | avg_epoch_time_sec={avg_epoch_time:.6f}"
+        )
+
+    with time_log_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(time_log_lines) + "\n")
 
     return metrics_overall
 
