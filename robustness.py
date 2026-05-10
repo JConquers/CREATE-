@@ -744,7 +744,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.model == "CREATE":
-        metrics = run_create_robustness(args, output_dir)
+        # Route CREATE requests to CREATE-Uni with LightGCN + bipartite graph.
+        routed_args = argparse.Namespace(**vars(args))
+        routed_args.model = "CREATEUni"
+        routed_args.graph_conv_type = "LightGCN"
+        routed_args.graph_type = "bipartite"
+        metrics = run_create_uni_robustness(routed_args, output_dir)
     else:
         metrics = run_create_uni_robustness(args, output_dir)
 
