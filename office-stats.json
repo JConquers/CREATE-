@@ -1,0 +1,52 @@
+{
+  "basic": {
+    "num_users": 4905,
+    "num_items": 2420,
+    "num_interactions": 145059,
+    "density": 0.012220537316450578,
+    "sparsity": 0.9877794626835494
+  },
+  "sequence_length": {
+    "mean": 29.573700305810398,
+    "median": 18.0,
+    "min": 12.0,
+    "max": 279.0,
+    "p25": 12.0,
+    "p75": 36.0,
+    "p90": 60.0
+  },
+  "degree_distribution": {
+    "user_gini": 0.39473000683282033,
+    "item_gini": 0.5466531486561268
+  },
+  "popularity": {
+    "top_1pct_item_share": 0.08948083193734963
+  },
+  "cold_start": {
+    "pct_users_le_2": 0.0,
+    "pct_items_le_2": 0.0
+  },
+  "repeat": {
+    "avg_user_repeat_rate": 0.6153222014800311,
+    "repeat_interaction_share": 0.6328528391895711
+  },
+  "temporal": {
+    "time_min": 970185600.0,
+    "time_max": 1406073600.0,
+    "time_span_days": 5045.0,
+    "median_inter_event_sec": 0.0,
+    "overall_median_inter_event_sec": 0.0
+  },
+  "session": {
+    "avg_session_size": 3.2876796156112595,
+    "median_session_size": 3.0,
+    "p90_session_size": 6.0,
+    "avg_sessions_per_user": 8.995310907237513
+  },
+  "session_labels": {},
+  "splits": {
+    "train": 43448,
+    "validation": 48353,
+    "test": 53258
+  }
+}

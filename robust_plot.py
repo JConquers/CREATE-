@@ -23,7 +23,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to CREATE-Uni json",
     )
-    parser.add_argument("--num_epochs", type=int, required=True, help="Total epochs per run")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -52,17 +51,13 @@ def get_metric(data: Dict, key: str) -> List[float]:
 
 
 def get_time_list(data: Dict) -> List[float]:
+    if "avg_epoch_time_sec" in data:
+        return data["avg_epoch_time_sec"]
     if "training_time" in data:
         return data["training_time"]
     if "train_time" in data:
         return data["train_time"]
-    raise KeyError("Missing 'training_time' in json")
-
-
-def to_avg_epoch_times(times: List[float], epochs: int) -> List[float]:
-    if epochs <= 0:
-        raise ValueError("num_epochs must be > 0")
-    return [t / float(epochs) for t in times]
+    raise KeyError("Missing 'avg_epoch_time_sec' or 'training_time' in json")
 
 
 def plot_series(ax, x, y_create, y_uni, title, ylabel):
@@ -94,8 +89,8 @@ def main() -> None:
     recall_create = get_metric(create_data, "recall@10")
     recall_uni = get_metric(create_uni_data, "recall@10")
 
-    time_create = to_avg_epoch_times(get_time_list(create_data), args.num_epochs)
-    time_uni = to_avg_epoch_times(get_time_list(create_uni_data), args.num_epochs)
+    time_create = get_time_list(create_data)
+    time_uni = get_time_list(create_uni_data)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
 
