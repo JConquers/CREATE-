@@ -200,8 +200,8 @@ class PoneBipartiteDataset(Dataset):
         self._all_items = np.arange(num_items)
         self.train = train_df
 
-    def negs_gen_EP(self, epochs: int) -> None:
-        self.edge_4_tot = torch.empty((len(self.edge_1), self.num_negs, epochs), dtype=torch.long)
+    def negs_gen_epoch(self) -> None:
+        self.edge_4 = torch.empty((len(self.edge_1), self.num_negs), dtype=torch.long)
         for user_id in np.unique(self.train["user_id"].values):
             pos = self.train[self.train["user_id"] == user_id]["item_id"].values
             neg = np.setdiff1d(self._all_items, pos)
@@ -209,10 +209,10 @@ class PoneBipartiteDataset(Dataset):
                 continue
             weights = self.neg_dist[neg]
             weights = weights / weights.sum() if weights.sum() > 0 else None
-            total = len(pos) * self.num_negs * epochs
+            total = len(pos) * self.num_negs
             sampled = np.random.choice(neg, total, replace=True, p=weights)
-            sampled = (torch.tensor(sampled, dtype=torch.long) + self.num_users)
-            self.edge_4_tot[self.edge_1 == user_id] = sampled.view(len(pos), self.num_negs, epochs)
+            sampled = torch.tensor(sampled, dtype=torch.long) + self.num_users
+            self.edge_4[self.edge_1 == user_id] = sampled.view(len(pos), self.num_negs)
 
     def __len__(self) -> int:
         return len(self.edge_1)
@@ -233,9 +233,14 @@ def deg_dist(train_df, num_items: int) -> np.ndarray:
     return weights
 
 
-def build_pone_edges(train_df, num_users: int, offset: float) -> tuple[Data, Data]:
-    pos_train = train_df[train_df["rating"] > offset]
-    neg_train = train_df[train_df["rating"] < offset]
+def build_pone_edges(
+    train_df,
+    num_users: int,
+    pos_offset: float,
+    neg_offset: float,
+) -> tuple[Data, Data]:
+    pos_train = train_df[train_df["rating"] > pos_offset]
+    neg_train = train_df[train_df["rating"] < neg_offset]
 
     edge_user = torch.tensor(pos_train["user_id"].values, dtype=torch.long)
     edge_item = torch.tensor(pos_train["item_id"].values, dtype=torch.long) + num_users
@@ -278,6 +283,170 @@ def gen_top_k_new3(
 
     _, reco = torch.topk(r_hat_p, k)
     return reco.cpu().numpy()
+
+
+def build_eval_masks(
+    train_df,
+    test_df,
+    num_users: int,
+    num_items: int,
+) -> tuple[list[int], list[list[int]]]:
+    all_items = set(range(num_items))
+    tot_items = set(train_df["item_id"]).union(set(test_df["item_id"]))
+    no_items = list(all_items - tot_items)
+
+    seen_by_user: list[list[int]] = [[] for _ in range(num_users)]
+    for row in train_df.itertuples(index=False):
+        seen_by_user[int(row.user_id)].append(int(row.item_id))
+
+    return no_items, seen_by_user
+
+
+def generate_reco_chunked(
+    emb_u: torch.Tensor,
+    emb_n_u: torch.Tensor,
+    emb_v: torch.Tensor,
+    emb_n_v: torch.Tensor,
+    train_df,
+    test_df,
+    num_users: int,
+    num_items: int,
+    topk: int,
+    threshold: float,
+    chunk_size: int,
+) -> np.ndarray:
+    no_items, seen_by_user = build_eval_masks(train_df, test_df, num_users, num_items)
+    reco = np.zeros((num_users, topk), dtype=np.int64)
+
+    for start in range(0, num_users, chunk_size):
+        end = min(start + chunk_size, num_users)
+        scores = emb_u[start:end] @ emb_v.t()
+
+        if threshold is not None:
+            neg_scores = emb_n_u[start:end] @ emb_n_v.t()
+            scores = scores.masked_fill(neg_scores > threshold, float("-inf"))
+
+        if no_items:
+            scores[:, no_items] = float("-inf")
+
+        for idx, user_id in enumerate(range(start, end)):
+            seen_items = seen_by_user[user_id]
+            if seen_items:
+                scores[idx, seen_items] = float("-inf")
+
+        topk_indices = torch.topk(scores, topk, dim=1).indices
+        reco[start:end] = topk_indices.cpu().numpy()
+
+    return reco
+
+
+def compute_pone_metrics(
+    reco: np.ndarray,
+    train_df,
+    test_df,
+    num_users: int,
+    n_list: list[int] | None = None,
+    threshold: float = 3.0,
+    partition: tuple[int, int] = (20, 50),
+) -> Dict[str, Dict[str, list[float]]]:
+    if n_list is None:
+        n_list = [1, 5, 10, 15, 20]
+
+    max_k = int(min(reco.shape[1], max(n_list, default=0)))
+    n_list = [n for n in n_list if n <= max_k]
+    if not n_list:
+        empty = [0.0] * 0
+        return {
+            "n_list": [],
+            "precision": {"total": empty},
+            "recall": {"total": empty},
+            "ndcg": {"total": empty},
+            "hr": {"total": empty},
+        }
+
+    positives = test_df[test_df["rating"] >= threshold]
+    gt: Dict[int, set[int]] = {}
+    for row in positives.itertuples(index=False):
+        gt.setdefault(int(row.user_id), set()).add(int(row.item_id))
+
+    if not gt:
+        zeros = [0.0] * len(n_list)
+        return {
+            "n_list": n_list,
+            "precision": {"total": zeros},
+            "recall": {"total": zeros},
+            "ndcg": {"total": zeros},
+            "hr": {"total": zeros},
+        }
+
+    user_counts = np.bincount(train_df["user_id"].values, minlength=num_users)
+    group1_mask = user_counts < partition[0]
+    group2_mask = (user_counts < partition[1]) & (~group1_mask)
+    group3_mask = ~(user_counts < partition[1])
+
+    group_map = np.zeros(num_users, dtype=np.int64)
+    group_map[group2_mask] = 1
+    group_map[group3_mask] = 2
+    group_names = ["group1", "group2", "group3", "total"]
+
+    metrics = {
+        "precision": {name: np.zeros(len(n_list)) for name in group_names},
+        "recall": {name: np.zeros(len(n_list)) for name in group_names},
+        "ndcg": {name: np.zeros(len(n_list)) for name in group_names},
+        "hr": {name: np.zeros(len(n_list)) for name in group_names},
+    }
+    counts = {name: 0 for name in group_names}
+
+    discount = 1.0 / np.log2(np.arange(2, max_k + 2))
+    idcg_base = np.cumsum(discount)
+    n_indices = [n - 1 for n in n_list]
+
+    for user_id, targets in gt.items():
+        if user_id >= num_users:
+            continue
+        group_idx = int(group_map[user_id])
+        group_name = group_names[group_idx]
+
+        rec = reco[user_id][:max_k]
+        hits = np.array([1.0 if int(item) in targets else 0.0 for item in rec], dtype=np.float64)
+        hits_cum = np.cumsum(hits)
+        hit_binary = (hits_cum > 0).astype(np.float64)
+        dcg_cum = np.cumsum(hits * discount)
+
+        ideal_len = min(len(targets), max_k)
+        if ideal_len > 0:
+            idcg = idcg_base.copy()
+            idcg[ideal_len:] = idcg[ideal_len - 1]
+        else:
+            idcg = np.zeros(max_k, dtype=np.float64)
+
+        for idx, k_idx in enumerate(n_indices):
+            k = n_list[idx]
+            precision = hits_cum[k_idx] / max(1, k)
+            recall = hits_cum[k_idx] / max(1, len(targets))
+            hr = hit_binary[k_idx]
+            ndcg = (dcg_cum[k_idx] / idcg[k_idx]) if idcg[k_idx] > 0 else 0.0
+
+            metrics["precision"][group_name][idx] += precision
+            metrics["recall"][group_name][idx] += recall
+            metrics["hr"][group_name][idx] += hr
+            metrics["ndcg"][group_name][idx] += ndcg
+
+            metrics["precision"]["total"][idx] += precision
+            metrics["recall"]["total"][idx] += recall
+            metrics["hr"]["total"][idx] += hr
+            metrics["ndcg"]["total"][idx] += ndcg
+
+        counts[group_name] += 1
+        counts["total"] += 1
+
+    for name in group_names:
+        denom = max(1, counts[name])
+        for metric in metrics.values():
+            metric[name] = (metric[name] / denom).tolist()
+
+    metrics["n_list"] = n_list
+    return metrics
 
 
 def compute_metrics(
@@ -346,7 +515,7 @@ def train_pone_gnn_baseline(
         args.neg_sample_k,
     )
 
-    data_p, data_n = build_pone_edges(train_df, bundle.num_users, args.pone_offset)
+    data_p, data_n = build_pone_edges(train_df, bundle.num_users, args.pone_offset, 3.5)
     data_p = data_p.to(device)
     data_n = data_n.to(device)
 
@@ -365,11 +534,9 @@ def train_pone_gnn_baseline(
     best_ndcg = -float("inf")
 
     eval_every = max(1, args.pone_eval_every)
+    pone_eval_n = [1, 5, 10, 15, 20]
     for epoch in range(1, args.epochs + 1):
-        if eval_every == 1 or epoch % eval_every == 1:
-            dataset.negs_gen_EP(eval_every)
-
-        dataset.edge_4 = dataset.edge_4_tot[:, :, (epoch - 1) % eval_every]
+        dataset.negs_gen_epoch()
         ds = DataLoader(dataset, batch_size=args.pone_batch_size, shuffle=True)
 
         model.train()
@@ -400,31 +567,62 @@ def train_pone_gnn_baseline(
         if eval_every == 1 or epoch % eval_every == 1:
             model.eval()
             emb_u, emb_n_u, emb_v, emb_n_v = model.get_ui_embeddings(data_p, data_n)
-            r_hat = emb_u.mm(emb_v.t()).cpu()
-            r_hat_n = emb_n_u.mm(emb_n_v.t()).cpu()
-
-            reco = gen_top_k_new3(
+            chunk_size = max(1, args.eval_batch_size)
+            topk = min(max(pone_eval_n), emb_v.size(0))
+            reco = generate_reco_chunked(
+                emb_u,
+                emb_n_u,
+                emb_v,
+                emb_n_v,
                 train_df,
                 test_df,
-                r_hat,
-                r_hat_n,
+                bundle.num_users,
                 bundle.num_items,
-                args.eval_topk,
+                topk,
                 threshold=0.0,
+                chunk_size=chunk_size,
             )
-            metrics = compute_metrics(reco, test_df, args.eval_topk, args.eval_min_rating)
-
-            epoch_metrics.update(metrics)
-            logger.info(
-                "Pone-GNN Eval@%s | P=%.4f R=%.4f NDCG=%.4f HR=%.4f",
-                args.eval_topk,
-                metrics["precision"],
-                metrics["recall"],
-                metrics["ndcg"],
-                metrics["hr"],
+            metrics = compute_pone_metrics(
+                reco,
+                train_df,
+                test_df,
+                bundle.num_users,
+                n_list=pone_eval_n,
+                threshold=args.eval_min_rating,
             )
 
-            best_ndcg = max(best_ndcg, metrics["ndcg"])
+            epoch_metrics.update({
+                f"precision@{k}": metrics["precision"]["total"][idx]
+                for idx, k in enumerate(metrics["n_list"])
+            })
+            epoch_metrics.update({
+                f"recall@{k}": metrics["recall"]["total"][idx]
+                for idx, k in enumerate(metrics["n_list"])
+            })
+            epoch_metrics.update({
+                f"ndcg@{k}": metrics["ndcg"]["total"][idx]
+                for idx, k in enumerate(metrics["n_list"])
+            })
+            epoch_metrics.update({
+                f"hr@{k}": metrics["hr"]["total"][idx]
+                for idx, k in enumerate(metrics["n_list"])
+            })
+
+            for idx, k in enumerate(metrics["n_list"]):
+                logger.info(
+                    "Pone-GNN Eval@%s | P=%.4f R=%.4f NDCG=%.4f HR=%.4f",
+                    k,
+                    metrics["precision"]["total"][idx],
+                    metrics["recall"]["total"][idx],
+                    metrics["ndcg"]["total"][idx],
+                    metrics["hr"]["total"][idx],
+                )
+
+            if args.eval_topk in metrics["n_list"]:
+                idx = metrics["n_list"].index(args.eval_topk)
+            else:
+                idx = -1
+            best_ndcg = max(best_ndcg, metrics["ndcg"]["total"][idx])
 
         history.append(epoch_metrics)
 
