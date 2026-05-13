@@ -10,4 +10,6 @@ CREATE
 Pone-GNN
 UniGNN
 .claude
-data
+.codex
+data/
+outputs/

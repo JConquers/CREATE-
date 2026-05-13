@@ -342,10 +342,10 @@ def main():
     device = torch.device(args.device)
     logger.info(f"Device: {device}")
 
-    # Load dataset
+    # loading dataset
     logger.info(f"Loading dataset: {args.dataset}")
 
-    # Try to use dataset_loaders module
+    # trying to use dataset_loaders module
     data_module_path = Path(__file__).parent.parent / "dataset_loaders"
     loader_datasets = ["beauty", "office_products", "ml1m", "movielens_1m"]
     if data_module_path.exists() and args.dataset in loader_datasets:
